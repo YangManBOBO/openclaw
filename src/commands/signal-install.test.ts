@@ -69,7 +69,9 @@ describe("looksLikeArchive", () => {
 
 describe("resolveSignalCliArchiveTempName", () => {
   it("maps zip assets to a fixed safe temp name", () => {
-    expect(resolveSignalCliArchiveTempName("signal-cli.zip")).toBe("signal-cli.zip");
+    expect(resolveSignalCliArchiveTempName("signal-cli-0.13.14-Windows-native.zip")).toBe(
+      "signal-cli.zip",
+    );
   });
 
   it("preserves archive type while ignoring traversal segments", () => {
