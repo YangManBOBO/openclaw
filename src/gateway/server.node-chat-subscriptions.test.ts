@@ -95,11 +95,7 @@ describe("gateway node chat subscriptions", () => {
           payload: { sessionKey: "  MAIN  " },
         });
         emitCompletedSessionRun("canonical-node-reconnect", "agent:main:main");
-        await expectNodeChatEvent(
-          reconnectEvents,
-          "canonical-node-reconnect",
-          "agent:main:main",
-        );
+        await expectNodeChatEvent(reconnectEvents, "canonical-node-reconnect", "agent:main:main");
 
         await reconnected.request("node.event", {
           event: "chat.subscribe",

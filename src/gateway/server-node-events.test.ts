@@ -2341,11 +2341,7 @@ describe("chat subscribe/unsubscribe events", () => {
     // nodeSubscribe. On unfixed main, nodeSubscribe receives the parsed
     // key ("Main"), causing a mismatch with delivery which uses the
     // canonical form ("agent:main:main").
-    expect(nodeSubscribe).toHaveBeenCalledWith(
-      "node-c1",
-      "agent:main:main",
-      "node-c1-connection",
-    );
+    expect(nodeSubscribe).toHaveBeenCalledWith("node-c1", "agent:main:main", "node-c1-connection");
     // loadSessionEntry is called with the parsed (trimmed) key from the payload.
     expect(loadSessionEntryMock).toHaveBeenCalledWith("Main");
   });
