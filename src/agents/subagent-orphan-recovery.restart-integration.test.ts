@@ -11,13 +11,22 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../config/config.js";
-import { callGateway } from "../gateway/call.js";
+import type { GatewayRecoveryRuntime } from "../gateway/server-instance-runtime.types.js";
 import { createRunningTaskRun } from "../tasks/detached-task-runtime.js";
-import { resetTaskFlowRegistryForTests } from "../tasks/task-flow-registry.js";
-import { findTaskByRunId, resetTaskRegistryForTests } from "../tasks/task-registry.js";
+import { findTaskByRunId } from "../tasks/task-registry.js";
+import {
+  resetTaskFlowRegistryForTests,
+  resetTaskRegistryForTests,
+} from "../tasks/task-runtime.test-helpers.js";
 import { captureEnv } from "../test-utils/env.js";
 import { cleanupSessionStateForTest } from "../test-utils/session-state-cleanup.js";
-import { recoverOrphanedSubagentSessions } from "./subagent-orphan-recovery.js";
+import { recoverOrphanedSubagentSessions as recoverOrphanedSubagentSessionsWithRuntime } from "./subagent-orphan-recovery.js";
+import {
+  createCanonicalSubagentRunFixture,
+  createSubagentRegistryTestDeps,
+  readSubagentSessionStore,
+  writeSubagentSessionEntry,
+} from "./subagent-registry.persistence.test-support.js";
 import {
   addSubagentRunForTests,
   finalizeInterruptedSubagentRun,
@@ -25,17 +34,27 @@ import {
   listSubagentRunsForRequester,
   resetSubagentRegistryForTests,
   testing,
-} from "./subagent-registry.js";
-import {
-  createSubagentRegistryTestDeps,
-  readSubagentSessionStore,
-  writeSubagentSessionEntry,
-} from "./subagent-registry.persistence.test-support.js";
+} from "./subagent-registry.test-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import {
+  createSubagentRunRecord,
+  type SubagentRunRecordOverrides,
+} from "./subagent-test-fixtures.test-helpers.js";
 
-vi.mock("../gateway/call.js", () => ({
-  callGateway: vi.fn(async () => ({ runId: "resumed-run-id" })),
+const dispatchAgent = vi.fn(async (_payload: Record<string, unknown>, _timeoutMs?: number) => ({
+  runId: "resumed-run-id",
 }));
+const gatewayRuntime: GatewayRecoveryRuntime = {
+  dispatchAgent: dispatchAgent as GatewayRecoveryRuntime["dispatchAgent"],
+  waitForAgent: vi.fn(),
+  sendRecoveryNotice: vi.fn(),
+};
+
+function recoverOrphanedSubagentSessions(
+  params: Omit<Parameters<typeof recoverOrphanedSubagentSessionsWithRuntime>[0], "gatewayRuntime">,
+) {
+  return recoverOrphanedSubagentSessionsWithRuntime({ ...params, gatewayRuntime });
+}
 
 vi.mock("../gateway/session-utils.fs.js", () => ({
   readSessionMessagesAsync: vi.fn(async () => []),
@@ -43,18 +62,20 @@ vi.mock("../gateway/session-utils.fs.js", () => ({
 
 const TWO_HOURS_MS = 2 * 60 * 60 * 1_000;
 
-function makeRunRecord(overrides: Partial<SubagentRunRecord>): SubagentRunRecord {
-  return {
-    runId: "run",
-    childSessionKey: "agent:main:subagent:child",
-    requesterSessionKey: "agent:main:main",
-    requesterDisplayKey: "main",
-    task: "restart-recoverable work",
-    cleanup: "keep",
-    createdAt: Date.now(),
-    startedAt: Date.now(),
-    ...overrides,
-  } as SubagentRunRecord;
+function makeRunRecord(overrides: Partial<SubagentRunRecordOverrides>): SubagentRunRecord {
+  return createCanonicalSubagentRunFixture(
+    createSubagentRunRecord({
+      runId: "run",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "restart-recoverable work",
+      cleanup: "keep",
+      createdAt: Date.now(),
+      startedAt: Date.now(),
+      ...overrides,
+    }),
+  );
 }
 
 describe("subagent orphan recovery — faithful restart path", () => {
@@ -74,8 +95,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
       runSubagentAnnounceFlow: vi.fn(async () => true),
       onAgentEvent: vi.fn(() => () => undefined),
     });
-    vi.mocked(callGateway).mockClear();
-    vi.mocked(callGateway).mockResolvedValue({ runId: "resumed-run-id" } as never);
+    dispatchAgent.mockReset();
+    dispatchAgent.mockResolvedValue({ runId: "resumed-run-id" });
   });
 
   afterEach(async () => {
@@ -120,8 +141,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
         runId,
         task: record.task,
         deliveryStatus: "pending",
-        startedAt: record.startedAt,
-        lastEventAt: record.startedAt,
+        startedAt: record.execution.startedAt,
+        lastEventAt: record.execution.startedAt,
       }),
     ).not.toBeNull();
     addSubagentRunForTests(record);
@@ -131,9 +152,9 @@ describe("subagent orphan recovery — faithful restart path", () => {
     });
 
     const after = getSubagentRunByChildSessionKey(childSessionKey);
-    expect(vi.mocked(callGateway)).not.toHaveBeenCalled();
-    expect(after?.endedAt).toBeTypeOf("number");
-    expect(after?.outcome?.status).toBe("error");
+    expect(dispatchAgent).not.toHaveBeenCalled();
+    expect(after?.execution.endedAt).toBeTypeOf("number");
+    expect(after?.execution.outcome?.status).toBe("error");
     expect(result.recovered).toBe(0);
     expect(findTaskByRunId(runId)).toMatchObject({
       status: "failed",
@@ -178,16 +199,18 @@ describe("subagent orphan recovery — faithful restart path", () => {
     });
 
     console.log(
-      `[proof] fresh recovery: result=${JSON.stringify(result)} gatewayCalls=${
-        vi.mocked(callGateway).mock.calls.length
+      `[proof] fresh recovery: result=${JSON.stringify(result)} runtimeDispatches=${
+        dispatchAgent.mock.calls.length
       }`,
     );
 
-    // Fresh aborted run passed the stale gate and reached a real resume call.
-    const agentCalls = vi
-      .mocked(callGateway)
-      .mock.calls.filter((args) => (args[0] as { method?: string })?.method === "agent");
-    expect(agentCalls).toHaveLength(1);
+    // Fresh aborted run passed the stale gate and reached the instance-owned dispatcher.
+    expect(dispatchAgent).toHaveBeenCalledOnce();
+    expect(dispatchAgent.mock.calls[0]?.[0]).toMatchObject({
+      sessionKey: childSessionKey,
+      lane: "subagent",
+      deliver: false,
+    });
     expect(result.recovered).toBe(1);
   });
 
@@ -221,8 +244,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
           runId: record.runId,
           task: record.task,
           deliveryStatus: "pending",
-          startedAt: record.startedAt,
-          lastEventAt: record.startedAt,
+          startedAt: record.execution.startedAt,
+          lastEventAt: record.execution.startedAt,
         }),
       ).not.toBeNull();
     }
@@ -237,10 +260,12 @@ describe("subagent orphan recovery — faithful restart path", () => {
 
     const runs = listSubagentRunsForRequester("agent:main:main");
     expect(updated).toBe(1);
-    expect(callGateway).not.toHaveBeenCalled();
+    expect(dispatchAgent).not.toHaveBeenCalled();
     expect(runs.some((entry) => entry.runId === staleRecord.runId)).toBe(false);
     expect(runs).toContainEqual(expect.objectContaining({ runId: freshRecord.runId }));
-    expect(runs.find((entry) => entry.runId === freshRecord.runId)?.endedAt).toBeUndefined();
+    expect(
+      runs.find((entry) => entry.runId === freshRecord.runId)?.execution.endedAt,
+    ).toBeUndefined();
     expect(findTaskByRunId(staleRecord.runId)).toMatchObject({ status: "failed" });
     expect(findTaskByRunId(freshRecord.runId)).toMatchObject({ status: "running" });
   });

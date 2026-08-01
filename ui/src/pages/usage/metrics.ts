@@ -58,9 +58,19 @@ function forEachSessionHourSlice(
 
   const startMs = Math.min(start, end);
   const endMs = Math.max(start, end);
-  const durationMs = Math.max(endMs - startMs, 1);
-  const totalMinutes = durationMs / 60000;
 
+  if (startMs === endMs) {
+    const date = new Date(startMs);
+    visitor({
+      usage,
+      hour: getZonedHour(date, timeZone),
+      weekday: getZonedWeekday(date, timeZone),
+      share: 1,
+    });
+    return true;
+  }
+
+  const totalMinutes = (endMs - startMs) / 60000;
   let cursor = startMs;
   while (cursor < endMs) {
     const date = new Date(cursor);
@@ -415,12 +425,15 @@ function renderUsageMosaic(
                     : "color-mix(in srgb, var(--accent) 24%, transparent)";
                 const selected = selectedHours.includes(hour);
                 return html`
-                  <div
+                  <button
+                    type="button"
                     class="usage-hour-cell ${selected ? "selected" : ""}"
                     style="background: ${bg}; border-color: ${border};"
                     title="${title}"
+                    aria-label=${title}
+                    aria-pressed=${selected ? "true" : "false"}
                     @click=${(e: MouseEvent) => onSelectHour(hour, e.shiftKey)}
-                  ></div>
+                  ></button>
                 `;
               })}
             </div>
@@ -856,3 +869,4 @@ export {
   renderUsageMosaic,
   sessionTouchesSelectedHours,
 };
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

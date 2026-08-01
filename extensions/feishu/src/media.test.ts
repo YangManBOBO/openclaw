@@ -22,6 +22,10 @@ const messageReplyMock = vi.hoisted(() => vi.fn());
 
 const FEISHU_MEDIA_HTTP_TIMEOUT_MS = 120_000;
 const emptyConfig: ClawdbotConfig = {};
+const validPngImage = Buffer.from(
+  "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de",
+  "hex",
+);
 
 vi.mock("./client.js", () => ({
   createFeishuClient: createFeishuClientMock,
@@ -206,6 +210,29 @@ describe("sendMediaFeishu msg_type routing", () => {
         mediaUrl: "https://example.com/song.mp3",
       }),
     ).toBe(false);
+  });
+
+  it("respects ttsSupplement.visibleTextAlreadyDelivered over audioAsVoice", () => {
+    expect(
+      shouldSuppressFeishuTextForVoiceMedia({
+        mediaUrl: "https://example.com/tts.mp3",
+        audioAsVoice: true,
+        ttsSupplement: {
+          spokenText: "Hello world",
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSuppressFeishuTextForVoiceMedia({
+        mediaUrl: "https://example.com/tts.mp3",
+        audioAsVoice: true,
+        ttsSupplement: {
+          spokenText: "Hello world",
+          visibleTextAlreadyDelivered: true,
+        },
+      }),
+    ).toBe(true);
   });
 
   it("uses msg_type=media for mp4 video", async () => {
@@ -424,7 +451,7 @@ describe("sendMediaFeishu msg_type routing", () => {
     await sendMediaFeishu({
       cfg: emptyConfig,
       to: "user:ou_target",
-      mediaBuffer: Buffer.from("image"),
+      mediaBuffer: validPngImage,
       fileName: "photo.png",
     });
 
@@ -452,7 +479,7 @@ describe("sendMediaFeishu msg_type routing", () => {
     const send = sendMediaFeishu({
       cfg: emptyConfig,
       to: "user:ou_target",
-      mediaBuffer: Buffer.from("image"),
+      mediaBuffer: validPngImage,
       fileName: "photo.png",
     });
 
@@ -496,6 +523,99 @@ describe("sendMediaFeishu msg_type routing", () => {
     expect(replyRequest.path).toEqual({ message_id: "om_parent" });
     expect(replyRequest.data?.msg_type).toBe("media");
     expect(replyRequest.data?.reply_in_thread).toBe(true);
+  });
+
+  it("falls back to top-level image sends for withdrawn reply targets", async () => {
+    messageReplyMock.mockResolvedValueOnce({
+      code: 230011,
+      msg: "The message was withdrawn.",
+    });
+    messageCreateMock.mockResolvedValueOnce({
+      code: 0,
+      data: { message_id: "msg_image_fallback" },
+    });
+
+    const result = await sendMediaFeishu({
+      cfg: emptyConfig,
+      to: "user:ou_target",
+      mediaBuffer: validPngImage,
+      fileName: "photo.png",
+      replyToMessageId: "om_parent",
+    });
+
+    expect(result.messageId).toBe("msg_image_fallback");
+    expect(messageCreateMock).toHaveBeenCalledTimes(1);
+    expect(callData<{ msg_type?: string; receive_id?: string }>(messageCreateMock)).toMatchObject({
+      msg_type: "image",
+      receive_id: "ou_target",
+    });
+  });
+
+  it("falls back to top-level file sends for thrown withdrawn reply errors", async () => {
+    messageReplyMock.mockRejectedValueOnce(
+      Object.assign(new Error("request failed"), { code: 230011 }),
+    );
+    messageCreateMock.mockResolvedValueOnce({
+      code: 0,
+      data: { message_id: "msg_file_fallback" },
+    });
+
+    const result = await sendMediaFeishu({
+      cfg: emptyConfig,
+      to: "user:ou_target",
+      mediaBuffer: Buffer.from("video"),
+      fileName: "reply.mp4",
+      replyToMessageId: "om_parent",
+    });
+
+    expect(result.messageId).toBe("msg_file_fallback");
+    expect(callData<{ msg_type?: string }>(messageCreateMock).msg_type).toBe("media");
+  });
+
+  it("keeps thread reply failures top-level safe when fallback is disallowed", async () => {
+    messageReplyMock.mockResolvedValueOnce({
+      code: 230011,
+      msg: "The message was withdrawn.",
+    });
+
+    await expect(
+      sendMediaFeishu({
+        cfg: emptyConfig,
+        to: "user:ou_target",
+        mediaBuffer: Buffer.from("video"),
+        fileName: "reply.mp4",
+        replyToMessageId: "om_parent",
+        replyInThread: true,
+      }),
+    ).rejects.toThrow(
+      "Feishu thread reply failed: reply target is unavailable and cannot safely fall back to a top-level send.",
+    );
+
+    expect(messageCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("allows media thread replies to fall back when the dispatcher marks top-level fallback safe", async () => {
+    messageReplyMock.mockResolvedValueOnce({
+      code: 231003,
+      msg: "The message is not found",
+    });
+    messageCreateMock.mockResolvedValueOnce({
+      code: 0,
+      data: { message_id: "msg_thread_fallback" },
+    });
+
+    const result = await sendMediaFeishu({
+      cfg: emptyConfig,
+      to: "user:ou_target",
+      mediaBuffer: Buffer.from("video"),
+      fileName: "reply.mp4",
+      replyToMessageId: "om_parent",
+      replyInThread: true,
+      allowTopLevelReplyFallback: true,
+    });
+
+    expect(result.messageId).toBe("msg_thread_fallback");
+    expect(callData<{ msg_type?: string }>(messageCreateMock).msg_type).toBe("media");
   });
 
   it("omits reply_in_thread when replyInThread is false", async () => {
@@ -927,6 +1047,56 @@ describe("saveMessageResourceFeishu", () => {
         Buffer.from([0xff, 0xd8, 0xff, 0x00]),
       );
     });
+  });
+
+  it("keeps the shipped 120-second media timeout for stalled stream bodies", async () => {
+    vi.useFakeTimers();
+    let markReadStarted: (() => void) | undefined;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    const stalled = new Readable({
+      read() {
+        markReadStarted?.();
+      },
+    });
+    messageResourceGetMock.mockResolvedValueOnce({
+      getReadableStream: () => stalled,
+      headers: { "content-type": "image/jpeg" },
+    });
+
+    try {
+      let settled = false;
+      const download = withIsolatedHome(() =>
+        saveMessageResourceFeishu({
+          cfg: emptyConfig,
+          messageId: "om_stalled_stream",
+          fileKey: "img_key_stalled",
+          type: "image",
+          maxBytes: 1024,
+        }),
+      );
+      void download.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await readStarted;
+      await vi.advanceTimersByTimeAsync(FEISHU_MEDIA_HTTP_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(download).rejects.toMatchObject({
+        name: "FeishuInboundMediaTimeoutError",
+        chunkTimeoutMs: FEISHU_MEDIA_HTTP_TIMEOUT_MS,
+      });
+      expect(stalled.destroyed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("recovers CJK filenames from the inbound message payload fallback", async () => {

@@ -265,6 +265,42 @@ describe("buildPeakErrorHours", () => {
       { value: "30.00%", sub: "3 errors · 10 msgs" },
     ]);
   });
+
+  it("keeps zero-duration fallback sessions in their activity hour", () => {
+    const instant = Date.parse("2026-03-15T10:00:00.000Z");
+    const session: UsageSessionEntry = {
+      key: "instant-fallback-session",
+      updatedAt: instant,
+      usage: {
+        totalTokens: 100,
+        totalCost: 0.01,
+        input: 50,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        inputCost: 0,
+        outputCost: 0,
+        cacheReadCost: 0,
+        cacheWriteCost: 0,
+        missingCostEntries: 0,
+        firstActivity: instant,
+        lastActivity: instant,
+        messageCounts: {
+          total: 10,
+          user: 5,
+          assistant: 5,
+          toolCalls: 0,
+          toolResults: 0,
+          errors: 3,
+        },
+      },
+    } as unknown as UsageSessionEntry;
+
+    const result = buildPeakErrorHours([session], "utc");
+    expect(peakErrorSummaries(result)).toStrictEqual([
+      { value: "30.00%", sub: "3 errors · 10 msgs" },
+    ]);
+  });
 });
 
 describe("usage mosaic token buckets", () => {
@@ -322,6 +358,34 @@ describe("usage mosaic token buckets", () => {
     expect(container.querySelector(".usage-mosaic-total")?.textContent).toContain("10.0K");
   });
 
+  it("renders named, focusable hour toggles and preserves shift selection", () => {
+    const session = makeSessionWithTokenBuckets([
+      { date: "2026-02-01", quarterIndex: 40, totalTokens: 10_000 },
+    ]);
+    const onSelectHour = vi.fn();
+    const container = document.createElement("div");
+    document.body.append(container);
+    render(renderUsageMosaic([session], "utc", [10], onSelectHour), container);
+
+    const cells = container.querySelectorAll<HTMLButtonElement>(".usage-hour-cell");
+    const selectedHour = cells[10];
+    const unselectedHour = cells[11];
+    expect(selectedHour).toBeInstanceOf(HTMLButtonElement);
+    expect(selectedHour?.type).toBe("button");
+    expect(selectedHour?.getAttribute("aria-label")).toBe("10:00 · 10.0K tokens");
+    expect(selectedHour?.getAttribute("aria-pressed")).toBe("true");
+    expect(unselectedHour?.getAttribute("aria-pressed")).toBe("false");
+
+    selectedHour?.focus();
+    expect(document.activeElement).toBe(selectedHour);
+    selectedHour?.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
+    expect(onSelectHour).toHaveBeenCalledWith(10, true);
+    unselectedHour?.click();
+    expect(onSelectHour).toHaveBeenCalledWith(11, false);
+
+    container.remove();
+  });
+
   it("renders precise UTC buckets in their local hour", () => {
     vi.spyOn(Date.prototype, "getHours").mockImplementation(function (this: Date) {
       return (this.getUTCHours() + 8) % 24;
@@ -363,6 +427,36 @@ describe("usage mosaic token buckets", () => {
 
     expect(sessionTouchesSelectedHours(session, [10], "utc")).toBe(true);
     expect(sessionTouchesSelectedHours(session, [11], "utc")).toBe(false);
+  });
+
+  it("renders zero-duration fallback sessions in their activity hour", () => {
+    const instant = Date.parse("2026-02-01T11:00:00.000Z");
+    const session = {
+      key: "instant-token-fallback-session",
+      updatedAt: instant,
+      usage: {
+        totalTokens: 10_000,
+        totalCost: 0,
+        input: 0,
+        output: 10_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        inputCost: 0,
+        outputCost: 0,
+        cacheReadCost: 0,
+        cacheWriteCost: 0,
+        missingCostEntries: 0,
+        firstActivity: instant,
+        lastActivity: instant,
+      },
+    } as unknown as UsageSessionEntry;
+    const container = document.createElement("div");
+    render(renderUsageMosaic([session], "utc", [], vi.fn()), container);
+
+    const cells = container.querySelectorAll<HTMLElement>(".usage-hour-cell");
+    expect(cells[11]?.title).toContain("10.0K");
+    expect(cells[10]?.title).toContain("0 tokens");
+    expect(container.querySelector(".usage-mosaic-total")?.textContent).toContain("10.0K");
   });
 
   it("preserves legacy session-span hour filtering when token buckets are absent", () => {

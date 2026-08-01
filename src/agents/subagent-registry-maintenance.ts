@@ -14,7 +14,7 @@ function isCleanupCompleteForMaintenance(entry: SubagentRunRecord): boolean {
 }
 
 function isActiveForMaintenance(entry: SubagentRunRecord): boolean {
-  return typeof entry.endedAt !== "number";
+  return typeof entry.execution.endedAt !== "number";
 }
 
 function isPendingFinalDeliveryForMaintenance(entry: SubagentRunRecord): boolean {
@@ -43,7 +43,7 @@ function shouldPreserveForMaintenance(entry: SubagentRunRecord): boolean {
 }
 
 /** Lists child session keys protected from session-store maintenance pruning. */
-export function listSessionMaintenanceProtectedSubagentSessionKeys(): string[] {
+function listSessionMaintenanceProtectedSubagentSessionKeys(): string[] {
   const keys = new Set<string>();
   for (const entry of getSubagentRunsSnapshotForRead(subagentRuns).values()) {
     if (!shouldPreserveForMaintenance(entry)) {

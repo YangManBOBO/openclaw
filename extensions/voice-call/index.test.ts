@@ -10,14 +10,19 @@ import type { VoiceCallRuntime } from "./runtime-entry.js";
 import type { CallRecord } from "./src/types.js";
 
 let runtimeStub: VoiceCallRuntime;
+const callGatewayFromCliMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./runtime-entry.js", () => ({
   createVoiceCallRuntime: vi.fn(async () => runtimeStub),
 }));
 
+vi.mock("openclaw/plugin-sdk/gateway-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/gateway-runtime")>()),
+  callGatewayFromCli: callGatewayFromCliMock,
+}));
+
 import plugin from "./index.js";
 import { createVoiceCallRuntime } from "./runtime-entry.js";
-import { testing as voiceCallCliTesting } from "./src/cli.js";
 
 const noopLogger = {
   info: vi.fn(),
@@ -25,8 +30,6 @@ const noopLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
-
-const callGatewayFromCliMock = vi.fn();
 
 type Registered = {
   methods: Map<string, unknown>;
@@ -243,13 +246,11 @@ describe("voice-call plugin", () => {
     runtimeStub = createRuntimeStub();
     callGatewayFromCliMock.mockReset();
     callGatewayFromCliMock.mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:18789"));
-    voiceCallCliTesting.setCallGatewayFromCliForTests(callGatewayFromCliMock);
     vi.mocked(createVoiceCallRuntime).mockReset();
     vi.mocked(createVoiceCallRuntime).mockImplementation(async () => runtimeStub);
   });
 
   afterEach(() => {
-    voiceCallCliTesting.setCallGatewayFromCliForTests();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.voice-call.runtime")];
@@ -757,23 +758,41 @@ describe("voice-call plugin", () => {
     expect(error?.message).not.toContain("endedAt=");
   });
 
-  it("freezes the invoking agent on tool-created calls", async () => {
-    const { tools } = setup({ provider: "mock" }, { agentId: "support" });
-    const tool = tools[0] as {
-      execute: (id: string, params: unknown) => Promise<unknown>;
-    };
+  it.each([{ action: "initiate_call", message: "Hello" }, { message: "Hello" }])(
+    "freezes invocation context for tool-created calls ($action)",
+    async (params) => {
+      const { tools } = setup(
+        { provider: "mock" },
+        { agentId: "support", sessionKey: "agent:support:discord:channel:general" },
+      );
+      const tool = tools[0] as {
+        execute: (id: string, params: unknown) => Promise<unknown>;
+      };
 
-    await tool.execute("id", {
-      action: "initiate_call",
-      to: "+15550001234",
-      message: "Hello",
-    });
+      await tool.execute("id", {
+        ...params,
+        to: "+15550001234",
+        requesterSessionKey: "agent:spoofed:requester",
+        sessionKey: "agent:support:voice:call-1",
+      });
 
-    expect(runtimeStub.manager["initiateCall"]).toHaveBeenCalledWith(
-      "+15550001234",
-      undefined,
-      expect.objectContaining({ agentId: "support", message: "Hello" }),
-    );
+      expect(runtimeStub.manager["initiateCall"]).toHaveBeenCalledWith(
+        "+15550001234",
+        "agent:support:voice:call-1",
+        expect.objectContaining({
+          agentId: "support",
+          message: "Hello",
+          requesterSessionKey: "agent:support:discord:channel:general",
+        }),
+      );
+    },
+  );
+
+  it("does not expose requester session identity to the model", () => {
+    const { tools } = setup({ provider: "mock" });
+    const tool = tools[0] as { parameters: unknown };
+
+    expect(JSON.stringify(tool.parameters)).not.toContain("requesterSessionKey");
   });
 
   it("tool get_status returns json payload", async () => {
@@ -1282,3 +1301,4 @@ describe("voice-call plugin", () => {
     }
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
