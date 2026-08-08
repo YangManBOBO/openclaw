@@ -493,28 +493,6 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    // Reject reset of the default agent's main session key (e.g. agent:main:main
-    // when "main" is the default agent). The gateway's own runtime session must
-    // not be rotated while it is in use; doing so can trigger unbounded recursion
-    // through session lifecycle hooks. This mirrors the protected-session guard
-    // that sessions.delete applies to the resolved main-session canonical key.
-    // Non-default agent main sessions (e.g. agent:work:main) are safe to reset.
-    const cfg = context.getRuntimeConfig();
-    if (isAgentMainSessionKey(cfg, key)) {
-      const parsed = parseAgentSessionKey(key);
-      if (parsed && normalizeAgentId(parsed.agentId) === resolveDefaultAgentId(cfg)) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `Cannot reset the main session (${key}). Use sessions.delete to remove it.`,
-          ),
-        );
-        return;
-      }
-    }
-
     const reason = p.reason === "new" ? "new" : "reset";
     const { performGatewaySessionReset } = await loadSessionsRuntimeModule();
     const result = await performGatewaySessionReset({

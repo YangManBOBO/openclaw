@@ -127,6 +127,13 @@ const mcpRunEndWatchers = mcpRunEndWatcherState.watchers;
 
 const ACP_RUNTIME_CLEANUP_TIMEOUT_MS = 15_000;
 
+// Prevent synchronous re-entrancy at the shared reset lifecycle boundary.
+// Resetting a session that is already mid-reset (e.g. via hooks or callbacks
+// on the default agent's own session) causes "Maximum call stack size exceeded".
+// Tracking by canonical key blocks re-entrant calls while preserving first-time
+// reset behavior for every supported entry path (RPC, chat commands, aliases).
+const activeResets = new Set<string>();
+
 export function archiveSessionTranscriptsForSessionDetailed(params: {
   sessionId: string | undefined;
   storePath: string;
@@ -1069,6 +1076,16 @@ export async function performGatewaySessionReset(params: {
   if (!resetTarget.ok) {
     return resetTarget;
   }
+  const resetCanonicalKey = resetTarget.target.canonicalKey;
+  if (activeResets.has(resetCanonicalKey)) {
+    return {
+      ok: false,
+      error: errorShape(
+        ErrorCodes.UNAVAILABLE,
+        `Session ${resetCanonicalKey} is already being reset; try again in a moment.`,
+      ),
+    };
+  }
   const initialResetEntry = loadSessionEntry(
     params.key,
     resetTarget.requestedAgentId ? { agentId: resetTarget.requestedAgentId } : undefined,
@@ -1135,6 +1152,7 @@ export async function performGatewaySessionReset(params: {
       ),
     };
   }
+  activeResets.add(resetCanonicalKey);
   let admittedWorkReleased = true;
   let resetOwnershipError: ReturnType<typeof errorShape> | undefined;
   return await runExclusiveSessionLifecycleMutation({
@@ -1670,6 +1688,8 @@ export async function performGatewaySessionReset(params: {
         storePath,
       };
     },
+  }).finally(() => {
+    activeResets.delete(resetCanonicalKey);
   });
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
