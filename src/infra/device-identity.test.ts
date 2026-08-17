@@ -2,19 +2,22 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   closeOpenClawStateDatabaseForTest,
   OPENCLAW_STATE_SCHEMA_VERSION,
 } from "../state/openclaw-state-db.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
+import { resolveDeviceIdentityCoordinatorPaths } from "./device-identity-coordinator-paths.js";
 import { acquireDeviceIdentityCoordinator } from "./device-identity-coordinator.js";
 import { normalizeLegacyDeviceIdentity } from "./device-identity-legacy.js";
 import type { DeviceIdentityStoreOptions } from "./device-identity-store.js";
 import {
   deriveDeviceIdFromPublicKey,
   loadDeviceIdentityIfPresent,
+  loadDeviceIdentityIfPresentReadOnly,
   loadOrCreateDeviceIdentity,
   loadOrCreateProcessDeviceIdentity,
   normalizeDevicePublicKeyBase64Url,
@@ -31,6 +34,7 @@ const MISMATCHED_SWIFT_RAW_PRIVATE_KEY = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ
 
 afterEach(() => {
   closeOpenClawStateDatabaseForTest();
+  vi.restoreAllMocks();
 });
 
 function storeOptions(rootDir: string, identityKey?: string): DeviceIdentityStoreOptions {
@@ -39,6 +43,19 @@ function storeOptions(rootDir: string, identityKey?: string): DeviceIdentityStor
     path: path.join(rootDir, "state", "openclaw.sqlite"),
     ...(identityKey ? { identityKey } : {}),
   };
+}
+
+function writeRetiredIdentity(filePath: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    `${JSON.stringify({
+      deviceId: SWIFT_RAW_DEVICE_ID,
+      publicKey: SWIFT_RAW_PUBLIC_KEY,
+      privateKey: SWIFT_RAW_PRIVATE_KEY,
+      createdAtMs: 1_700_000_000_000,
+    })}\n`,
+  );
 }
 
 function waitForChild(child: ChildProcess): Promise<DeviceIdentity> {
@@ -167,12 +184,121 @@ describe("device identity SQLite store", () => {
     });
   });
 
+  it("bridges process-temp and state-local coordinator owners", async () => {
+    await withTempDir("openclaw-device-identity-bridge-", async (rawRootDir) => {
+      const rootDir = fs.realpathSync.native(rawRootDir);
+      const databasePath = path.join(rootDir, "selected-state", "state", "openclaw.sqlite");
+      const stateDir = path.join(rootDir, "selected-state");
+      const temporaryDirectory = path.join(rootDir, "process-temp");
+      fs.mkdirSync(temporaryDirectory, { recursive: true });
+      vi.spyOn(os, "tmpdir").mockReturnValue(temporaryDirectory);
+
+      const paths = resolveDeviceIdentityCoordinatorPaths({
+        databasePath,
+        stateDir,
+        temporaryDirectory,
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      });
+      expect(paths).toHaveLength(2);
+      const processTempPath = paths[0];
+      const stateLocalPath = paths[1];
+      if (!processTempPath || !stateLocalPath) {
+        throw new Error("coordinator bridge paths are unavailable");
+      }
+      const processTempLockDir = path.dirname(processTempPath);
+      const stateLockDir = path.dirname(stateLocalPath);
+
+      const stateOnly = acquireDeviceIdentityCoordinator({
+        databasePath,
+        lockDir: stateLockDir,
+        busyTimeoutMs: 0,
+      });
+      try {
+        expect(() =>
+          acquireDeviceIdentityCoordinator({ databasePath, stateDir, busyTimeoutMs: 0 }),
+        ).toThrow(/migration or creation already owns this state database/);
+        const oldAfterPartialFailure = acquireDeviceIdentityCoordinator({
+          databasePath,
+          lockDir: processTempLockDir,
+          busyTimeoutMs: 0,
+        });
+        oldAfterPartialFailure.release();
+      } finally {
+        stateOnly.release();
+      }
+
+      const dual = acquireDeviceIdentityCoordinator({ databasePath, stateDir, busyTimeoutMs: 0 });
+      try {
+        expect(() =>
+          acquireDeviceIdentityCoordinator({
+            databasePath,
+            lockDir: processTempLockDir,
+            busyTimeoutMs: 0,
+          }),
+        ).toThrow(/migration or creation already owns this state database/);
+        expect(() =>
+          acquireDeviceIdentityCoordinator({
+            databasePath,
+            lockDir: stateLockDir,
+            busyTimeoutMs: 0,
+          }),
+        ).toThrow(/migration or creation already owns this state database/);
+      } finally {
+        dual.release();
+      }
+
+      const oldRuntime = acquireDeviceIdentityCoordinator({
+        databasePath,
+        lockDir: processTempLockDir,
+        busyTimeoutMs: 0,
+      });
+      const transitionalRuntime = acquireDeviceIdentityCoordinator({
+        databasePath,
+        lockDir: stateLockDir,
+        busyTimeoutMs: 0,
+      });
+      transitionalRuntime.release();
+      oldRuntime.release();
+    });
+  });
+
   it("reads a missing database without creating files", async () => {
     await withTempDir("openclaw-device-identity-readonly-", async (rootDir) => {
       const options = storeOptions(rootDir);
       expect(loadDeviceIdentityIfPresent(options)).toBeNull();
       expect(fs.existsSync(options.path!)).toBe(false);
       expect(fs.existsSync(path.dirname(options.path!))).toBe(false);
+    });
+  });
+
+  it("reads a missing database without creating coordinator artifacts", async () => {
+    await withTempDir("openclaw-device-identity-artifact-free-", async (rootDir) => {
+      const options = storeOptions(rootDir);
+      const coordinatorPaths = resolveDeviceIdentityCoordinatorPaths({
+        databasePath: options.path!,
+        stateDir: rootDir,
+        temporaryDirectory: os.tmpdir(),
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      });
+
+      expect(loadDeviceIdentityIfPresentReadOnly(options)).toBeNull();
+      expect(fs.existsSync(options.path!)).toBe(false);
+      for (const coordinatorPath of coordinatorPaths) {
+        expect(fs.existsSync(coordinatorPath)).toBe(false);
+      }
+    });
+  });
+
+  it("reads an existing identity without changing canonical SQLite artifacts", async () => {
+    await withTempDir("openclaw-device-identity-artifact-preserving-", async (rootDir) => {
+      const options = storeOptions(rootDir);
+      const created = loadOrCreateDeviceIdentity(options);
+      closeOpenClawStateDatabaseForTest();
+      const databaseDirectory = path.dirname(options.path!);
+      const artifactsBeforeRead = fs.readdirSync(databaseDirectory).toSorted();
+
+      expect(loadDeviceIdentityIfPresentReadOnly(options)).toEqual(created);
+      expect(fs.readdirSync(databaseDirectory).toSorted()).toEqual(artifactsBeforeRead);
     });
   });
 
@@ -263,11 +389,30 @@ describe("device identity SQLite store", () => {
       expect(secondary.deviceId).not.toBe(primary.deviceId);
 
       const claimPath = path.join(rootDir, "identity", "device.json.doctor-importing");
-      fs.mkdirSync(path.dirname(claimPath), { recursive: true });
-      fs.writeFileSync(claimPath, "{}\n");
-      expect(() => loadOrCreateProcessDeviceIdentity(primaryOptions)).toThrow(/doctor --fix/);
+      writeRetiredIdentity(claimPath);
+      expect(loadOrCreateProcessDeviceIdentity(primaryOptions)).toBe(primary);
+      expect(fs.existsSync(claimPath)).toBe(true);
     });
   });
+
+  it.each(["device.json", "device.json.doctor-importing", "device.json.native-importing"])(
+    "keeps canonical SQLite authoritative when retired %s reappears",
+    async (legacyName) => {
+      await withTempDir("openclaw-device-identity-canonical-", async (rootDir) => {
+        const options = storeOptions(rootDir);
+        const canonical = loadOrCreateDeviceIdentity(options);
+        expect(canonical.deviceId).not.toBe(SWIFT_RAW_DEVICE_ID);
+        closeOpenClawStateDatabaseForTest();
+
+        const legacyPath = path.join(rootDir, "identity", legacyName);
+        writeRetiredIdentity(legacyPath);
+
+        expect(loadDeviceIdentityIfPresent(options)).toEqual(canonical);
+        expect(loadOrCreateDeviceIdentity(options)).toEqual(canonical);
+        expect(fs.existsSync(legacyPath)).toBe(true);
+      });
+    },
+  );
 
   it("returns one authoritative winner to concurrent creators", async () => {
     await withTempDir("openclaw-device-identity-concurrent-", async (rootDir) => {

@@ -1,7 +1,7 @@
 import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
-import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt.queue-message.js";
+import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt-queue-message.js";
 import {
   cancelAskUserPromptDelivery,
   createAskUserTool,
@@ -60,7 +60,7 @@ describe("ask_user normalization", () => {
 
     expect(normalized.timeoutSeconds).toBe(30);
     expect(normalized.questions[0]).toMatchObject({
-      id: "deploy_target",
+      questionId: "deploy_target",
       header: "Deployment t",
       isOther: true,
     });
@@ -104,6 +104,26 @@ describe("ask_user normalization", () => {
 });
 
 describe("ask_user prompt delivery", () => {
+  it("reserves duplicate bare keys independently per agent", () => {
+    const questions = normalizeAskUserParams(validArgs).questions;
+    const research = reserveAskUserPromptDelivery({
+      toolCallId: "call-research",
+      sessionKey: "global",
+      agentId: "research",
+      questions,
+    });
+    const ops = reserveAskUserPromptDelivery({
+      toolCallId: "call-ops",
+      sessionKey: "global",
+      agentId: "ops",
+      questions,
+    });
+
+    expect(research).toBeDefined();
+    expect(ops).toBeDefined();
+    expect(research?.questionId).not.toBe(ops?.questionId);
+  });
+
   it("uses the Gateway record when the executor has isolated runtime state", async () => {
     const questions = normalizeAskUserParams(validArgs).questions;
     const reservation = reserveAskUserPromptDelivery({
@@ -252,7 +272,7 @@ describe("ask_user prompt delivery", () => {
     settleAskUserPromptDelivery(reservation.questionId);
     finishWait?.({
       status: "answered",
-      answers: { answers: { deploy_target: { answers: ["Production"] } } },
+      answers: { answers: { deploy_target: ["Production"] } },
     });
     await expect(pending).resolves.toMatchObject({ details: { status: "answered" } });
   });
@@ -260,7 +280,7 @@ describe("ask_user prompt delivery", () => {
 
 describe("ask_user execution", () => {
   it("returns answered details plus readable answer lines", async () => {
-    const answers = { answers: { deploy_target: { answers: ["Staging (Recommended)"] } } };
+    const answers = { answers: { deploy_target: ["Staging (Recommended)"] } };
     const gateway = gatewayStub(async (method, _opts, params) => {
       if (method === "question.request") {
         return { id: params.id, expiresAtMs: Date.now() + 30_000 };
@@ -273,6 +293,7 @@ describe("ask_user execution", () => {
     const tool = createAskUserTool({
       agentId: "main",
       sessionKey: "agent:main:main",
+      runId: "run-main",
       gatewayCall: gateway.call,
     });
 
@@ -294,6 +315,7 @@ describe("ask_user execution", () => {
         id: questionId,
         agentId: "main",
         sessionKey: "agent:main:main",
+        runId: "run-main",
         timeoutMs: 900_000,
       }),
       undefined,
@@ -599,7 +621,7 @@ describe("ask_user execution", () => {
     if (!reservation) {
       throw new Error("expected prompt reservation");
     }
-    const answers = { answers: { deploy_target: { answers: ["Production"] } } };
+    const answers = { answers: { deploy_target: ["Production"] } };
     let waitCalls = 0;
     const gateway = gatewayStub(async (method, _opts, params) => {
       if (method === "question.request") {
@@ -735,7 +757,7 @@ describe("ask_user execution", () => {
       {},
       {
         id: questionId,
-        answers: { answers: { deploy_target: { answers: ["A custom destination"] } } },
+        answers: { answers: { deploy_target: ["A custom destination"] } },
         resolvedBy: "plain-text",
       },
     );

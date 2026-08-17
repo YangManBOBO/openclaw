@@ -105,9 +105,16 @@ poll, and **Refresh** remains available as manual recovery.
 When more than one board exists, the toolbar includes a **Board** filter backed
 by persisted board metadata rather than only the currently visible cards. Empty
 and archived boards therefore remain selectable. Cards without an explicit
-board id belong to the canonical `default` board. The selected board is stored
-in the `?board=` query parameter, so the filtered Workboard URL can be bookmarked
-or shared; choosing **All boards** removes the parameter.
+board id belong to the canonical `default` board. Each board has a canonical
+`/workboard/<boardId>` page that can be bookmarked, shared, or pinned in the
+sidebar. The previously shipped `/workboard?board=<boardId>` form remains a
+compatibility alias and redirects to that page while preserving other query
+parameters. Choosing **All boards** returns to `/workboard`.
+
+A board can store an `automationJobId` reference to the automation job that
+owns its AI-categorization prompt, model, schedule, and run history. The board
+page shows an **Automation** link when that reference is present. Deleting the
+board does not delete or otherwise mutate the operator-owned automation job.
 
 Cards are stored in the plugin's own Gateway state and move with the rest of
 that Gateway's OpenClaw state (see [Storage](#storage)).
@@ -129,11 +136,11 @@ resulting task, run id, and session key back onto the card. Each linked
 execution also records an attempt summary (engine, mode, model, run id,
 timestamps, status, rolling failure count) so repeated failures stay visible.
 
-The dashboard refreshes task status from the Gateway task ledger, matching
-tasks to cards by task id, run id, or linked session key. A queued/running
-task keeps the card's lifecycle active; a finished, failed, timed-out, or
-cancelled task moves the card toward `review` or `blocked` using the same sync
-rule as linked sessions (see [Session lifecycle sync](#session-lifecycle-sync)).
+The dashboard refreshes task status from the Gateway task ledger for its
+lifecycle display, matching tasks to cards by task id, run id, or linked
+session key. Card status changes are persisted by the Gateway-side Workboard
+plugin using the linked run and session lifecycle (see
+[Session lifecycle sync](#session-lifecycle-sync)).
 
 ## Agent tools
 
@@ -312,6 +319,13 @@ still offers start controls to restart into a fresh session. If an active
 linked session stops reporting recent activity, Workboard marks the card
 `stale` and stores that as metadata until the lifecycle clears it.
 
+Lifecycle writes are owned by the Gateway-side Workboard plugin, so they do
+not depend on an open browser tab. Agent and subagent completion hooks persist
+terminal outcomes immediately. A bounded session sweep runs once per minute to
+reconcile active, idle, missing, and stale session state. Each store mutation
+emits the normal `plugin.workboard.changed` invalidation, so an open dashboard
+reloads the canonical card instead of writing its own lifecycle projection.
+
 While a card is in an active work state, Workboard follows the linked session:
 
 | Linked session state                  | Card status |
@@ -347,6 +361,20 @@ the template id is stored as card metadata.
 6. Let lifecycle sync move running work into `review`/`blocked`, then manually
    move the card to `done` when accepted.
 
+### Session-board widgets
+
+Workboard ships two native widgets for session dashboards (see
+[Dashboards](/web/dashboards)). The agent pins them with its `dashboard` tool
+using `content: { kind: "plugin", pluginKind, props }`, and they render as
+first-party UI with live data — no sandbox frame or capability grant:
+
+- `workboard:card` with `props: { cardId }` shows one card with its status
+  control, priority, and assigned agent.
+- `workboard:mini` with optional `props: { boardId, limit }` shows per-status
+  counts plus the top ready/running cards, and links to the full board page.
+  Without `boardId` it aggregates every board; with `boardId` it scopes to that
+  board (cards created without an explicit board id live on `default`).
+
 ## Diagnostics
 
 Diagnostics are computed from local card metadata. Built-in checks flag:
@@ -359,6 +387,7 @@ Diagnostics are computed from local card metadata. Built-in checks flag:
 | `repeated_failures`         | Card's tracked failure count reaches 2 or more.                                |
 | `missing_proof`             | `done` card with no proof, artifacts, or attachments.                          |
 | `orphaned_session`          | `running` card with a `sessionKey` but no `execution` metadata.                |
+| `archived_but_active`       | Archived card remains in any non-`done` lifecycle status.                      |
 
 ## Permissions
 

@@ -1,7 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { InMemoryBoardStore } from "../boards/board-store.js";
+import { createTestBoardStore } from "../boards/board-store.test-support.js";
+import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { handleBoardHttpRequest } from "./board-http.js";
 import {
   BOARD_VIEW_TICKET_TTL_MS,
@@ -9,8 +14,10 @@ import {
   verifyBoardViewTicket,
 } from "./board-view-ticket.js";
 
-const store = new InMemoryBoardStore();
+const stateDir = mkdtempSync(path.join(tmpdir(), "openclaw-board-http-"));
+const store = createTestBoardStore({ stateDir });
 const nowMs = 1_800_000_000_000;
+const statusHtml = "<!doctype html><p>Status 界</p>";
 let server: Server;
 let baseUrl: string;
 
@@ -18,7 +25,7 @@ beforeAll(async () => {
   store.putWidget({
     sessionKey: "agent:main:main",
     name: "status",
-    content: { kind: "html", html: "<!doctype html><p>Status</p>" },
+    content: { kind: "html", html: statusHtml },
   });
   store.putWidget({
     sessionKey: "agent:main:main",
@@ -26,13 +33,19 @@ beforeAll(async () => {
     content: { kind: "html", html: "pending" },
     declared: { tools: ["pending.read"] },
   });
-  store.putWidget({
+  const rejected = store.putWidget({
     sessionKey: "agent:main:main",
     name: "rejected",
     content: { kind: "html", html: "rejected" },
     declared: { tools: ["rejected.read"] },
   });
-  store.grant("agent:main:main", "rejected", "rejected", 1);
+  store.grant(
+    "agent:main:main",
+    "rejected",
+    "rejected",
+    1,
+    rejected.widgets.find((widget) => widget.name === "rejected")?.instanceId,
+  );
   store.putWidget({
     sessionKey: "agent:main:main",
     name: "mcp",
@@ -42,15 +55,21 @@ beforeAll(async () => {
         serverName: "server",
         toolName: "tool",
         uiResourceUri: "ui://resource",
-        originSessionKey: "origin",
         toolCallId: "call",
       },
+      interactive: false,
     },
   });
   store.putWidget({
     sessionKey: "agent:main:main",
     name: "revisioned",
     content: { kind: "html", html: "<p>one</p>" },
+  });
+  store.putWidget({
+    sessionKey: "agent:main:main",
+    name: "grantable",
+    content: { kind: "html", html: "<script>pending()</script>" },
+    declared: { netOrigins: ["https://example.com"] },
   });
   server = createServer((req, res) => {
     const handled = handleBoardHttpRequest(req, res, {
@@ -79,11 +98,14 @@ afterAll(async () => {
       resolve();
     });
   });
+  closeOpenClawAgentDatabasesForTest();
+  closeOpenClawStateDatabaseForTest();
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 function ticketFor(name: string, revision = 1, issuedAtMs = nowMs): string {
   const document = store.readWidgetHtml("agent:main:main", name);
-  if (!document || !("html" in document)) {
+  if (!document) {
     throw new Error(`missing HTML widget: ${name}`);
   }
   return createBoardViewTicket({
@@ -132,13 +154,51 @@ describe("board widget HTTP", () => {
     });
   });
 
-  it("serves HTML bytes with a valid ticket and no gateway auth", async () => {
-    const response = await request("status", { ticket: ticketFor("status") });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
-    expect(response.headers.get("content-security-policy")).toBe("sandbox allow-scripts");
-    expect(response.headers.get("cache-control")).toBe("no-cache");
-    await expect(response.text()).resolves.toBe("<!doctype html><p>Status</p>");
+  it.each([
+    {
+      label: "authorized multibyte HTML",
+      name: "status",
+      ticket: () => ticketFor("status"),
+      status: 200,
+      body: statusHtml,
+      contentType: "text/html; charset=utf-8",
+    },
+    {
+      label: "malformed encoded path",
+      name: "%E0%A4%A",
+      status: 404,
+      body: "Not Found",
+      contentType: "text/plain; charset=utf-8",
+    },
+    {
+      label: "missing ticket",
+      name: "status",
+      status: 401,
+      body: "Unauthorized",
+      contentType: "text/plain; charset=utf-8",
+    },
+  ])("preserves GET metadata while suppressing the HEAD body for $label", async (testCase) => {
+    for (const method of ["GET", "HEAD"] as const) {
+      const response = await request(testCase.name, {
+        method,
+        ticket: testCase.ticket?.(),
+      });
+      const body = Buffer.from(await response.arrayBuffer());
+
+      expect(response.status).toBe(testCase.status);
+      expect(response.headers.get("content-type")).toBe(testCase.contentType);
+      expect(response.headers.get("content-length")).toBe(String(Buffer.byteLength(testCase.body)));
+      expect(response.headers.get("access-control-allow-origin")).toBe("*");
+      expect(body).toEqual(method === "GET" ? Buffer.from(testCase.body) : Buffer.alloc(0));
+
+      if (testCase.status === 200) {
+        expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
+        expect(response.headers.get("content-security-policy")).toContain("connect-src 'none'");
+        expect(response.headers.get("content-security-policy")).toContain("webrtc 'block'");
+        expect(response.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
+        expect(response.headers.get("cache-control")).toBe("no-cache");
+      }
+    }
   });
 
   it("does not require or inspect an operator token", async () => {
@@ -154,11 +214,33 @@ describe("board widget HTTP", () => {
     const valid = ticketFor("status");
     const readSpy = vi.spyOn(store, "readWidgetHtml");
     expect((await request("status")).status).toBe(401);
-    expect((await request("status", { ticket: "garbage" })).status).toBe(401);
+    const garbage = await request("status", { ticket: "garbage" });
+    expect(garbage.status).toBe(401);
+    expect(garbage.headers.get("access-control-allow-origin")).toBe("*");
     expect((await request("status", { ticket: `${valid.slice(0, -1)}x` })).status).toBe(401);
     expect((await request("status", { ticket: expired })).status).toBe(401);
     expect(readSpy).not.toHaveBeenCalled();
     readSpy.mockRestore();
+  });
+
+  it("withholds declared widget bytes until the operator grants them", async () => {
+    const ticket = ticketFor("grantable");
+    expect((await request("grantable", { ticket })).status).toBe(401);
+
+    store.grant(
+      "agent:main:main",
+      "grantable",
+      "granted",
+      1,
+      store.getSnapshot("agent:main:main").widgets.find((widget) => widget.name === "grantable")
+        ?.instanceId,
+    );
+    const response = await request("grantable", { ticket });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-security-policy")).toContain(
+      "connect-src https://example.com",
+    );
+    await expect(response.text()).resolves.toBe("<script>pending()</script>");
   });
 
   it("rejects a ticket after the widget revision changes", async () => {
@@ -251,9 +333,9 @@ describe("board widget HTTP", () => {
     expect((await request("mcp", { ticket: mcpTicket })).status).toBe(401);
   });
 
-  it("allows GET only", async () => {
+  it("allows GET and HEAD only", async () => {
     const response = await request("status", { method: "POST", ticket: ticketFor("status") });
     expect(response.status).toBe(405);
-    expect(response.headers.get("allow")).toBe("GET");
+    expect(response.headers.get("allow")).toBe("GET, HEAD");
   });
 });

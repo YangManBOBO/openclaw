@@ -1,6 +1,12 @@
 // Workboard plugin module implements store behavior.
 import { randomUUID } from "node:crypto";
-import type { WorkboardAttachment, WorkboardCard } from "@openclaw/workboard-contract";
+import type {
+  WorkboardAttachment,
+  WorkboardCard,
+  WorkboardExecutionStatus,
+  WorkboardStaleState,
+  WorkboardStatus,
+} from "@openclaw/workboard-contract";
 import type {
   PersistedWorkboardAttachment,
   PersistedWorkboardBoard,
@@ -18,9 +24,10 @@ import {
   mergeDiagnostics,
   removeUndefinedCardFields,
   retryBudgetExhausted,
+  shouldSyncWorkboardLifecycleStatus,
 } from "./store-card-helpers.js";
 import {
-  CLAIM_RECLAIM_MS,
+  isWorkboardClaimReclaimable,
   MAX_ATTACHMENT_ENTRIES,
   MAX_CARDS,
   MAX_CARD_NOTIFICATIONS,
@@ -45,6 +52,68 @@ export type { WorkboardDispatchResult } from "./store-inputs.js";
 
 // Capability layers split review boundaries only; the core still owns persistence and mutation order.
 export class WorkboardStore extends WorkboardNotificationStore {
+  async syncLifecycle(
+    id: string,
+    input: {
+      targetStatus: WorkboardStatus | undefined;
+      executionStatus: WorkboardExecutionStatus | undefined;
+      sourceUpdatedAt: number | undefined;
+      stale: WorkboardStaleState | undefined;
+      now: number;
+    },
+  ): Promise<boolean> {
+    return await this.enqueueMutation(async () => {
+      const card = await this.get(id);
+      if (!card || card.metadata?.archivedAt) {
+        return false;
+      }
+      const patch: WorkboardCardPatch = {};
+      let metadata: Record<string, unknown> | undefined;
+      // Recheck manual status under the mutation lock; a hook can race an operator move.
+      if (
+        input.sourceUpdatedAt !== undefined &&
+        shouldSyncWorkboardLifecycleStatus(card, input.targetStatus)
+      ) {
+        patch.status = input.targetStatus;
+        metadata = { lifecycleStatusSourceUpdatedAt: input.sourceUpdatedAt };
+      }
+      if (
+        card.execution &&
+        input.executionStatus &&
+        card.execution.status !== input.executionStatus
+      ) {
+        patch.execution = {
+          ...card.execution,
+          status: input.executionStatus,
+          updatedAt: input.now,
+        };
+      }
+      if (input.stale) {
+        const existing = card.metadata?.stale;
+        if (
+          !existing ||
+          existing.lastSessionUpdatedAt !== input.stale.lastSessionUpdatedAt ||
+          existing.reason !== input.stale.reason
+        ) {
+          metadata = {
+            ...metadata,
+            stale: { ...input.stale, detectedAt: existing?.detectedAt ?? input.stale.detectedAt },
+          };
+        }
+      } else if (card.metadata?.stale) {
+        metadata = { ...metadata, stale: null };
+      }
+      if (metadata) {
+        patch.metadata = metadata;
+      }
+      if (Object.keys(patch).length === 0) {
+        return false;
+      }
+      await this.updateCard(id, patch);
+      return true;
+    });
+  }
+
   private async shouldAutoOrchestrate(card: WorkboardCard): Promise<boolean> {
     if (
       card.status !== "triage" ||
@@ -69,6 +138,10 @@ export class WorkboardStore extends WorkboardNotificationStore {
       const orchestrated: WorkboardCard[] = [];
       const orchestratedByBoard = new Map<string, number>();
       for (const card of await this.list({ boardId })) {
+        // Archived cards remain readable and restorable, but must never re-enter automation.
+        if (card.metadata?.archivedAt) {
+          continue;
+        }
         let latest = await this.promoteDependencyReady(card.id, now);
         const wasPromoted = latest.status !== card.status;
         const claim = latest.metadata?.claim;
@@ -78,7 +151,7 @@ export class WorkboardStore extends WorkboardNotificationStore {
         const timedOut =
           Boolean(maxRuntimeSeconds && runtimeStartedAt) &&
           now - runtimeStartedAt! > secondsToDurationMs(maxRuntimeSeconds!);
-        const claimExpired = Boolean(claim?.expiresAt && now - claim.expiresAt > CLAIM_RECLAIM_MS);
+        const claimExpired = isWorkboardClaimReclaimable(claim, now);
         const retriesExhausted = retryBudgetExhausted(latest);
         if (latest.status === "running" && (timedOut || claimExpired)) {
           const reason = timedOut
@@ -138,7 +211,7 @@ export class WorkboardStore extends WorkboardNotificationStore {
           });
           blocked.push(latest);
         }
-        if (latest.status === "ready") {
+        if (latest.status === "ready" && !latest.metadata?.archivedAt) {
           latest = await this.recordDispatch(latest, now);
         }
         if (await this.shouldAutoOrchestrate(latest)) {
@@ -224,7 +297,7 @@ export class WorkboardStore extends WorkboardNotificationStore {
       const rows: WorkboardDiagnosticsResult["diagnostics"] = [];
       for (const card of cards) {
         const latest = await this.get(card.id);
-        if (!latest) {
+        if (!latest || latest.metadata?.archivedAt) {
           continue;
         }
         const diagnostics = mergeDiagnostics(

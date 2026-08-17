@@ -7,9 +7,10 @@ import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { NodePluginToolDescriptor } from "../../packages/gateway-protocol/src/schema/nodes.js";
-import { matchesMcpToolFilterPattern } from "../agents/agent-bundle-mcp-filter.js";
 import { createMcpJsonSchemaValidator } from "../agents/mcp-json-schema-validator.js";
 import { sanitizeMcpMetadataText } from "../agents/mcp-metadata.js";
+import { collectMcpPaginatedItems } from "../agents/mcp-pagination.js";
+import { isMcpToolAllowed } from "../agents/mcp-tool-filter.js";
 import { resolveMcpRequestTimeoutMs } from "../agents/mcp-transport-config.js";
 import { resolveMcpTransport } from "../agents/mcp-transport.js";
 import { normalizeConfiguredMcpServers } from "../config/mcp-config-normalize.js";
@@ -29,18 +30,21 @@ const NODE_MCP_ERROR_MAX_CHARS = 1_024;
 const NODE_MCP_MAX_DESCRIPTORS = 128;
 const NODE_MCP_MAX_DESCRIPTOR_BYTES = 1024 * 1024;
 const NODE_MCP_MAX_CATALOG_BYTES = 10 * 1024 * 1024;
+const NODE_MCP_MAX_LIST_PAGES = NODE_MCP_MAX_DESCRIPTORS;
+// The byte cap charges every response; this separately bounds retained tiny-tool object overhead.
+const NODE_MCP_MAX_LISTED_TOOLS = NODE_MCP_MAX_DESCRIPTORS * NODE_MCP_MAX_LIST_PAGES;
 
 type NodeHostMcpClient = {
   onclose?: () => void;
   connect(transport: Transport): Promise<void>;
   listTools(
     params?: { cursor?: string },
-    options?: { timeout?: number },
+    options?: { timeout?: number; maxTotalTimeout?: number; signal?: AbortSignal },
   ): Promise<{ tools: Tool[]; nextCursor?: string }>;
   callTool(
     params: { name: string; arguments?: Record<string, unknown> },
     resultSchema?: undefined,
-    options?: { timeout?: number },
+    options?: { timeout?: number; signal?: AbortSignal },
   ): Promise<CallToolResult>;
   close(): Promise<void>;
 };
@@ -55,7 +59,6 @@ type NodeHostMcpTransport = {
 type NodeHostMcpSession = {
   client: NodeHostMcpClient;
   connected: boolean;
-  tools: Set<string>;
   toolCallTimeoutMs: number;
   detachStderr?: () => void;
 };
@@ -77,13 +80,13 @@ export class NodeHostMcpError extends Error {
 }
 
 export type NodeHostMcpManager = {
-  configuredServerCount: number;
   descriptors: NodePluginToolDescriptor[];
   callMcpTool(params: {
     server: string;
     tool: string;
     arguments?: Record<string, unknown>;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<CallToolResult>;
   close(): Promise<void>;
 };
@@ -91,6 +94,7 @@ export type NodeHostMcpManager = {
 type NodeHostMcpManagerDeps = {
   createClient?: (serverName: string) => NodeHostMcpClient;
   resolveTransport?: (serverName: string, config: McpServerConfig) => NodeHostMcpTransport | null;
+  onDescriptorsChanged?: () => void;
   warn?: (message: string) => void;
   signal?: AbortSignal;
 };
@@ -101,7 +105,7 @@ type ListedNodeMcpTool = {
 };
 
 function defaultWarn(message: string): void {
-  process.stderr.write(`${message}\n`);
+  console.warn(message);
 }
 
 function formatMcpError(error: unknown): string {
@@ -193,22 +197,6 @@ function buildNodeMcpToolDescriptors(
   return descriptors;
 }
 
-function isOAuthServer(config: McpServerConfig): boolean {
-  return config.auth === "oauth" || Boolean(config.oauth);
-}
-
-function shouldExposeTool(config: McpServerConfig, toolName: string): boolean {
-  const include = config.toolFilter?.include ?? [];
-  const exclude = config.toolFilter?.exclude ?? [];
-  if (
-    include.length > 0 &&
-    !include.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName))
-  ) {
-    return false;
-  }
-  return !exclude.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName));
-}
-
 async function connectWithTimeout(
   client: NodeHostMcpClient,
   transport: Transport,
@@ -259,32 +247,33 @@ async function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined
 async function listAllTools(
   client: NodeHostMcpClient,
   timeoutMs: number,
+  shouldInclude: (toolName: string) => boolean,
   signal?: AbortSignal,
 ): Promise<Tool[]> {
-  const tools: Tool[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await withAbort(
-      client.listTools(cursor ? { cursor } : undefined, { timeout: timeoutMs }),
-      signal,
-    );
-    tools.push(...page.tools);
-    cursor = page.nextCursor;
-  } while (cursor);
-  return tools;
-}
-
-function resolveCallTimeoutMs(value: number | undefined): number {
-  return clampPositiveTimerTimeoutMs(value) ?? NODE_MCP_TOOL_CALL_TIMEOUT_MS;
-}
-
-function isMcpTimeoutError(error: unknown): boolean {
-  return Boolean(
-    error &&
-    typeof error === "object" &&
-    "code" in error &&
-    (error as { code?: unknown }).code === ErrorCode.RequestTimeout,
-  );
+  return await collectMcpPaginatedItems({
+    label: "MCP tool listing",
+    itemLabel: "tools",
+    timeoutMs,
+    maxPages: NODE_MCP_MAX_LIST_PAGES,
+    maxItems: NODE_MCP_MAX_LISTED_TOOLS,
+    maxBytes: NODE_MCP_MAX_CATALOG_BYTES,
+    signal,
+    loadPage: async ({ cursor, requestTimeoutMs, signal: requestSignal }) => {
+      const page = await client.listTools(cursor === undefined ? undefined : { cursor }, {
+        timeout: requestTimeoutMs,
+        maxTotalTimeout: requestTimeoutMs,
+        signal: requestSignal,
+      });
+      return { items: page.tools, nextCursor: page.nextCursor, serializedValue: page };
+    },
+    mapItem: (tool) => {
+      const toolName = tool.name.trim();
+      if (!toolName || !shouldInclude(toolName)) {
+        return undefined;
+      }
+      return { ...tool, name: toolName };
+    },
+  });
 }
 
 /** Starts configured MCP servers once for the lifetime of the node host. */
@@ -301,13 +290,13 @@ export async function startNodeHostMcpManager(
         { jsonSchemaValidator: createMcpJsonSchemaValidator() },
       ) as NodeHostMcpClient);
   const resolveTransport = deps.resolveTransport ?? resolveMcpTransport;
-  const configured = listEnabledNodeHostMcpServers(servers);
   const sessions = new Map<string, NodeHostMcpSession>();
   const listedTools: ListedNodeMcpTool[] = [];
+  const descriptors: NodePluginToolDescriptor[] = [];
 
   await Promise.all(
-    configured.map(async ([serverName, config]) => {
-      if (isOAuthServer(config)) {
+    listEnabledNodeHostMcpServers(servers).map(async ([serverName, config]) => {
+      if (config.auth === "oauth" || config.oauth) {
         warn(`node host MCP server "${serverName}" skipped: OAuth is not supported`);
         return;
       }
@@ -324,34 +313,38 @@ export async function startNodeHostMcpManager(
         session = {
           client,
           connected: false,
-          tools: new Set<string>(),
           toolCallTimeoutMs: resolveMcpRequestTimeoutMs(config, NODE_MCP_TOOL_CALL_TIMEOUT_MS),
           detachStderr: resolved.detachStderr,
         };
         // MCP Client exposes callback properties rather than an EventTarget surface.
         // oxlint-disable-next-line unicorn/prefer-add-event-listener
         client.onclose = () => {
-          if (session) {
-            session.connected = false;
+          if (!session?.connected) {
+            return;
           }
+          session.connected = false;
+          descriptors.splice(
+            0,
+            descriptors.length,
+            ...descriptors.filter((descriptor) => descriptor.mcp?.server !== serverName),
+          );
+          deps.onDescriptorsChanged?.();
         };
         await withAbort(
           connectWithTimeout(client, resolved.transport, resolved.connectionTimeoutMs),
           deps.signal,
         );
         session.connected = true;
-        const tools = (await listAllTools(client, resolved.requestTimeoutMs, deps.signal)).filter(
-          (tool) => {
-            const toolName = tool.name.trim();
-            return Boolean(toolName) && shouldExposeTool(config, toolName);
-          },
+        const tools = await listAllTools(
+          client,
+          resolved.requestTimeoutMs,
+          (toolName) => isMcpToolAllowed(config.toolFilter, toolName),
+          deps.signal,
         );
-        for (const tool of tools) {
-          const toolName = tool.name.trim();
-          session.tools.add(toolName);
-          listedTools.push({ serverName, tool: { ...tool, name: toolName } });
+        if (session.connected) {
+          sessions.set(serverName, session);
+          listedTools.push(...tools.map((tool) => ({ serverName, tool })));
         }
-        sessions.set(serverName, session);
       } catch (error) {
         if (session) {
           session.connected = false;
@@ -367,15 +360,17 @@ export async function startNodeHostMcpManager(
     }),
   );
 
-  const descriptors = buildNodeMcpToolDescriptors(listedTools);
-  if (descriptors.length < listedTools.length) {
+  const publishableTools = listedTools.filter(
+    ({ serverName }) => sessions.get(serverName)?.connected,
+  );
+  descriptors.push(...buildNodeMcpToolDescriptors(publishableTools));
+  if (descriptors.length < publishableTools.length) {
     warn(
-      `node host MCP catalog bounded: published ${descriptors.length} of ${listedTools.length} tools`,
+      `node host MCP catalog bounded: published ${descriptors.length} of ${publishableTools.length} tools`,
     );
   }
   let closed = false;
   return {
-    configuredServerCount: configured.length,
     descriptors,
     async callMcpTool(params) {
       const session = sessions.get(params.server);
@@ -385,18 +380,25 @@ export async function startNodeHostMcpManager(
           `MCP server "${params.server}" is unavailable`,
         );
       }
-      if (!session.tools.has(params.tool)) {
+      const published = descriptors.some(
+        (descriptor) =>
+          descriptor.mcp?.server === params.server && descriptor.mcp.tool === params.tool,
+      );
+      if (!published) {
         throw new NodeHostMcpError(
           "MCP_TOOL_UNAVAILABLE",
           `MCP tool "${params.tool}" is unavailable on server "${params.server}"`,
         );
       }
+      const requestedTimeoutMs =
+        clampPositiveTimerTimeoutMs(params.timeoutMs) ?? NODE_MCP_TOOL_CALL_TIMEOUT_MS;
       try {
         return await session.client.callTool(
           { name: params.tool, arguments: params.arguments ?? {} },
           undefined,
           {
-            timeout: Math.min(resolveCallTimeoutMs(params.timeoutMs), session.toolCallTimeoutMs),
+            timeout: Math.min(requestedTimeoutMs, session.toolCallTimeoutMs),
+            ...(params.signal ? { signal: params.signal } : {}),
           },
         );
       } catch (error) {
@@ -407,7 +409,12 @@ export async function startNodeHostMcpManager(
             { cause: error },
           );
         }
-        if (isMcpTimeoutError(error)) {
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === ErrorCode.RequestTimeout
+        ) {
           throw new NodeHostMcpError("MCP_TOOL_TIMEOUT", formatMcpError(error), { cause: error });
         }
         throw new NodeHostMcpError("MCP_TOOL_ERROR", formatMcpError(error), { cause: error });

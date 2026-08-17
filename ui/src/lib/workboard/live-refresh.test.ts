@@ -1,22 +1,15 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.js";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { normalizeWorkboardChange } from "./change-payload.ts";
 import {
   configureWorkboardLiveRefresh,
   handleWorkboardChanged,
   resumeWorkboardLiveRefresh,
-  stopWorkboardLiveRefresh,
 } from "./live-refresh.ts";
 import { loadWorkboard } from "./loading.ts";
-import { getWorkboardState } from "./runtime.ts";
-
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
-}
+import { stopWorkboardLiveRefresh, getWorkboardState } from "./runtime.ts";
 
 function createClient(run: (method: string) => unknown) {
   return { request: vi.fn(async (method: string) => run(method)) };

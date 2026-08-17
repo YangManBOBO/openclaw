@@ -13,12 +13,26 @@ import { NonEmptyString } from "./primitives.js";
 export {
   ErrorCodes,
   GatewayErrorDetailCodes,
+  type CronJobNotFoundErrorDetails,
   type ErrorCode,
   type GatewayErrorDetails,
+  type McpAppViewExpiredErrorDetails,
   type MissingScopeErrorDetails,
+  type UserPrefsLimitExceededErrorDetails,
+  type ProjectCloneErrorDetails,
+  type ProjectCloneFailureCause,
+  type UnknownAgentIdErrorDetails,
+  type WizardNotFoundErrorDetails,
+  readCronJobNotFoundError,
+  isMcpAppViewExpiredError,
   readMissingScopeError,
   readMissingScopeErrorDetails,
 } from "../gateway-error-details.js";
+
+export const CronJobNotFoundErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.CRON_JOB_NOT_FOUND),
+  jobId: NonEmptyString,
+});
 
 /** Missing operator-scope details shared by WebSocket and HTTP responses. */
 export const MissingScopeErrorDetailsSchema = closedObject({
@@ -27,8 +41,42 @@ export const MissingScopeErrorDetailsSchema = closedObject({
   requiredScopes: Type.Array(NonEmptyString, { minItems: 1 }),
 });
 
-/** Structured details emitted by method-level authorization failures. */
-export const GatewayErrorDetailsSchema = MissingScopeErrorDetailsSchema;
+export const McpAppViewExpiredErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.MCP_APP_VIEW_EXPIRED),
+});
+
+export const UserPrefsLimitExceededErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.USER_PREFS_LIMIT_EXCEEDED),
+  limit: Type.Integer({ minimum: 1 }),
+  currentCount: Type.Integer({ minimum: 0 }),
+});
+
+export const UnknownAgentIdErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.UNKNOWN_AGENT_ID),
+  agentId: NonEmptyString,
+});
+
+export const WizardNotFoundErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.WIZARD_NOT_FOUND),
+});
+
+export const ProjectCloneErrorDetailsSchema = closedObject({
+  code: Type.Literal(GatewayErrorDetailCodes.PROJECT_CLONE_FAILED),
+  cause: Type.String({
+    enum: ["invalid_url", "auth_required", "not_found", "network", "target_exists", "clone_failed"],
+  }),
+});
+
+/** Structured details emitted by method-level failures. */
+export const GatewayErrorDetailsSchema = Type.Union([
+  CronJobNotFoundErrorDetailsSchema,
+  MissingScopeErrorDetailsSchema,
+  McpAppViewExpiredErrorDetailsSchema,
+  UserPrefsLimitExceededErrorDetailsSchema,
+  ProjectCloneErrorDetailsSchema,
+  UnknownAgentIdErrorDetailsSchema,
+  WizardNotFoundErrorDetailsSchema,
+]);
 
 /** Builds the canonical gateway error payload while preserving optional retry metadata. */
 export function errorShape(

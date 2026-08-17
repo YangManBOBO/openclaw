@@ -1,5 +1,5 @@
 // Directive tag tests cover parsing and filtering inline directive tags.
-import { describe, expect, test } from "vitest";
+import { describe, expect, it, test } from "vitest";
 import {
   parseInlineDirectives,
   sanitizeReplyDirectiveId,
@@ -69,6 +69,43 @@ describe("stripInlineDirectiveTagsForDelivery", () => {
     const result = stripInlineDirectiveTagsForDelivery(input);
     expect(result.changed).toBe(false);
     expect(result.text).toBe(input);
+  });
+});
+
+describe("parseInlineDirectives markdown code", () => {
+  it("leaves directive examples inside inline and fenced code untouched", () => {
+    const input = [
+      "Use `[[reply_to_current]]` literally.",
+      "```text",
+      "[[audio_as_voice]]",
+      "[[reply_to:example-id]]",
+      "```",
+    ].join("\n");
+
+    expect(parseInlineDirectives(input)).toEqual({
+      text: input,
+      audioAsVoice: false,
+      replyToCurrent: false,
+      hasAudioTag: false,
+      hasReplyTag: false,
+    });
+    expect(stripInlineDirectiveTagsForDisplay(input)).toEqual({ text: input, changed: false });
+    expect(stripInlineDirectiveTagsForDelivery(input)).toEqual({ text: input, changed: false });
+  });
+
+  it.each([
+    ["four-space", "    [[reply_to_current]]\n    [[audio_as_voice]]"],
+    ["tab", "\t[[reply_to_current]]\n\t[[audio_as_voice]]"],
+  ])("leaves directives inside standalone %s-indented code untouched", (_name, input) => {
+    expect(parseInlineDirectives(input)).toEqual({
+      text: input,
+      audioAsVoice: false,
+      replyToCurrent: false,
+      hasAudioTag: false,
+      hasReplyTag: false,
+    });
+    expect(stripInlineDirectiveTagsForDisplay(input)).toEqual({ text: input, changed: false });
+    expect(stripInlineDirectiveTagsForDelivery(input)).toEqual({ text: input, changed: false });
   });
 });
 
@@ -203,6 +240,22 @@ describe("parseInlineDirectives", () => {
     const result = parseInlineDirectives(input);
     expect(result.hasReplyTag).toBe(true);
     expect(result.text).toBe(["~~~python", "    x  =  1", "        y  =  2", "~~~"].join("\n"));
+  });
+
+  test.each([
+    [
+      "a false closing marker",
+      ["```python", "value = 'a  b'", "``` not a close", "x = 'c  d'", "```"],
+    ],
+    ["an unclosed fence", ["```python", "value = 'a  b'", "x = 'c  d'"]],
+    ["an indented closing fence", ["```python", "value = 'a  b'", "   ```"]],
+  ])("preserves canonical code fences with %s after removing directives", (_name, lines) => {
+    const code = lines.join("\n");
+    const result = parseInlineDirectives(`[[reply_to_current]]\n[[audio_as_voice]]\n${code}`);
+
+    expect(result.hasReplyTag).toBe(true);
+    expect(result.audioAsVoice).toBe(true);
+    expect(result.text).toBe(code);
   });
 
   test("normalizes plain text without directives using code-fence awareness", () => {

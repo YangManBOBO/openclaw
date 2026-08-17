@@ -2,9 +2,11 @@
 import type { Command } from "commander";
 import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
 import { theme } from "../../packages/terminal-core/src/theme.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { defaultRuntime } from "../runtime.js";
 import { inheritOptionFromParent } from "./command-options.js";
 import { formatHelpExamples } from "./help-format.js";
+import { isJsonOutputModeActive } from "./json-output-mode.js";
 import type {
   UpdateCommandOptions,
   UpdateFinalizeOptions,
@@ -27,12 +29,20 @@ function inheritedUpdateJson(command?: Command): boolean {
   return Boolean(inheritOptionFromParent<boolean>(command, "json"));
 }
 
+function handleUpdateCommandError(error: unknown): void {
+  if (isJsonOutputModeActive(process.argv)) {
+    throw error;
+  }
+  defaultRuntime.error(formatErrorMessage(error));
+  defaultRuntime.exit(1);
+}
+
 function inheritedUpdateTimeout(
   opts: { timeout?: unknown },
   command?: Command,
 ): string | undefined {
   const timeout = opts.timeout as string | undefined;
-  if (timeout) {
+  if (timeout !== undefined) {
     return timeout;
   }
   return inheritOptionFromParent<string>(command, "timeout");
@@ -59,6 +69,19 @@ function inheritedUpdateClawHubRisk(command?: Command): boolean {
     inheritOptionFromParent<boolean>(command, "acknowledgeClawhubRisk") ??
     inheritOptionFromParent<boolean>(command, "acknowledgeClawHubRisk"),
   );
+}
+
+function rejectUnsupportedInheritedUpdateDryRun(command: Command): boolean {
+  if (!inheritOptionFromParent<boolean>(command, "dryRun")) {
+    return false;
+  }
+
+  handleUpdateCommandError(
+    new Error(
+      `--dry-run is not supported for \`openclaw update ${command.name()}\`. Run \`openclaw update --dry-run\` instead.`,
+    ),
+  );
+  return true;
 }
 
 function registerUpdateFinalizationCommand(update: Command, name: string, hidden: boolean) {
@@ -90,18 +113,23 @@ function registerUpdateFinalizationCommand(update: Command, name: string, hidden
     )
     .action(async (opts, actionCommand) => {
       try {
+        if (rejectUnsupportedInheritedUpdateDryRun(actionCommand)) {
+          return;
+        }
+
         await updateFinalizeCommand({
           json: Boolean(opts.json) || inheritedUpdateJson(actionCommand),
-          channel: opts.channel as string | undefined,
+          channel:
+            (opts.channel as string | undefined) ??
+            inheritOptionFromParent<string>(actionCommand, "channel"),
           timeout: inheritedUpdateTimeout(opts, actionCommand),
-          yes: Boolean(opts.yes),
+          yes: Boolean(opts.yes) || Boolean(inheritOptionFromParent<boolean>(actionCommand, "yes")),
           restart: false,
           acknowledgeClawHubRisk:
             normalizeCommanderClawHubRiskOption(opts) || inheritedUpdateClawHubRisk(actionCommand),
         });
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleUpdateCommandError(err);
       }
     });
 }
@@ -191,8 +219,7 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/update", "docs.openclaw.ai/cli/up
           acknowledgeClawHubRisk: normalizeCommanderClawHubRiskOption(opts),
         });
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleUpdateCommandError(err);
       }
     });
 
@@ -209,12 +236,15 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/update", "docs.openclaw.ai/cli/up
     )
     .action(async (opts, command) => {
       try {
+        if (rejectUnsupportedInheritedUpdateDryRun(command)) {
+          return;
+        }
+
         await updateWizardCommand({
           timeout: inheritedUpdateTimeout(opts, command),
         });
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleUpdateCommandError(err);
       }
     });
 
@@ -243,8 +273,7 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/update", "docs.openclaw.ai/cli/up
           timeout: inheritedUpdateTimeout(opts, command),
         });
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleUpdateCommandError(err);
       }
     });
 }

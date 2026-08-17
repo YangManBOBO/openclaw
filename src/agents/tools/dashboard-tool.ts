@@ -9,7 +9,7 @@ import type { AnyAgentTool } from "./common.js";
 import {
   readNumberParam,
   readStringArrayParam,
-  readStringParam,
+  readToolStringParam,
   textResult,
   ToolInputError,
 } from "./common.js";
@@ -25,6 +25,7 @@ const DASHBOARD_ACTIONS = [
   "tab_update",
   "tab_delete",
   "tabs_reorder",
+  "widget_put",
   "widget_move",
   "widget_resize",
   "widget_remove",
@@ -34,6 +35,8 @@ const DASHBOARD_ACTIONS = [
 const BOARD_TAB_ID_PATTERN = "^[a-z0-9-]{1,40}$";
 const BOARD_TAB_ID_REGEX = /^[a-z0-9-]{1,40}$/;
 const BOARD_WIDGET_NAME_PATTERN = "^[a-z0-9][a-z0-9._-]{0,63}$";
+const BOARD_PLUGIN_KIND_PATTERN = "^[a-z0-9][a-z0-9-]{0,63}:[a-z0-9][a-z0-9._-]{0,63}$";
+const BOARD_PLUGIN_KIND_REGEX = /^[a-z0-9][a-z0-9-]{0,63}:[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const DashboardToolSchema = Type.Object(
   {
@@ -65,11 +68,27 @@ const DashboardToolSchema = Type.Object(
     ),
     sizeW: Type.Optional(Type.Integer({ minimum: 1, maximum: 12 })),
     sizeH: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    size: Type.Optional(Type.String({ enum: ["sm", "md", "lg", "xl", "full"] })),
+    pluginKind: Type.Optional(
+      Type.String({
+        pattern: BOARD_PLUGIN_KIND_PATTERN,
+        description: "Plugin widget kind, for example workboard:card or workboard:mini",
+      }),
+    ),
+    props: Type.Optional(
+      Type.Record(Type.String(), Type.Unknown(), {
+        description: "Plugin-owned JSON props (maximum 8KB encoded)",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
 
-type DashboardCommandEmitter = (params: { sessionKey: string; command: BoardCommand }) => number;
+type DashboardCommandEmitter = (params: {
+  sessionKey: string;
+  agentId?: string;
+  command: BoardCommand;
+}) => number;
 
 type DashboardGatewayContext = {
   getClientConnIds?: (
@@ -80,6 +99,7 @@ type DashboardGatewayContext = {
 
 type DashboardToolOptions = {
   agentSessionKey?: string;
+  agentId?: string;
   callGateway?: InProcessGatewayCaller;
   emitCommand?: DashboardCommandEmitter;
 };
@@ -96,7 +116,7 @@ function readDock(
   params: Record<string, unknown>,
   key: "chatDock" | "dock",
 ): "left" | "right" | "bottom" | "hidden" | undefined {
-  const value = readStringParam(params, key);
+  const value = readToolStringParam(params, key);
   if (
     value === undefined ||
     value === "left" ||
@@ -118,25 +138,44 @@ function requireInteger(params: Record<string, unknown>, key: string): number {
 }
 
 function readTabId(params: Record<string, unknown>): string {
-  const tabId = readStringParam(params, "tabId", { required: true });
+  const tabId = readToolStringParam(params, "tabId", { required: true });
   if (!BOARD_TAB_ID_REGEX.test(tabId)) {
     throw new ToolInputError("tabId must be a lowercase slug up to 40 characters");
   }
   return tabId;
 }
 
+function readOptionalTabId(params: Record<string, unknown>): string | undefined {
+  const tabId = readToolStringParam(params, "tabId");
+  if (tabId !== undefined && !BOARD_TAB_ID_REGEX.test(tabId)) {
+    throw new ToolInputError("tabId must be a lowercase slug up to 40 characters");
+  }
+  return tabId;
+}
+
+function readPluginProps(params: Record<string, unknown>): Record<string, unknown> | undefined {
+  const props = params.props;
+  if (props === undefined) {
+    return undefined;
+  }
+  if (!props || typeof props !== "object" || Array.isArray(props)) {
+    throw new ToolInputError("props must be an object");
+  }
+  return props as Record<string, unknown>;
+}
+
 function opForAction(action: string, params: Record<string, unknown>): BoardOp {
-  const name = () => readStringParam(params, "name", { required: true });
+  const name = () => readToolStringParam(params, "name", { required: true });
   switch (action) {
     case "tab_create":
       return {
         kind: "tab_create",
         tabId: readTabId(params),
-        title: readStringParam(params, "title", { required: true }),
+        title: readToolStringParam(params, "title", { required: true }),
         ...(readDock(params, "chatDock") ? { chatDock: readDock(params, "chatDock") } : {}),
       };
     case "tab_update": {
-      const title = readStringParam(params, "title");
+      const title = readToolStringParam(params, "title");
       const chatDock = readDock(params, "chatDock");
       const position = readNumberParam(params, "position", { integer: true, strict: true });
       if (title === undefined && chatDock === undefined && position === undefined) {
@@ -158,9 +197,9 @@ function opForAction(action: string, params: Record<string, unknown>): BoardOp {
         tabIds: readStringArrayParam(params, "tabIds", { required: true }),
       };
     case "widget_move": {
-      const targetTabId = readStringParam(params, "tabId");
+      const targetTabId = readToolStringParam(params, "tabId");
       const position = readNumberParam(params, "position", { integer: true, strict: true });
-      const after = readStringParam(params, "after");
+      const after = readToolStringParam(params, "after");
       if (position !== undefined && after !== undefined) {
         throw new ToolInputError("widget_move accepts either position or after, not both");
       }
@@ -186,7 +225,11 @@ function opForAction(action: string, params: Record<string, unknown>): BoardOp {
   }
 }
 
-function emitBoardCommand(params: { sessionKey: string; command: BoardCommand }): number {
+function emitBoardCommand(params: {
+  sessionKey: string;
+  agentId?: string;
+  command: BoardCommand;
+}): number {
   const context = getInProcessGatewayToolContext() as DashboardGatewayContext | undefined;
   if (!context) {
     throw new ToolInputError("dashboard command unavailable outside gateway runtime");
@@ -213,18 +256,24 @@ export function createDashboardTool(opts: DashboardToolOptions = {}): AnyAgentTo
     label: "Dashboard",
     name: "dashboard",
     description:
-      "Read and arrange this session dashboard. Widgets use stable names. Sizes: sm=3x3, md=6x4, lg=8x6, xl=12x8, full=12x8 single-widget emphasis.",
+      "Read and arrange this session dashboard: read snapshot; tab_create/tab_update/tab_delete/tabs_reorder; widget_put/widget_move/widget_resize/widget_remove; focus_tab; set_chat_dock moves or hides the chat dock (left/right/bottom/hidden). Widgets use stable names. Create trusted plugin widgets with widget_put; examples: workboard:card props {cardId}, workboard:mini props {boardId, limit}. Sizes: sm=3x3, md=6x4, lg=8x6, xl=12x8, full=12x8 single-widget emphasis.",
     parameters: DashboardToolSchema,
     execute: async (_toolCallId, rawArgs) => {
       const params = rawArgs as Record<string, unknown>;
-      const action = readStringParam(params, "action", { required: true });
+      const action = readToolStringParam(params, "action", { required: true });
       const sessionKey = requireSessionKey(opts.agentSessionKey);
       if (action === "read") {
-        return snapshotResult(await gatewayCall<BoardSnapshot>("board.get", { sessionKey }));
+        return snapshotResult(
+          await gatewayCall<BoardSnapshot>("board.get", {
+            sessionKey,
+            agentId: opts.agentId,
+          }),
+        );
       }
       if (action === "focus_tab") {
         const delivered = emitCommand({
           sessionKey,
+          agentId: opts.agentId,
           command: {
             kind: "focus_tab",
             tabId: readTabId(params),
@@ -240,15 +289,53 @@ export function createDashboardTool(opts: DashboardToolOptions = {}): AnyAgentTo
         if (!dock) {
           throw new ToolInputError("dock required");
         }
-        const delivered = emitCommand({ sessionKey, command: { kind: "set_chat_dock", dock } });
+        const delivered = emitCommand({
+          sessionKey,
+          agentId: opts.agentId,
+          command: { kind: "set_chat_dock", dock },
+        });
         return textResult(`Dashboard command sent to ${delivered} client(s)`, {
           ok: true,
           delivered,
         });
       }
+      if (action === "widget_put") {
+        const pluginKind = readToolStringParam(params, "pluginKind", { required: true });
+        if (!BOARD_PLUGIN_KIND_REGEX.test(pluginKind)) {
+          throw new ToolInputError("pluginKind must use the <pluginId>:<name> format");
+        }
+        const title = readToolStringParam(params, "title");
+        const tabId = readOptionalTabId(params);
+        const size = readToolStringParam(params, "size");
+        const after = readToolStringParam(params, "after");
+        const props = readPluginProps(params);
+        return snapshotResult(
+          await gatewayCall<BoardSnapshot>("board.widget.put", {
+            sessionKey,
+            agentId: opts.agentId,
+            name: readToolStringParam(params, "name", { required: true }),
+            ...(title !== undefined ? { title } : {}),
+            content: {
+              kind: "plugin",
+              pluginKind,
+              ...(props !== undefined ? { props } : {}),
+            },
+            ...(tabId || size || after
+              ? {
+                  placement: {
+                    ...(tabId ? { tabId } : {}),
+                    ...(size ? { size } : {}),
+                    ...(after ? { after } : {}),
+                  },
+                }
+              : {}),
+          }),
+        );
+      }
       return snapshotResult(
         await gatewayCall<BoardSnapshot>("board.update", {
           sessionKey,
+          agentId: opts.agentId,
           ops: [opForAction(action, params)],
         }),
       );

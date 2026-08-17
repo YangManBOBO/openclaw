@@ -1,4 +1,9 @@
 import {
+  canonicalizeMaxTokensParam,
+  resolveMaxTokensParam,
+  detectOpenAICompletionsCompat,
+} from "@openclaw/ai/transports";
+import {
   type NativeWebSearchToolPolicyParams,
   isNativeWebSearchAllowedByToolPolicy,
 } from "../../agents/codex-native-web-search-core.js";
@@ -33,15 +38,13 @@ import {
 } from "../../plugins/provider-hook-runtime.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { resolveModelExtraParamSources } from "../model-extra-params.js";
-import { canonicalizeMaxTokensParam, resolveMaxTokensParam } from "../model-max-tokens-params.js";
-import { detectOpenAICompletionsCompat } from "../openai-completions-compat.js";
-import { supportsGptParallelToolCallsPayload } from "../provider-api-families.js";
 import { resolveProviderRequestPolicyConfig } from "../provider-request-config.js";
 import type { AgentRuntimeTransport } from "../runtime-plan/types.js";
 import type { StreamFn } from "../runtime/index.js";
 import type { SettingsManager } from "../sessions/index.js";
 import { log } from "./logger.js";
 import { parseCacheRetention, resolveCacheRetention } from "./prompt-cache-retention.js";
+import type { ProviderThinkLevel } from "./utils.js";
 
 function requireBaseStreamFn(streamFn: StreamFn | undefined): StreamFn {
   if (!streamFn) {
@@ -49,7 +52,6 @@ function requireBaseStreamFn(streamFn: StreamFn | undefined): StreamFn {
   }
   return streamFn;
 }
-import type { ProviderThinkLevel } from "./utils.js";
 
 const defaultProviderRuntimeDeps = {
   prepareProviderExtraParams: prepareProviderExtraParamsRuntime,
@@ -63,8 +65,20 @@ const providerRuntimeDeps = {
 
 let preparedExtraParamsCache = new WeakMap<OpenClawConfig, Map<string, Record<string, unknown>>>();
 const REQUEST_SCOPED_EXTRA_PARAM_KEYS = new Set(["response_format", "responseFormat", "stop"]);
+const GPT_PARALLEL_TOOL_CALLS_APIS = new Set([
+  "openai-completions",
+  "openai-responses",
+  "openai-chatgpt-responses",
+  "azure-openai-responses",
+]);
+
+/** True when a provider API accepts GPT parallel-tool-call payload settings. */
+function supportsGptParallelToolCallsPayload(api: unknown): boolean {
+  return typeof api === "string" && GPT_PARALLEL_TOOL_CALLS_APIS.has(api);
+}
 
 const testing = {
+  supportsGptParallelToolCallsPayload,
   setProviderRuntimeDepsForTest(
     deps: Partial<typeof defaultProviderRuntimeDeps> | undefined,
   ): void {
@@ -167,7 +181,6 @@ type CacheRetentionStreamOptions = Partial<SimpleStreamOptions> & {
   cacheRetention?: "none" | "short" | "long";
   cachedContent?: string;
   topP?: number;
-  responseFormat?: Record<string, unknown>;
   frequencyPenalty?: number;
   presencePenalty?: number;
   seed?: number;
@@ -176,7 +189,12 @@ type CacheRetentionStreamOptions = Partial<SimpleStreamOptions> & {
 type SupportedTransport = AgentRuntimeTransport;
 
 function resolveSupportedTransport(value: unknown): SupportedTransport | undefined {
-  return value === "sse" || value === "websocket" || value === "auto" ? value : undefined;
+  return value === "sse" ||
+    value === "websocket" ||
+    value === "websocket-cached" ||
+    value === "auto"
+    ? value
+    : undefined;
 }
 
 function hasExplicitTransportSetting(settings: { transport?: unknown }): boolean {
@@ -191,7 +209,6 @@ function fingerprintPreparedExtraParamsModel(model?: ProviderRuntimeModel): unkn
   if (!model) {
     return null;
   }
-  const record = model as unknown as Record<string, unknown>;
   return {
     api: model.api,
     provider: model.provider,
@@ -201,10 +218,10 @@ function fingerprintPreparedExtraParamsModel(model?: ProviderRuntimeModel): unkn
     reasoning: model.reasoning,
     input: model.input,
     cost: model.cost,
-    compat: record.compat ?? null,
+    compat: Reflect.get(model, "compat") ?? null,
     contextWindow: model.contextWindow,
     contextTokens: model.contextTokens ?? null,
-    headers: record.headers ?? null,
+    headers: Reflect.get(model, "headers") ?? null,
     maxTokens: model.maxTokens,
     maxTokensSource: model.maxTokensSource ?? null,
     params: model.params ?? null,

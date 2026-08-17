@@ -2,11 +2,30 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
-import { resolveStorePath } from "../config/sessions.js";
+import {
+  listAgentEntries,
+  toAgentEntriesRecord,
+  tryResolveSoleAgentId,
+} from "../agents/agent-scope-config.js";
+import {
+  retainLegacyDefaultAgentId,
+  tryGetLegacyDefaultAgentId,
+} from "../config/legacy.default-agent-owner.js";
+import { resolveSessionStorePathCore } from "../config/sessions.js";
 import type { SessionEntry } from "../config/sessions.js";
-import { listSessionEntries, replaceSessionEntry } from "../config/sessions/session-accessor.js";
+import {
+  listSessionEntriesCore,
+  replaceSessionEntry,
+} from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
+import { readAgentDeletionJournal } from "../state/agent-deletion-journal.js";
+import { readAgentProvenance, recordAgentProvenance } from "../state/agent-provenance.js";
+import { writeConfigMachineState } from "../state/config-machine-state.js";
+import {
+  listOpenClawRegisteredAgentDatabases,
+  registerOpenClawAgentDatabase,
+} from "../state/openclaw-agent-db-registry.js";
 import { withStateDirEnv } from "../test-helpers/state-dir-env.js";
 import { baseConfigSnapshot, createTestRuntime } from "./test-runtime-config-helpers.js";
 
@@ -32,6 +51,13 @@ const gatewayMocks = vi.hoisted(() => ({
 const workspaceStateMocks = vi.hoisted(() => ({
   deleteWorkspaceState: vi.fn(),
   prepareWorkspaceStateDeletion: vi.fn((workspaceDir: string) => ({ workspaceDir })),
+}));
+
+const terminalMocks = vi.hoisted(() => ({
+  isTerminalInteractive: vi.fn(() => true),
+}));
+const wizardMocks = vi.hoisted(() => ({
+  createClackPrompter: vi.fn(),
 }));
 
 vi.mock("../config/config.js", async () => ({
@@ -62,6 +88,15 @@ vi.mock("../agents/workspace-state-store.js", async () => ({
   prepareWorkspaceStateDeletion: workspaceStateMocks.prepareWorkspaceStateDeletion,
 }));
 
+vi.mock("../cli/terminal-interactivity.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../cli/terminal-interactivity.js")>()),
+  isTerminalInteractive: terminalMocks.isTerminalInteractive,
+}));
+
+vi.mock("../wizard/clack-prompter.js", () => ({
+  createClackPrompter: wizardMocks.createClackPrompter,
+}));
+
 import { agentsDeleteCommand } from "./agents.commands.delete.js";
 
 const runtime = createTestRuntime();
@@ -69,7 +104,12 @@ const runtime = createTestRuntime();
 function resolveFixtureStoreAgentId(cfg: OpenClawConfig, deletedAgentId: string): string {
   const storeConfig = cfg.session?.store;
   if (typeof storeConfig === "string" && !storeConfig.includes("{agentId}")) {
-    return resolveDefaultAgentId(cfg);
+    return (
+      tryGetLegacyDefaultAgentId(cfg) ??
+      listAgentEntries(cfg).find((entry) => entry.default === true)?.id ??
+      tryResolveSoleAgentId(cfg) ??
+      deletedAgentId
+    );
   }
   return deletedAgentId;
 }
@@ -81,13 +121,32 @@ async function arrangeAgentsDeleteTest(params: {
   sessions: Record<string, { sessionId: string; updatedAt: number }>;
 }) {
   const deletedAgentId = params.deletedAgentId ?? "ops";
-  const storeAgentId = resolveFixtureStoreAgentId(params.cfg, deletedAgentId);
-  const storePath = resolveStorePath(params.cfg.session?.store, { agentId: deletedAgentId });
+  const authored = structuredClone(params.cfg);
+  const roster = listAgentEntries(authored);
+  if (!roster.some((entry) => entry.default === true)) {
+    const existingDefault = roster.find((entry) => entry.id !== deletedAgentId);
+    if (existingDefault) {
+      existingDefault.default = true;
+    } else {
+      roster.unshift({ id: "main", default: true });
+    }
+  }
+  const { list: _legacyList, ...agents } = authored.agents ?? {};
+  const cfg: OpenClawConfig = {
+    ...authored,
+    agents: { ...agents, entries: toAgentEntriesRecord(roster) },
+  };
+  const storeAgentId = resolveFixtureStoreAgentId(cfg, deletedAgentId);
+  const storePath = resolveSessionStorePathCore(cfg.session?.store, { agentId: deletedAgentId });
   for (const [sessionKey, entry] of Object.entries(params.sessions)) {
-    await replaceSessionEntry(
-      { agentId: storeAgentId, sessionKey, storePath },
-      entry as SessionEntry,
-    );
+    const entryAgentId = parseAgentSessionKey(sessionKey)?.agentId ?? storeAgentId;
+    const entryStorePath = resolveSessionStorePathCore(cfg.session?.store, {
+      agentId: entryAgentId,
+    });
+    await replaceSessionEntry({ agentId: entryAgentId, sessionKey, storePath: entryStorePath }, {
+      ...entry,
+      delivery: { kind: "none" },
+    } as SessionEntry);
   }
   await fs.mkdir(path.join(params.stateDir, `workspace-${deletedAgentId}`), { recursive: true });
   await fs.mkdir(path.join(params.stateDir, "agents", deletedAgentId, "agent"), {
@@ -96,28 +155,44 @@ async function arrangeAgentsDeleteTest(params: {
 
   configMocks.readConfigFileSnapshot.mockResolvedValue({
     ...baseConfigSnapshot,
-    config: params.cfg,
-    runtimeConfig: params.cfg,
-    sourceConfig: params.cfg,
-    resolved: params.cfg,
+    config: cfg,
+    runtimeConfig: cfg,
+    sourceConfig: cfg,
+    resolved: cfg,
   });
 
   return storePath;
 }
 
 function expectSessionStore(
-  storePath: string,
+  cfg: OpenClawConfig,
   sessions: Record<string, { sessionId: string; updatedAt: number }>,
   agentId = "ops",
 ) {
+  const agentIds = new Set([
+    agentId,
+    ...Object.keys(sessions).flatMap((sessionKey) => {
+      const parsedAgentId = parseAgentSessionKey(sessionKey)?.agentId;
+      return parsedAgentId ? [parsedAgentId] : [];
+    }),
+  ]);
   expect(
     Object.fromEntries(
-      listSessionEntries({ agentId, storePath }).map(({ entry, sessionKey }) => [
+      [...agentIds].flatMap((storeAgentId) =>
+        listSessionEntriesCore({
+          agentId: storeAgentId,
+          storePath: resolveSessionStorePathCore(cfg.session?.store, { agentId: storeAgentId }),
+        }).map(({ entry, sessionKey }) => [sessionKey, entry]),
+      ),
+    ),
+  ).toEqual(
+    Object.fromEntries(
+      Object.entries(sessions).map(([sessionKey, entry]) => [
         sessionKey,
-        entry,
+        { ...entry, delivery: { kind: "none" } },
       ]),
     ),
-  ).toEqual(sessions);
+  );
 }
 
 function readJsonLogs(): Array<Record<string, unknown>> {
@@ -152,16 +227,41 @@ describe("agents delete command", () => {
     runtime.log.mockClear();
     runtime.error.mockClear();
     runtime.exit.mockClear();
+    terminalMocks.isTerminalInteractive.mockReset().mockReturnValue(true);
+    wizardMocks.createClackPrompter.mockReset();
   });
 
-  it("routes deletion through the Gateway when reachable", async () => {
+  it("requires --force when confirmation cannot use an interactive terminal", async () => {
+    await withStateDirEnv("openclaw-agents-delete-non-tty-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          list: [
+            { id: "main", default: true, workspace: path.join(stateDir, "workspace-main") },
+            { id: "ops", workspace: path.join(stateDir, "workspace-ops") },
+          ],
+        },
+      };
+      await arrangeAgentsDeleteTest({ stateDir, cfg, deletedAgentId: "ops", sessions: {} });
+      terminalMocks.isTerminalInteractive.mockReturnValue(false);
+
+      await agentsDeleteCommand({ id: "ops" }, runtime);
+
+      expect(runtime.error).toHaveBeenCalledWith("Non-interactive session. Re-run with --force.");
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(wizardMocks.createClackPrompter).not.toHaveBeenCalled();
+      expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
+      expect(fsSafeMocks.movePathToTrash).not.toHaveBeenCalled();
+    });
+  });
+
+  it("refuses deleting main even when another agent is default", async () => {
     await withStateDirEnv("openclaw-agents-delete-gateway-", async ({ stateDir }) => {
       const now = Date.now();
       const cfg: OpenClawConfig = {
         agents: {
           list: [
             { id: "main", workspace: path.join(stateDir, "workspace-main") },
-            { id: "ops", workspace: path.join(stateDir, "workspace-ops") },
+            { id: "ops", default: true, workspace: path.join(stateDir, "workspace-ops") },
           ],
         },
       } satisfies OpenClawConfig;
@@ -169,40 +269,139 @@ describe("agents delete command", () => {
         "agent:ops:main": { sessionId: "sess-ops-main", updatedAt: now + 1 },
         "agent:main:main": { sessionId: "sess-main", updatedAt: now + 2 },
       };
-      const storePath = await arrangeAgentsDeleteTest({
+      await arrangeAgentsDeleteTest({
         stateDir,
         cfg,
-        deletedAgentId: "ops",
+        deletedAgentId: "main",
         sessions,
       });
-      gatewayMocks.callGateway.mockResolvedValue({
-        ok: true,
-        agentId: "ops",
-        removedBindings: 0,
-        removed: [{ path: path.join(stateDir, "agents", "ops", "agent"), method: "trash" }],
-        failed: [{ path: path.join(stateDir, "workspace-ops"), reason: "trash unavailable" }],
+      await agentsDeleteCommand({ id: "main", force: true, json: true }, runtime);
+
+      expect(gatewayMocks.callGateway).not.toHaveBeenCalled();
+      expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
+      expect(runtime.error).not.toHaveBeenCalled();
+      expect(readJsonLogs()).toEqual([
+        {
+          ok: false,
+          error: {
+            type: "cli_error",
+            message:
+              'Agent "main" owns the legacy shared auth store and cannot be deleted. Run openclaw doctor --fix to migrate shared auth, then retry.',
+          },
+        },
+      ]);
+      expect(runtime.exit).toHaveBeenCalledWith(1, { resetStream: process.stderr });
+      expectSessionStore(cfg, sessions, "main");
+    });
+  });
+
+  it("deletes main normally after shared auth ownership moves to state SQLite", async () => {
+    await withStateDirEnv("openclaw-agents-delete-relocated-auth-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          list: [
+            { id: "main", workspace: path.join(stateDir, "workspace-main") },
+            { id: "ops", default: true, workspace: path.join(stateDir, "workspace-ops") },
+          ],
+        },
+      };
+      writeConfigMachineState("auth.sharedStore", { location: "state-db" });
+      await arrangeAgentsDeleteTest({
+        stateDir,
+        cfg,
+        deletedAgentId: "main",
+        sessions: {
+          "agent:main:main": { sessionId: "sess-main", updatedAt: Date.now() },
+        },
       });
 
-      await agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime);
+      await agentsDeleteCommand({ id: "main", force: true, json: true }, runtime);
 
-      expect(gatewayMocks.callGateway).toHaveBeenCalledOnce();
-      const gatewayCall = gatewayMocks.callGateway.mock.calls[0]?.[0];
-      expect(gatewayCall?.method).toBe("agents.delete");
-      expect(gatewayCall?.params).toEqual({ agentId: "ops", deleteFiles: true });
-      expect(gatewayCall?.requiredMethods).toEqual(["agents.delete"]);
-      expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
-      expectSessionStore(storePath, sessions);
-      const output = readJsonLogs()[0];
-      expect(output?.agentId).toBe("ops");
-      expect(output?.removedBindings).toBe(0);
-      expect(output?.removed).toEqual([
-        { path: path.join(stateDir, "agents", "ops", "agent"), method: "trash" },
-      ]);
-      expect(output?.failed).toEqual([
-        { path: path.join(stateDir, "workspace-ops"), reason: "trash unavailable" },
-      ]);
-      expect(output?.transport).toBe("gateway");
+      expect(runtime.error).not.toHaveBeenCalled();
+      expect(runtime.exit).not.toHaveBeenCalledWith(1);
+      expect(configMocks.replaceConfigFile).toHaveBeenCalledOnce();
+      expectSessionStore(cfg, {}, "main");
     });
+  });
+
+  it("rejects an unrepresentable id before targeting or deleting an agent", async () => {
+    await withStateDirEnv("openclaw-agents-delete-invalid-id-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          list: [
+            { id: "main", workspace: path.join(stateDir, "workspace-main") },
+            { id: "second", default: true, workspace: path.join(stateDir, "workspace-second") },
+          ],
+        },
+      };
+      const sessions = {
+        "agent:main:main": { sessionId: "sess-main", updatedAt: Date.now() },
+      };
+      writeConfigMachineState("auth.sharedStore", { location: "state-db" });
+      await arrangeAgentsDeleteTest({ stateDir, cfg, deletedAgentId: "main", sessions });
+
+      await agentsDeleteCommand({ id: "агент✨", force: true }, runtime);
+
+      expect(runtime.error).toHaveBeenCalledWith(
+        'Agent "агент✨" not found. Run openclaw agents list to see configured agents.',
+      );
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(gatewayMocks.callGateway).not.toHaveBeenCalled();
+      expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
+      expect(fsSafeMocks.movePathToTrash).not.toHaveBeenCalled();
+      expect(workspaceStateMocks.deleteWorkspaceState).not.toHaveBeenCalled();
+      expectSessionStore(cfg, sessions, "main");
+    });
+  });
+
+  it("refuses deleting the auth-inheritance owner until credentials are relocated", async () => {
+    await withStateDirEnv("openclaw-agents-delete-auth-owner-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: { authInheritance: { agentId: "ops" } },
+          list: [{ id: "ops" }, { id: "research" }],
+        },
+      };
+      await arrangeAgentsDeleteTest({ stateDir, cfg, deletedAgentId: "ops", sessions: {} });
+
+      await agentsDeleteCommand({ id: "ops", force: true }, runtime);
+
+      expect(runtime.error).toHaveBeenCalledWith(
+        'Agent "ops" owns inherited credentials through agents.defaults.authInheritance.agentId and cannot be deleted. Relocate those credentials, then re-point or remove that binding before retrying.',
+      );
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(gatewayMocks.callGateway).not.toHaveBeenCalled();
+      expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
+      expect(fsSafeMocks.movePathToTrash).not.toHaveBeenCalled();
+    });
+  });
+
+  it("refuses deleting the retained inherited-auth owner", async () => {
+    const cfg = retainLegacyDefaultAgentId(
+      {
+        agents: {
+          ownership: "explicit",
+          entries: { ops: {}, research: {} },
+        },
+      },
+      "ops",
+    );
+    configMocks.readConfigFileSnapshot.mockResolvedValue({
+      ...baseConfigSnapshot,
+      config: cfg,
+      runtimeConfig: cfg,
+      sourceConfig: cfg,
+      resolved: cfg,
+    });
+
+    await agentsDeleteCommand({ id: "ops", force: true }, runtime);
+
+    expect(runtime.error).toHaveBeenCalledWith(
+      'Agent "ops" owns inherited credentials through agents.defaults.authInheritance.agentId and cannot be deleted. Relocate those credentials, then re-point or remove that binding before retrying.',
+    );
+    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(gatewayMocks.callGateway).not.toHaveBeenCalled();
+    expect(configMocks.replaceConfigFile).not.toHaveBeenCalled();
   });
 
   it("warns about Gateway cleanup failures without failing committed deletion", async () => {
@@ -235,11 +434,16 @@ describe("agents delete command", () => {
       const now = Date.now();
       const cfg: OpenClawConfig = {
         agents: {
+          defaults: {
+            heartbeat: { agentId: "ops" },
+            systemAgent: { agentId: "ops" },
+          },
           list: [
             { id: "main", workspace: path.join(stateDir, "workspace-shared") },
             { id: "ops", workspace: path.join(stateDir, "workspace-shared") },
           ],
         },
+        talk: { agentId: "ops", provider: "test-provider" },
       } satisfies OpenClawConfig;
       await arrangeAgentsDeleteTest({
         stateDir,
@@ -271,6 +475,21 @@ describe("agents delete command", () => {
       expect(output?.workspaceRetained).toBe(true);
       expect(output?.workspaceRetainedReason).toBe("shared");
       expect(output?.transport).toBeUndefined();
+      expect(output?.clearedOwnerRefs).toEqual([
+        "agents.defaults.heartbeat.agentId",
+        "agents.defaults.systemAgent.agentId",
+        "talk.agentId",
+      ]);
+      const replaceConfigFileCalls = configMocks.replaceConfigFile.mock.calls as unknown as Array<
+        [{ nextConfig: OpenClawConfig }]
+      >;
+      expect(replaceConfigFileCalls[0]?.[0].nextConfig.agents?.defaults?.heartbeat).toBeUndefined();
+      expect(
+        replaceConfigFileCalls[0]?.[0].nextConfig.agents?.defaults?.systemAgent,
+      ).toBeUndefined();
+      expect(replaceConfigFileCalls[0]?.[0].nextConfig.talk).toEqual({
+        provider: "test-provider",
+      });
     });
   });
 
@@ -285,7 +504,7 @@ describe("agents delete command", () => {
           ],
         },
       } satisfies OpenClawConfig;
-      const storePath = await arrangeAgentsDeleteTest({
+      await arrangeAgentsDeleteTest({
         stateDir,
         cfg,
         sessions: {
@@ -303,11 +522,92 @@ describe("agents delete command", () => {
         [{ nextConfig: OpenClawConfig }]
       >;
       expect(replaceConfigFileCalls[0]?.[0].nextConfig).toEqual({
-        agents: { list: [{ id: "main", workspace: path.join(stateDir, "workspace-main") }] },
+        agents: {
+          defaults: undefined,
+          entries: {
+            main: { default: true, workspace: path.join(stateDir, "workspace-main") },
+          },
+        },
+        bindings: undefined,
+        tools: undefined,
       });
-      expectSessionStore(storePath, {
+      expectSessionStore(cfg, {
         "agent:main:main": { sessionId: "sess-main", updatedAt: now + 3 },
       });
+    });
+  });
+
+  it("deregisters the agent database after offline deletion", async () => {
+    await withStateDirEnv("openclaw-agents-delete-registry-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          list: [
+            { id: "main", workspace: path.join(stateDir, "workspace-main") },
+            { id: "ops", workspace: path.join(stateDir, "workspace-ops") },
+          ],
+        },
+      };
+      await arrangeAgentsDeleteTest({ stateDir, cfg, sessions: {} });
+      const databasePath = path.join(stateDir, "agents", "ops", "agent", "openclaw-agent.sqlite");
+      registerOpenClawAgentDatabase({ agentId: "ops", path: databasePath });
+      recordAgentProvenance("ops", { createdVia: "operator" });
+      recordAgentProvenance("child", { createdVia: "agent", creatorAgentId: "ops" });
+      expect(listOpenClawRegisteredAgentDatabases().map((entry) => entry.agentId)).toContain("ops");
+
+      await agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime);
+
+      expect(listOpenClawRegisteredAgentDatabases().map((entry) => entry.agentId)).not.toContain(
+        "ops",
+      );
+      expect(readAgentDeletionJournal("ops")?.cleanupCompleted).toBe(true);
+      expect(readAgentProvenance("ops")).toBeUndefined();
+      expect(readAgentProvenance("child")).toMatchObject({ creatorAgentId: "ops" });
+    });
+  });
+
+  it("resumes offline deletion after cleanup was interrupted", async () => {
+    await withStateDirEnv("openclaw-agents-delete-recovery-", async ({ stateDir }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          list: [
+            { id: "main", workspace: path.join(stateDir, "workspace-main") },
+            { id: "ops", workspace: path.join(stateDir, "workspace-ops") },
+          ],
+        },
+      };
+      await arrangeAgentsDeleteTest({ stateDir, cfg, sessions: {} });
+      const databasePath = path.join(stateDir, "agents", "ops", "agent", "openclaw-agent.sqlite");
+      registerOpenClawAgentDatabase({ agentId: "ops", path: databasePath });
+      workspaceStateMocks.deleteWorkspaceState.mockImplementationOnce(() => {
+        throw new Error("interrupted after filesystem cleanup");
+      });
+
+      await expect(
+        agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime),
+      ).rejects.toThrow("interrupted after filesystem cleanup");
+      expect(readAgentDeletionJournal("ops")?.cleanupCompleted).toBe(false);
+      expect(listOpenClawRegisteredAgentDatabases().map((entry) => entry.agentId)).toContain("ops");
+
+      const writeCalls = configMocks.replaceConfigFile.mock.calls as unknown as Array<
+        [{ nextConfig?: OpenClawConfig }]
+      >;
+      const firstWrite = writeCalls[0]?.[0];
+      const nextConfig = firstWrite?.nextConfig;
+      expect(nextConfig).toBeDefined();
+      configMocks.readConfigFileSnapshot.mockResolvedValue({
+        ...baseConfigSnapshot,
+        config: nextConfig,
+        runtimeConfig: nextConfig,
+        sourceConfig: nextConfig,
+        resolved: nextConfig,
+      });
+
+      await agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime);
+
+      expect(listOpenClawRegisteredAgentDatabases().map((entry) => entry.agentId)).not.toContain(
+        "ops",
+      );
+      expect(readAgentDeletionJournal("ops")?.cleanupCompleted).toBe(true);
     });
   });
 
@@ -369,7 +669,7 @@ describe("agents delete command", () => {
     });
   });
 
-  it("purges legacy main-alias entries owned by the deleted default agent", async () => {
+  it("refuses deleting the sole configured agent", async () => {
     await withStateDirEnv("openclaw-agents-delete-main-alias-", async ({ stateDir }) => {
       const now = Date.now();
       const cfg: OpenClawConfig = {
@@ -377,7 +677,7 @@ describe("agents delete command", () => {
           list: [{ id: "ops", default: true, workspace: path.join(stateDir, "workspace-ops") }],
         },
       };
-      const storePath = await arrangeAgentsDeleteTest({
+      await arrangeAgentsDeleteTest({
         stateDir,
         cfg,
         sessions: {
@@ -393,8 +693,20 @@ describe("agents delete command", () => {
 
       await agentsDeleteCommand({ id: "ops", force: true, json: true }, runtime);
 
-      expect(runtime.exit).not.toHaveBeenCalled();
-      expectSessionStore(storePath, {
+      expect(runtime.error).not.toHaveBeenCalled();
+      expect(readJsonLogs()).toEqual([
+        {
+          ok: false,
+          error: {
+            type: "cli_error",
+            message: 'Agent "ops" is the only configured agent and cannot be deleted.',
+          },
+        },
+      ]);
+      expect(runtime.exit).toHaveBeenCalledWith(1, { resetStream: process.stderr });
+      expectSessionStore(cfg, {
+        "agent:main:main": { sessionId: "sess-default-alias", updatedAt: now + 1 },
+        "agent:ops:quietchat:direct:u1": { sessionId: "sess-ops-direct", updatedAt: now + 2 },
         "agent:main:quietchat:direct:u2": {
           sessionId: "sess-stale-main",
           updatedAt: now + 3,
@@ -404,11 +716,11 @@ describe("agents delete command", () => {
     });
   });
 
-  it("preserves shared-store legacy default keys when deleting another agent", async () => {
+  it("preserves canonical main-agent keys when deleting another agent", async () => {
     await withStateDirEnv("openclaw-agents-delete-shared-store-", async ({ stateDir }) => {
       const now = Date.now();
       const cfg: OpenClawConfig = {
-        session: { store: path.join(stateDir, "sessions.json") },
+        session: { store: path.join(stateDir, "shared-sessions.sqlite") },
         agents: {
           list: [
             { id: "main", default: true, workspace: path.join(stateDir, "workspace-main") },
@@ -416,12 +728,15 @@ describe("agents delete command", () => {
           ],
         },
       };
-      const storePath = await arrangeAgentsDeleteTest({
+      await arrangeAgentsDeleteTest({
         stateDir,
         cfg,
         sessions: {
-          main: { sessionId: "sess-main", updatedAt: now + 1 },
-          "quietchat:direct:u1": { sessionId: "sess-main-direct", updatedAt: now + 2 },
+          "agent:main:main": { sessionId: "sess-main", updatedAt: now + 1 },
+          "agent:main:quietchat:direct:u1": {
+            sessionId: "sess-main-direct",
+            updatedAt: now + 2,
+          },
           "agent:ops:main": { sessionId: "sess-ops-main", updatedAt: now + 3 },
           "agent:ops:quietchat:direct:u2": { sessionId: "sess-ops-direct", updatedAt: now + 4 },
         },
@@ -431,10 +746,13 @@ describe("agents delete command", () => {
 
       expect(runtime.exit).not.toHaveBeenCalled();
       expectSessionStore(
-        storePath,
+        cfg,
         {
-          main: { sessionId: "sess-main", updatedAt: now + 1 },
-          "quietchat:direct:u1": { sessionId: "sess-main-direct", updatedAt: now + 2 },
+          "agent:main:main": { sessionId: "sess-main", updatedAt: now + 1 },
+          "agent:main:quietchat:direct:u1": {
+            sessionId: "sess-main-direct",
+            updatedAt: now + 2,
+          },
         },
         "main",
       );

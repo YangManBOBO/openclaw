@@ -14,7 +14,7 @@ function gatewayPrompt(overrides: Partial<QuestionPrompt> = {}): QuestionPrompt 
     id: "question-1",
     questions: [
       {
-        id: "format",
+        questionId: "format",
         header: "Format",
         question: "Which format should I use?",
         options: [
@@ -69,7 +69,6 @@ describe("shared question panel", () => {
       render(
         html`<openclaw-chat-question-panel
           .props=${createGatewayQuestionPanelProps(prompt, {
-            nowMs: 2_000,
             collapsed,
             onCollapsedChange: (nextCollapsed) => {
               collapsed = nextCollapsed;
@@ -90,14 +89,14 @@ describe("shared question panel", () => {
     const prompt = gatewayPrompt({
       questions: [
         {
-          id: "target",
+          questionId: "target",
           header: "Target",
           question: "Where should I send it?",
           options: [{ label: "Chat" }, { label: "File" }],
           isOther: true,
         },
         {
-          id: "extras",
+          questionId: "extras",
           header: "Extras",
           question: "Which extras should I include?",
           options: [{ label: "Tests" }, { label: "Docs" }],
@@ -174,7 +173,7 @@ describe("shared question panel", () => {
         questions: [
           ...gatewayPrompt().questions,
           {
-            id: "confirm",
+            questionId: "confirm",
             header: "Confirm",
             question: "Ready to continue?",
             options: [{ label: "Ready" }],
@@ -249,7 +248,7 @@ describe("shared question panel", () => {
   it("disables actions whose gateway callbacks are unavailable", async () => {
     render(
       html`<openclaw-chat-question-panel
-        .props=${createGatewayQuestionPanelProps(gatewayPrompt(), { nowMs: 2_000 })}
+        .props=${createGatewayQuestionPanelProps(gatewayPrompt(), {})}
       ></openclaw-chat-question-panel>`,
       container,
     );
@@ -261,10 +260,18 @@ describe("shared question panel", () => {
     expect(container.querySelector(".chat-question-panel__skip")).toBeNull();
   });
 
+  it("does not render the request expiry countdown", async () => {
+    drawGateway(gatewayPrompt());
+    await panelIn(container);
+
+    expect(container.querySelector(".chat-question-panel__countdown")).toBeNull();
+    expect(container.textContent).not.toContain("1:00");
+  });
+
   it("manages collapse state when no controlled callback is supplied", async () => {
     render(
       html`<openclaw-chat-question-panel
-        .props=${createGatewayQuestionPanelProps(gatewayPrompt(), { nowMs: 2_000 })}
+        .props=${createGatewayQuestionPanelProps(gatewayPrompt(), {})}
       ></openclaw-chat-question-panel>`,
       container,
     );
@@ -284,7 +291,6 @@ describe("shared question panel", () => {
     render(
       html`<openclaw-chat-question-panel
         .props=${createGatewayQuestionPanelProps(gatewayPrompt(), {
-          nowMs: 2_000,
           onSubmit,
         })}
       ></openclaw-chat-question-panel>`,
@@ -304,7 +310,6 @@ describe("shared question panel", () => {
     render(
       html`<openclaw-chat-question-panel
         .props=${createGatewayQuestionPanelProps(gatewayPrompt(), {
-          nowMs: 2_000,
           onSkip,
         })}
       ></openclaw-chat-question-panel>`,

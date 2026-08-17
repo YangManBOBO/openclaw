@@ -15,21 +15,21 @@ import {
   resolveThreadBindingThreadName,
 } from "./thread-bindings.messages.js";
 import { resolveBindingIdsForTargetSession } from "./thread-bindings.session-shared.js";
-export {
-  setThreadBindingIdleTimeoutBySessionKey,
-  setThreadBindingMaxAgeBySessionKey,
-} from "./thread-bindings.session-updates.js";
 import {
   BINDINGS_BY_THREAD_ID,
   MANAGERS_BY_ACCOUNT_ID,
   getThreadBindingToken,
   normalizeThreadId,
-  rememberRecentUnboundWebhookEcho,
+  refreshUnboundThreadWebhookIdentity,
   removeBindingRecord,
   saveBindingsToDisk,
   shouldPersistBindingMutations,
 } from "./thread-bindings.state.js";
 import type { ThreadBindingRecord, ThreadBindingTargetKind } from "./thread-bindings.types.js";
+export {
+  setThreadBindingIdleTimeoutBySessionKey,
+  setThreadBindingMaxAgeBySessionKey,
+} from "./thread-bindings.session-updates.js";
 
 export type AcpThreadBindingReconciliationResult = {
   checked: number;
@@ -187,7 +187,7 @@ export function unbindThreadBindingsBySessionKey(params: {
     }
     const unbound = removeBindingRecord(bindingKey);
     if (unbound) {
-      rememberRecentUnboundWebhookEcho(unbound);
+      refreshUnboundThreadWebhookIdentity(unbound);
       removed.push(unbound);
     }
   }

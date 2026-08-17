@@ -1,10 +1,9 @@
 import {
-  buildChannelInboundEventContext,
   formatAgentEnvelope,
   formatInboundMediaUnavailableText,
   recordChannelBotPairLoopAndCheckSuppression,
   resolveEnvelopeFormatOptions,
-  toInboundMediaFacts,
+  toInboundMediaFactsWithMetadata,
 } from "openclaw/plugin-sdk/channel-inbound";
 import {
   bindIngressLifecycleToReplyOptions,
@@ -47,7 +46,6 @@ import {
   parseMessageContent,
   resolveFeishuGroupSession,
   resolveFeishuMediaList,
-  resolveFeishuMediaFailurePresentation,
 } from "./bot-content.js";
 import { resolveGroupName } from "./bot-group-name.js";
 import { resolveFeishuBotName } from "./bot-name.js";
@@ -67,6 +65,8 @@ import {
 } from "./dedup.js";
 import { resolveFeishuMessageDedupeKey } from "./dedupe-key.js";
 import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
+import type { FeishuMessageEvent } from "./event-types.js";
+import type { FeishuIngressLifecycle } from "./feishu-ingress.js";
 import {
   extractMentionTargets,
   isFeishuBroadcastMention,
@@ -86,15 +86,13 @@ import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
 import { getFeishuSyntheticDirectPreDispatchTarget } from "./synthetic-event-target.js";
-export type { FeishuBotAddedEvent, FeishuMessageEvent } from "./event-types.js";
-import type { FeishuMessageEvent } from "./event-types.js";
-import type { FeishuIngressLifecycle } from "./feishu-ingress.js";
 import {
   isFeishuGroupChatType,
   type FeishuMessageContext,
   type FeishuMediaInfo,
   type FeishuMessageInfo,
 } from "./types.js";
+export type { FeishuBotAddedEvent, FeishuMessageEvent } from "./event-types.js";
 
 // Cache permission errors to avoid spamming the user with repeated notifications.
 // Key: appId or "default", Value: timestamp of last notification
@@ -133,13 +131,17 @@ async function resolveFeishuAudioPreflightTranscript(params: {
   cfg: ClawdbotConfig;
   mediaList: FeishuMediaInfo[];
   content: string;
+  messageType: string;
   chatType: "direct" | "group";
   log: (msg: string) => void;
 }): Promise<string | undefined> {
-  if (params.content.trim() !== "<media:audio>") {
+  if (params.messageType !== "audio" || params.content.trim()) {
     return undefined;
   }
-  const audioMedia = params.mediaList.filter((media) => media.contentType?.startsWith("audio/"));
+  const audioMedia = params.mediaList.filter(
+    (media) =>
+      Boolean(media.path) && (media.kind === "audio" || media.contentType?.startsWith("audio/")),
+  );
   if (audioMedia.length === 0) {
     return undefined;
   }
@@ -148,8 +150,7 @@ async function resolveFeishuAudioPreflightTranscript(params: {
     const { transcribeFirstAudio } = await import("./audio-preflight.runtime.js");
     return await transcribeFirstAudio({
       ctx: {
-        MediaPaths: audioMedia.map((media) => media.path),
-        MediaTypes: audioMedia.map((media) => media.contentType).filter(Boolean) as string[],
+        media: audioMedia,
         ChatType: params.chatType,
       },
       cfg: params.cfg,
@@ -161,8 +162,7 @@ async function resolveFeishuAudioPreflightTranscript(params: {
 }
 
 /**
- * Build media payload for inbound context.
- * Similar to Discord's buildDiscordMediaPayload().
+ * Parse an inbound Feishu event into its caption and routing metadata.
  */
 export function parseFeishuMessageEvent(
   event: FeishuMessageEvent,
@@ -430,6 +430,7 @@ export async function handleFeishuMessage(params: {
       // The API returns all sub-messages in the items array
       const client = createFeishuClient(account);
       const response = (await client.im.message.get({
+        params: { card_msg_content_type: "user_card_content" },
         path: { message_id: event.message.message_id },
       })) as { code?: number; data?: { items?: unknown[] } };
 
@@ -516,23 +517,26 @@ export async function handleFeishuMessage(params: {
     !effectiveThreadId &&
     isFeishuTopicSessionScope(groupSessionScope ?? "group")
   ) {
+    // Synthetic turns keep a local dedupe ID in messageId; their explicit reply target is
+    // the real Feishu message ID that topic hydration can send back to the provider.
+    const topicHydrationMessageId = ctx.replyTargetMessageId ?? ctx.messageId;
     try {
       const messageInfo = await getMessageFeishu({
         cfg,
         accountId: account.accountId,
-        messageId: ctx.messageId,
+        messageId: topicHydrationMessageId,
       });
       const hydratedThreadId = messageInfo?.threadId?.trim();
       if (hydratedThreadId) {
         ctx = { ...ctx, threadId: hydratedThreadId };
         effectiveThreadId = hydratedThreadId;
         log(
-          `feishu[${account.accountId}]: hydrated topic thread_id=${hydratedThreadId} for message=${ctx.messageId}`,
+          `feishu[${account.accountId}]: hydrated topic thread_id=${hydratedThreadId} for message=${topicHydrationMessageId}`,
         );
       }
     } catch (err) {
       log(
-        `feishu[${account.accountId}]: failed to hydrate topic thread_id for message=${ctx.messageId}: ${String(err)}`,
+        `feishu[${account.accountId}]: failed to hydrate topic thread_id for message=${topicHydrationMessageId}: ${String(err)}`,
       );
     }
   }
@@ -798,6 +802,9 @@ export async function handleFeishuMessage(params: {
     // Using a group-scoped From causes the agent to treat different users as the same person.
     const feishuFrom = `feishu:${ctx.senderOpenId}`;
     const feishuTo = isGroup ? `chat:${ctx.chatId}` : `user:${ctx.senderOpenId}`;
+    // Reply in the inbound conversation while keeping DM routing/session identity sender-scoped.
+    // Synthetic menu and card-action events do not always carry a real Feishu chat ID.
+    const feishuReplyTarget = ctx.chatId.startsWith("oc_") ? `chat:${ctx.chatId}` : feishuTo;
     const peerId = isGroup ? (groupSession?.peerId ?? ctx.chatId) : ctx.senderOpenId;
     const parentPeer = isGroup ? (groupSession?.parentPeer ?? null) : null;
     const directThreadReply = !isGroup && Boolean(ctx.threadId?.trim());
@@ -964,7 +971,7 @@ export async function handleFeishuMessage(params: {
 
     // Resolve media from message
     const mediaMaxBytes = (feishuCfg?.mediaMaxMb ?? 30) * 1024 * 1024; // 30MB default
-    const mediaResolution = await resolveFeishuMediaList({
+    const mediaList = await resolveFeishuMediaList({
       cfg,
       messageId: ctx.messageId,
       messageType: event.message.message_type,
@@ -973,17 +980,12 @@ export async function handleFeishuMessage(params: {
       log,
       accountId: account.accountId,
     });
-    const mediaList = mediaResolution.media;
-    const mediaFailurePresentation = resolveFeishuMediaFailurePresentation(
-      event.message.content,
-      event.message.message_type,
-    );
+    const unavailableMediaCount = mediaList.filter((media) => !media.path).length;
     const mediaFailureContent =
-      mediaResolution.unavailableCount > 0
+      unavailableMediaCount > 0
         ? formatInboundMediaUnavailableText({
-            body: mediaFailurePresentation.unavailableBody ?? ctx.content,
-            mediaPlaceholder: mediaFailurePresentation.mediaPlaceholder,
-            notice: `[feishu ${mediaResolution.unavailableCount > 1 ? `${mediaResolution.unavailableCount} attachments` : "attachment"} unavailable]`,
+            body: ctx.content,
+            notice: `[feishu ${unavailableMediaCount > 1 ? `${unavailableMediaCount} attachments` : "attachment"} unavailable]`,
           })
         : ctx.content;
     // Fetch quoted/replied message content before the empty-message guard
@@ -1045,14 +1047,17 @@ export async function handleFeishuMessage(params: {
       cfg: effectiveCfg,
       mediaList,
       content: ctx.content,
+      messageType: event.message.message_type,
       chatType: isGroup ? "group" : "direct",
       log,
     });
     const preflightAudioIndex =
       audioTranscript === undefined
         ? -1
-        : mediaList.findIndex((media) => media.contentType?.startsWith("audio/"));
-    const inboundMedia = toInboundMediaFacts(mediaList, {
+        : mediaList.findIndex(
+            (media) => media.kind === "audio" || media.contentType?.startsWith("audio/"),
+          );
+    const inboundMedia = await toInboundMediaFactsWithMetadata(mediaList, {
       transcribed: (_media, index) => index === preflightAudioIndex,
     });
     const requiredMentionTargets =
@@ -1141,7 +1146,7 @@ export async function handleFeishuMessage(params: {
     const body = formatAgentEnvelope({
       channel: "Feishu",
       from: envelopeFrom,
-      timestamp: new Date(),
+      timestamp: messageCreateTimeMs,
       envelope: envelopeOptions,
       body: messageBody,
     });
@@ -1362,7 +1367,40 @@ export async function handleFeishuMessage(params: {
     ) => {
       const groupName = await resolveGroupNameForLabel();
       const threadContext = await resolveThreadContextForAgent(agentId, agentSessionKey, groupName);
-      return buildChannelInboundEventContext({
+      const contextBinding = {
+        agentId,
+        sessionKey: agentSessionKey,
+        messageId: ctx.messageId,
+        inboundEventKind: "user_request" as const,
+      };
+      // Broadcast fan-out has one final session per agent; each context needs its own bound result.
+      const boundChannelIngress = isGroup
+        ? await resolveFeishuGroupSenderActivationIngressAccess({
+            cfg: effectiveCfg,
+            accountId: account.accountId,
+            chatId: ctx.chatId,
+            allowFrom: effectiveGroupSenderAllowFrom,
+            senderOpenId: ctx.senderOpenId,
+            senderUserId,
+            requireMention,
+            mentionedBot: ctx.mentionedBot,
+            contextBinding,
+            threadId: ctx.rootId && isTopicSessionForThread ? ctx.rootId : undefined,
+          })
+        : await resolveFeishuDmIngressAccess({
+            cfg: effectiveCfg,
+            accountId: account.accountId,
+            dmPolicy: effectiveDmPolicy,
+            allowFrom: effectiveConfigAllowFrom,
+            readAllowFromStore: pairing.readAllowFromStore,
+            senderOpenId: ctx.senderOpenId,
+            senderUserId,
+            conversationId: ctx.senderOpenId,
+            mayPair: false,
+            contextBinding,
+          });
+      return core.channel.inbound.buildContext({
+        channelIngress: boundChannelIngress,
         channel: "feishu",
         supplemental: {
           quote: quotedContent ? { id: ctx.parentId, body: quotedContent } : undefined,
@@ -1409,6 +1447,7 @@ export async function handleFeishuMessage(params: {
           rawBody: commandFacingContent,
           commandBody: commandFacingContent,
         },
+        sessionTranscript: { historyLimit: isGroup ? historyLimit : 0 },
         access: {
           mentions: {
             canDetectMention: isGroup,
@@ -1557,6 +1596,52 @@ export async function handleFeishuMessage(params: {
         `feishu[${account.accountId}]: broadcasting to ${broadcastAgents.length} agents (strategy=${strategy}, active=${activeAgentId ?? "none"})`,
       );
 
+      type BroadcastInboundVariant =
+        | { kind: "observeOnly" }
+        | { kind: "active"; dispatcher: ReturnType<typeof createFeishuReplyDispatcher> };
+      const createBroadcastInboundAdapter = (paramsLocal: {
+        agentId: string;
+        sessionKey: string;
+        ctxPayload: Awaited<ReturnType<typeof buildCtxPayloadForAgent>>;
+        record: {
+          updateLastRoute: ReturnType<typeof buildFeishuInboundLastRouteUpdate>;
+          onRecordError: (err: unknown) => void;
+        };
+        lifecycle: FeishuIngressLifecycle;
+        variant: BroadcastInboundVariant;
+      }) => ({
+        ingest: () => ({
+          id: ctx.messageId,
+          timestamp: messageCreateTimeMs,
+          rawText: ctx.content,
+          textForAgent: paramsLocal.ctxPayload.BodyForAgent,
+          textForCommands: paramsLocal.ctxPayload.CommandBody,
+          raw: ctx,
+        }),
+        resolveTurn: () => ({
+          cfg,
+          channel: "feishu" as const,
+          accountId: route.accountId,
+          route: { agentId: paramsLocal.agentId, sessionKey: paramsLocal.sessionKey },
+          ctxPayload: paramsLocal.ctxPayload,
+          record: paramsLocal.record,
+          ...(paramsLocal.variant.kind === "observeOnly"
+            ? {
+                admission: { kind: "observeOnly" as const, reason: "broadcast-observer" },
+                delivery: { deliver: async () => ({ visibleReplySent: false }) },
+                replyOptions: bindIngressLifecycleToReplyOptions(paramsLocal.lifecycle),
+              }
+            : {
+                dispatcherOptions: paramsLocal.variant.dispatcher.dispatcherOptions,
+                delivery: paramsLocal.variant.dispatcher.delivery,
+                replyOptions: {
+                  ...paramsLocal.variant.dispatcher.replyOptions,
+                  ...bindIngressLifecycleToReplyOptions(paramsLocal.lifecycle),
+                },
+              }),
+        }),
+      });
+
       const dispatchForAgent = async (agentId: string) => {
         const normalizedAgentId = normalizeAgentId(agentId);
         if (hasKnownAgents && !agentIds.includes(normalizedAgentId)) {
@@ -1626,16 +1711,18 @@ export async function handleFeishuMessage(params: {
             ctx.mentionedBot && agentId === activeAgentId,
           );
 
+          let variant: BroadcastInboundVariant;
           if (agentId === activeAgentId) {
             // Active agent: real Feishu dispatcher (responds on Feishu)
             const identity = resolveAgentOutboundIdentity(cfg, agentId);
-            const { dispatcherOptions, delivery, replyOptions, ensureNoVisibleReplyFallback } =
-              createFeishuReplyDispatcher({
+            variant = {
+              kind: "active",
+              dispatcher: createFeishuReplyDispatcher({
                 cfg,
                 agentId,
                 runtime: runtime as RuntimeEnv,
                 chatId: ctx.chatId,
-                sendTarget: feishuTo,
+                sendTarget: feishuReplyTarget,
                 allowReasoningPreview,
                 replyToMessageId: replyTargetMessageId,
                 typingTargetMessageId,
@@ -1649,85 +1736,46 @@ export async function handleFeishuMessage(params: {
                 requiredMentionTargets,
                 messageCreateTimeMs,
                 sessionKey: agentSessionKey,
-              });
+              }),
+            };
 
             log(
               `feishu[${account.accountId}]: broadcast active dispatch agent=${agentId} (session=${agentSessionKey})`,
             );
-            const turnResult = await core.channel.inbound.run({
-              channel: "feishu",
-              accountId: route.accountId,
-              raw: ctx,
-              adapter: {
-                ingest: () => ({
-                  id: ctx.messageId,
-                  timestamp: messageCreateTimeMs,
-                  rawText: ctx.content,
-                  textForAgent: agentCtx.BodyForAgent,
-                  textForCommands: agentCtx.CommandBody,
-                  raw: ctx,
-                }),
-                resolveTurn: () => ({
-                  cfg,
-                  channel: "feishu",
-                  accountId: route.accountId,
-                  route: { agentId, sessionKey: agentSessionKey },
-                  ctxPayload: agentCtx,
-                  record: agentRecord,
-                  dispatcherOptions,
-                  delivery,
-                  replyOptions: {
-                    ...replyOptions,
-                    ...bindIngressLifecycleToReplyOptions(lane.lifecycle),
-                  },
-                }),
-              },
-            });
-            if (
-              turnResult.dispatched &&
-              shouldSendNoVisibleReplyFallback(turnResult.dispatchResult)
-            ) {
-              await ensureNoVisibleReplyFallback("broadcast-dispatch-complete-no-visible-reply");
-            }
-            await lane.onDispatchComplete(turnResult.dispatched);
           } else {
             // Observer agent: no-op dispatcher (session entry + inference, no Feishu reply).
             // Strip CommandAuthorized so slash commands (e.g. /reset) don't silently
             // mutate observer sessions — only the active agent should execute commands.
             delete (agentCtx as Record<string, unknown>).CommandAuthorized;
+            variant = { kind: "observeOnly" };
             log(
               `feishu[${account.accountId}]: broadcast observer dispatch agent=${agentId} (session=${agentSessionKey})`,
             );
-            const turnResult = await core.channel.inbound.run({
-              channel: "feishu",
-              accountId: route.accountId,
-              raw: ctx,
-              adapter: {
-                ingest: () => ({
-                  id: ctx.messageId,
-                  timestamp: messageCreateTimeMs,
-                  rawText: ctx.content,
-                  textForAgent: agentCtx.BodyForAgent,
-                  textForCommands: agentCtx.CommandBody,
-                  raw: ctx,
-                }),
-                resolveTurn: () => ({
-                  cfg,
-                  channel: "feishu",
-                  accountId: route.accountId,
-                  route: { agentId, sessionKey: agentSessionKey },
-                  ctxPayload: agentCtx,
-                  record: agentRecord,
-                  admission: { kind: "observeOnly", reason: "broadcast-observer" },
-                  delivery: {
-                    deliver: async () => ({ visibleReplySent: false }),
-                  },
-                  replyOptions: bindIngressLifecycleToReplyOptions(lane.lifecycle),
-                }),
-              },
-            });
-            await lane.onDispatchComplete(turnResult.dispatched);
           }
+
+          const turnResult = await core.channel.inbound.run({
+            channel: "feishu",
+            accountId: route.accountId,
+            raw: ctx,
+            adapter: createBroadcastInboundAdapter({
+              agentId,
+              sessionKey: agentSessionKey,
+              ctxPayload: agentCtx,
+              record: agentRecord,
+              lifecycle: lane.lifecycle,
+              variant,
+            }),
+          });
+          if (
+            variant.kind === "active" &&
+            turnResult.dispatched &&
+            shouldSendNoVisibleReplyFallback(turnResult.dispatchResult)
+          ) {
+            await variant.dispatcher.ensureNoVisibleReplyFallback(
+              "broadcast-dispatch-complete-no-visible-reply",
+            );
+          }
+          await lane.onDispatchComplete(turnResult.dispatched);
         } catch (err) {
           await lane.onDispatchFailed(err);
           throw err;
@@ -1804,7 +1852,7 @@ export async function handleFeishuMessage(params: {
           agentId: route.agentId,
           runtime: runtime as RuntimeEnv,
           chatId: ctx.chatId,
-          sendTarget: feishuTo,
+          sendTarget: feishuReplyTarget,
           allowReasoningPreview,
           replyToMessageId: replyTargetMessageId,
           typingTargetMessageId,

@@ -44,6 +44,17 @@
         "screenIndex"
       ]
     },
+    "mobile_ui": {
+      "emoji": "📱",
+      "title": "Mobile UI",
+      "detailKeys": [
+        "action",
+        "mobileAction",
+        "snapshotId",
+        "node",
+        "nodeId"
+      ]
+    },
     "screen": {
       "emoji": "🖥️",
       "title": "Screen",
@@ -61,6 +72,17 @@
         "sessionId",
         "command",
         "cwd"
+      ]
+    },
+    "portal": {
+      "emoji": "🌐",
+      "title": "Portal",
+      "detailKeys": [
+        "action",
+        "port",
+        "id",
+        "title",
+        "path"
       ]
     },
     "process": {
@@ -348,6 +370,15 @@
             "durationMs"
           ]
         },
+        "camera_ptz": {
+          "label": "camera PTZ",
+          "detailKeys": [
+            "ptzOperation",
+            "node",
+            "nodeId",
+            "deviceId"
+          ]
+        },
         "screen_record": {
           "label": "screen record",
           "detailKeys": [
@@ -457,7 +488,7 @@
         "questions.0.question"
       ]
     },
-    "spawn_task": {
+    "suggest_task": {
       "emoji": "✨",
       "title": "Suggest Task",
       "detailKeys": [

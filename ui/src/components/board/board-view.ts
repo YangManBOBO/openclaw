@@ -2,12 +2,14 @@ import { html, nothing, type PropertyValues, type TemplateResult } from "lit";
 import { property, state } from "lit/decorators.js";
 import { keyed } from "lit/directives/keyed.js";
 import { repeat } from "lit/directives/repeat.js";
-import type { GatewaySessionRow } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import {
   BOARD_GRID_COLUMNS,
   BOARD_GRID_GAP,
   BOARD_GRID_ROW_HEIGHT,
+  boardChromeRowPx,
+  effectiveBoardWidgetRows,
+  FINE_POINTER_QUERY,
   layout,
   nudge,
   previewDrag,
@@ -15,13 +17,10 @@ import {
   type BoardGridDirection,
   type BoardGridItem,
 } from "../../lib/board/grid.ts";
+import type { BoardOp, BoardSnapshot, BoardTab, BoardWidget } from "../../lib/board/types.ts";
 import type {
   BoardGrantDecision,
-  BoardOp,
-  BoardSnapshot,
-  BoardTab,
   BoardViewCallbacks,
-  BoardWidget,
   BoardWidgetFrameUrl,
 } from "../../lib/board/view-types.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
@@ -57,11 +56,15 @@ function orderedWidgets(snapshot: BoardSnapshot, tabId: string): BoardWidget[] {
     );
 }
 
-function itemsForWidgets(widgets: readonly BoardWidget[]): BoardGridItem[] {
+function itemsForWidgets(
+  widgets: readonly BoardWidget[],
+  contentHeights: ReadonlyMap<string, number>,
+): BoardGridItem[] {
+  const chromeRowPx = boardChromeRowPx();
   return widgets.map((widget) => ({
     name: widget.name,
     w: widget.sizeW,
-    h: widget.sizeH,
+    h: effectiveBoardWidgetRows(widget, contentHeights.get(widget.name), chromeRowPx),
     order: widget.position,
   }));
 }
@@ -71,7 +74,9 @@ class OpenClawBoardView extends OpenClawLightDomElement {
   @property({ attribute: false }) activeTabId = "";
   @property({ attribute: false }) widgetFrameUrl?: BoardWidgetFrameUrl;
   @property({ attribute: false }) callbacks?: BoardViewCallbacks;
-  @property({ attribute: false }) sessions: readonly GatewaySessionRow[] = [];
+  @property({ type: Boolean }) active = true;
+  @property({ type: Boolean }) canMutate = true;
+  @property({ type: Boolean }) canGrant = true;
 
   @state() private previewItems: BoardGridItem[] | null = null;
   @state() private gestureName = "";
@@ -86,6 +91,17 @@ class OpenClawBoardView extends OpenClawLightDomElement {
   private mutationRequestId = 0;
   private stableCellOrder = new Map<string, number>();
   private stableCellOrderSequence = 0;
+  private readonly contentHeights = new Map<string, number>();
+  // Hybrid devices flip pointer capability live (mouse dock/undock); CSS moves
+  // the bar between overlay and in-flow, so auto-height rows must re-layout.
+  private readonly finePointerQuery =
+    typeof window.matchMedia === "function" ? window.matchMedia(FINE_POINTER_QUERY) : null;
+  private readonly handlePointerModeChange = () => this.requestUpdate();
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.finePointerQuery?.addEventListener("change", this.handlePointerModeChange);
+  }
 
   override willUpdate(changed: PropertyValues<this>): void {
     if (changed.has("snapshot")) {
@@ -97,17 +113,39 @@ class OpenClawBoardView extends OpenClawLightDomElement {
         this.focusName = "";
         this.stableCellOrder.clear();
         this.stableCellOrderSequence = 0;
+        this.contentHeights.clear();
+      } else if (previousSnapshot && this.snapshot) {
+        const previousByName = new Map(
+          previousSnapshot.widgets.map((widget) => [widget.name, widget]),
+        );
+        for (const name of this.contentHeights.keys()) {
+          const previous = previousByName.get(name);
+          const current = this.snapshot.widgets.find((widget) => widget.name === name);
+          if (
+            !current ||
+            current.contentKind !== "html" ||
+            previous?.revision !== current.revision
+          ) {
+            this.contentHeights.delete(name);
+          }
+        }
       }
     }
     if (changed.has("activeTabId")) {
       this.focusName = "";
     }
-    if (this.gesture && (changed.has("snapshot") || changed.has("activeTabId"))) {
+    if (
+      this.gesture &&
+      (changed.has("snapshot") ||
+        changed.has("activeTabId") ||
+        (changed.has("active") && !this.active))
+    ) {
       this.cancelGesture();
     }
   }
 
   override disconnectedCallback(): void {
+    this.finePointerQuery?.removeEventListener("change", this.handlePointerModeChange);
     this.cancelGesture();
     super.disconnectedCallback();
   }
@@ -190,9 +228,45 @@ class OpenClawBoardView extends OpenClawLightDomElement {
     },
     resizeTo: async (widget, w, h) => {
       await this.applyOps(
-        [{ kind: "widget_resize", name: widget.name, sizeW: w, sizeH: h }],
+        [{ kind: "widget_resize", name: widget.name, sizeW: w, sizeH: h, heightMode: "fixed" }],
         t("board.announcement.resized", { title: widget.title || widget.name }),
       );
+    },
+    setHeightMode: async (widget, mode) => {
+      // Pinning keeps the currently rendered auto height, not the stale stored
+      // sizeH, so "fixed" freezes exactly what the user sees.
+      const sizeH =
+        mode === "fixed"
+          ? effectiveBoardWidgetRows(
+              widget,
+              this.contentHeights.get(widget.name),
+              boardChromeRowPx(),
+            )
+          : widget.sizeH;
+      await this.applyOps(
+        [
+          {
+            kind: "widget_resize",
+            name: widget.name,
+            sizeW: widget.sizeW,
+            sizeH,
+            heightMode: mode,
+          },
+        ],
+        t("board.announcement.resized", { title: widget.title || widget.name }),
+      );
+    },
+    reportContentHeight: (name, height) => {
+      const widget = this.snapshot?.widgets.find((candidate) => candidate.name === name);
+      if (!widget || widget.contentKind !== "html") {
+        return;
+      }
+      // Any pixel change matters: the cell renders the exact reported height,
+      // not just the quantized row span.
+      if (this.contentHeights.get(name) !== height) {
+        this.contentHeights.set(name, height);
+        this.requestUpdate();
+      }
     },
     remove: async (widget) => {
       await this.applyOps(
@@ -205,6 +279,19 @@ class OpenClawBoardView extends OpenClawLightDomElement {
     focusChanged: (name) => {
       this.focusName = name;
     },
+    frameLoadFailed: async (name) => {
+      await this.callbacks?.frameLoadFailed?.(name);
+    },
+    widgetAppView: async (name, revision) =>
+      (await this.callbacks?.widgetAppView?.(name, revision)) ?? {
+        status: "stale",
+        error: "MCP App view unavailable",
+      },
+    refreshWidgetAppView: async (name, revision) =>
+      (await this.callbacks?.refreshWidgetAppView?.(name, revision)) ?? {
+        status: "stale",
+        error: "MCP App view unavailable",
+      },
   };
 
   private beginGesture(
@@ -212,7 +299,13 @@ class OpenClawBoardView extends OpenClawLightDomElement {
     widget: BoardWidget,
     event: PointerEvent,
   ): void {
-    if (event.button !== 0 || this.gesture || this.mutationPending) {
+    if (
+      !this.active ||
+      !this.canMutate ||
+      event.button !== 0 ||
+      this.gesture ||
+      this.mutationPending
+    ) {
       return;
     }
     const snapshot = this.snapshot;
@@ -228,7 +321,7 @@ class OpenClawBoardView extends OpenClawLightDomElement {
     } catch {
       // Synthetic pointers and detached test targets cannot be captured.
     }
-    const items = itemsForWidgets(orderedWidgets(snapshot, tab.tabId));
+    const items = itemsForWidgets(orderedWidgets(snapshot, tab.tabId), this.contentHeights);
     this.gesture = {
       dropValid: false,
       mode,
@@ -236,7 +329,11 @@ class OpenClawBoardView extends OpenClawLightDomElement {
       originClientX: event.clientX,
       originClientY: event.clientY,
       originW: widget.sizeW,
-      originH: widget.sizeH,
+      originH: effectiveBoardWidgetRows(
+        widget,
+        this.contentHeights.get(widget.name),
+        boardChromeRowPx(),
+      ),
       pointerId: event.pointerId,
       items,
     };
@@ -350,7 +447,7 @@ class OpenClawBoardView extends OpenClawLightDomElement {
       return;
     }
     const resized = previewItems?.find((item) => item.name === gesture.name);
-    if (resized && (resized.w !== widget.sizeW || resized.h !== widget.sizeH)) {
+    if (resized && (resized.w !== gesture.originW || resized.h !== gesture.originH)) {
       void this.applyOps(
         [
           {
@@ -358,6 +455,7 @@ class OpenClawBoardView extends OpenClawLightDomElement {
             name: gesture.name,
             sizeW: resized.w,
             sizeH: resized.h,
+            heightMode: "fixed",
           },
         ],
         t("board.announcement.resized", { title: widget.title || widget.name }),
@@ -386,7 +484,7 @@ class OpenClawBoardView extends OpenClawLightDomElement {
     if (!snapshot) {
       return;
     }
-    const items = itemsForWidgets(orderedWidgets(snapshot, widget.tabId));
+    const items = itemsForWidgets(orderedWidgets(snapshot, widget.tabId), this.contentHeights);
     const moved = nudge(items, widget.name, direction).find((item) => item.name === widget.name);
     if (!moved || moved.order === widget.position) {
       return;
@@ -528,7 +626,7 @@ class OpenClawBoardView extends OpenClawLightDomElement {
         </div>
       `;
     }
-    const items = this.previewItems ?? itemsForWidgets(widgets);
+    const items = this.previewItems ?? itemsForWidgets(widgets, this.contentHeights);
     const rects = layout(items);
     for (const rect of rects) {
       if (!this.stableCellOrder.has(rect.name)) {
@@ -560,16 +658,19 @@ class OpenClawBoardView extends OpenClawLightDomElement {
               <openclaw-board-widget-cell
                 .widget=${widget}
                 .rect=${rect}
+                .contentHeightPx=${this.contentHeights.get(widget.name)}
                 .tabs=${tabs}
+                .sessionKey=${sessionKey}
                 .widgetFrameUrl=${this.widgetFrameUrl}
                 .callbacks=${this.cellCallbacks}
-                .sessions=${this.sessions}
-                .sessionKey=${sessionKey}
+                .active=${this.active}
                 .dragging=${widget.name === this.gestureName}
                 .focusTabIndex=${widget.name === focusName ? 0 : -1}
                 .positionInSet=${(logicalPosition.get(widget.name) ?? 0) + 1}
                 .setSize=${rects.length}
                 .busy=${this.mutationPending}
+                .canMutate=${this.canMutate}
+                .canGrant=${this.canGrant}
               ></openclaw-board-widget-cell>
             `;
           },

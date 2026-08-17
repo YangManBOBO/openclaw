@@ -1,25 +1,44 @@
+import { consume } from "@lit/context";
 import { html, nothing, type PropertyValues, type TemplateResult } from "lit";
 import { property, state } from "lit/decorators.js";
-import type { GatewaySessionRow } from "../../api/types.ts";
+import { applicationContext, type ApplicationContext } from "../../app/context.ts";
+import { ensureCustomElementDefined } from "../../app/lazy-custom-element.ts";
 import { t } from "../../i18n/index.ts";
 import type { BoardGridDirection, BoardGridRect } from "../../lib/board/grid.ts";
-import { toCssPlacement } from "../../lib/board/grid.ts";
-import type {
-  BoardGrantDecision,
-  BoardTab,
-  BoardWidget,
-  BoardWidgetFrameUrl,
-} from "../../lib/board/view-types.ts";
-import { getBuiltinWidgetRenderer } from "../../lib/board/widgets/index.ts";
+import {
+  boardChromeRowPx,
+  exactBoardWidgetHeightPx,
+  toCssPlacement,
+} from "../../lib/board/grid.ts";
+import type { BoardWidgetAppViewState } from "../../lib/board/provider.ts";
+import type { BoardTab, BoardWidget } from "../../lib/board/types.ts";
+import type { BoardGrantDecision, BoardWidgetFrameUrl } from "../../lib/board/view-types.ts";
+import {
+  getPluginWidgetKindContribution,
+  loadPluginWidgetRenderer,
+  pluginIdForWidgetKind,
+  type PluginBoardWidgetRenderer,
+} from "../../lib/board/widgets/index.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
+import { renderBoardMcpAppContent } from "./board-mcp-app-content.ts";
+import { BoardMcpAppLifecycle } from "./board-mcp-app-lifecycle.ts";
+import { renderBoardGrantedCapabilities } from "./board-widget-capabilities.ts";
+import {
+  BOARD_SIZE_PRESETS,
+  closeBoardWidgetMenu,
+  renderBoardDisabledPlugin,
+  renderBoardWidgetActionError,
+  renderBoardWidgetError,
+  renderBoardWidgetMenu,
+  renderBoardWidgetPending,
+  renderBoardWidgetRejected,
+} from "./board-widget-cell-render.ts";
+import { BoardWidgetFrameLifecycle } from "./board-widget-frame.ts";
+import "../tooltip.ts";
 import "../web-awesome.ts";
 
-const BOARD_SIZE_PRESETS = {
-  sm: { w: 3, h: 3 },
-  md: { w: 6, h: 4 },
-  lg: { w: 8, h: 6 },
-  xl: { w: 12, h: 8 },
-} as const;
+const loadMcpAppView = () => import("../mcp-app-view-registration.ts");
 
 export type BoardWidgetCellCallbacks = {
   grant: (name: string, decision: BoardGrantDecision) => Promise<void>;
@@ -27,41 +46,111 @@ export type BoardWidgetCellCallbacks = {
   resizePointerDown: (widget: BoardWidget, event: PointerEvent) => void;
   moveToTab: (widget: BoardWidget, tabId: string) => Promise<void>;
   resizeTo: (widget: BoardWidget, w: number, h: number) => Promise<void>;
+  setHeightMode: (widget: BoardWidget, mode: "auto" | "fixed") => Promise<void>;
+  reportContentHeight: (name: string, height: number) => void;
   remove: (widget: BoardWidget) => Promise<void>;
   nudge: (widget: BoardWidget, direction: BoardGridDirection) => Promise<void>;
   focus: (widget: BoardWidget, direction: BoardGridDirection) => void;
   focusChanged: (name: string) => void;
+  frameLoadFailed: (name: string) => Promise<void>;
+  widgetAppView: (name: string, revision: number) => Promise<BoardWidgetAppViewState>;
+  refreshWidgetAppView: (name: string, revision: number) => Promise<BoardWidgetAppViewState>;
 };
 
 class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
+  @consume({ context: applicationContext, subscribe: true })
+  private context?: ApplicationContext;
+
   @property({ attribute: false }) widget?: BoardWidget;
   @property({ attribute: false }) rect?: BoardGridRect;
+  @property({ attribute: false }) contentHeightPx?: number;
   @property({ attribute: false }) tabs: readonly BoardTab[] = [];
+  @property({ attribute: false }) sessionKey = "";
   @property({ attribute: false }) widgetFrameUrl?: BoardWidgetFrameUrl;
   @property({ attribute: false }) callbacks?: BoardWidgetCellCallbacks;
-  @property({ attribute: false }) sessions: readonly GatewaySessionRow[] = [];
-  @property({ type: String }) sessionKey = "";
+  @property({ type: Boolean }) active = true;
   @property({ type: Boolean }) dragging = false;
   @property({ type: Number }) focusTabIndex = -1;
   @property({ type: Number }) positionInSet = 1;
   @property({ type: Number }) setSize = 1;
   @property({ type: Boolean }) busy = false;
+  @property({ type: Boolean }) canMutate = true;
+  @property({ type: Boolean }) canGrant = true;
 
   @state() private actionError = "";
   @state() private actionPending = false;
+  @state() private pluginRenderer: PluginBoardWidgetRenderer | null = null;
+  @state() private pluginRendererError = "";
+  @state() private pluginRendererLabel = "";
+  private pluginRendererKind = "";
+  private pluginRendererLoadToken: object | null = null;
+  private readonly appView = new BoardMcpAppLifecycle({
+    active: () => this.active,
+    connected: () => this.isConnected,
+    requestUpdate: () => this.requestUpdate(),
+    sessionKey: () => this.sessionKey,
+    widget: () => this.widget,
+  });
+  private readonly frame = new BoardWidgetFrameLifecycle({
+    active: () => this.active,
+    connected: () => this.isConnected,
+    context: () => this.context,
+    refreshFrame: () => this.callbacks?.frameLoadFailed,
+    reportContentHeight: (name, height) => this.callbacks?.reportContentHeight(name, height),
+    requestUpdate: () => this.requestUpdate(),
+    resolveFrameUrl: () => this.widgetFrameUrl,
+    root: () => this,
+    widget: () => this.widget,
+  });
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.frame.connect();
+    this.requestUpdate();
+  }
 
   override willUpdate(changed: PropertyValues<this>): void {
     const previousWidget = changed.get("widget");
     if (previousWidget && previousWidget !== this.widget) {
       this.actionError = "";
+      this.frame.widgetChanged(previousWidget, this.widget);
     }
+    this.appView.update(this.widget, this.callbacks);
+    if (changed.has("active")) {
+      this.appView.activityChanged();
+      this.frame.activityChanged();
+      if (this.active) {
+        this.appView.observe(
+          this.querySelector(".board-widget"),
+          this.widget?.contentKind === "mcp-app",
+        );
+      }
+    }
+    this.syncPluginRenderer();
   }
 
-  private closeMenu(): void {
-    const menu = this.querySelector<HTMLElement & { open: boolean }>(".board-widget__menu");
-    if (menu) {
-      menu.open = false;
+  override updated(): void {
+    if (!this.isConnected) {
+      this.appView.observe(null, false);
+      return;
     }
+    this.appView.observe(
+      this.querySelector(".board-widget"),
+      this.active && this.widget?.contentKind === "mcp-app",
+    );
+    queueMicrotask(() => {
+      if (this.isConnected) {
+        this.appView.sync();
+      }
+    });
+    this.frame.update();
+  }
+
+  override disconnectedCallback(): void {
+    this.resetPluginRenderer();
+    this.frame.disconnect();
+    this.appView.disconnect();
+    super.disconnectedCallback();
   }
 
   private async runAction(action: () => Promise<void>): Promise<void> {
@@ -70,11 +159,11 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
     }
     this.actionPending = true;
     this.actionError = "";
-    this.closeMenu();
+    closeBoardWidgetMenu(this);
     try {
       await action();
     } catch (error) {
-      this.actionError = error instanceof Error ? error.message : String(error);
+      this.actionError = formatUiError(error);
     } finally {
       this.actionPending = false;
     }
@@ -85,6 +174,9 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
     widget: BoardWidget,
     callbacks: BoardWidgetCellCallbacks,
   ): void {
+    if (!this.canMutate) {
+      return;
+    }
     const value = event.detail.item.value;
     if (value === "remove") {
       void this.runAction(() => callbacks.remove(widget));
@@ -100,176 +192,146 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
       if (size) {
         void this.runAction(() => callbacks.resizeTo(widget, size.w, size.h));
       }
+      return;
+    }
+    if (value === "height:auto") {
+      const mode = widget.heightMode !== "fixed" ? "fixed" : "auto";
+      void this.runAction(() => callbacks.setHeightMode(widget, mode));
     }
   }
 
-  private renderMenu(widget: BoardWidget, callbacks: BoardWidgetCellCallbacks): TemplateResult {
-    const otherTabs = this.tabs.filter((tab) => tab.tabId !== widget.tabId);
-    return html`
-      <wa-dropdown
-        class="board-widget__menu"
-        placement="bottom-end"
-        @wa-select=${(event: CustomEvent<{ item: { value?: string } }>) =>
-          this.handleMenuSelect(event, widget, callbacks)}
-      >
-        <button
-          class="board-widget__menu-trigger"
-          slot="trigger"
-          type="button"
-          aria-label=${t("board.widget.menuLabel")}
-          title=${t("board.widget.menuLabel")}
-        >
-          ⋮
-        </button>
-        <div class="board-widget__menu-heading">${t("board.widget.moveToTab")}</div>
-        ${otherTabs.length > 0
-          ? otherTabs.map(
-              (tab) => html`
-                <wa-dropdown-item
-                  value=${`move:${tab.tabId}`}
-                  ?disabled=${this.busy || this.actionPending}
-                >
-                  ${tab.title}
-                </wa-dropdown-item>
-              `,
-            )
-          : html`<span class="board-widget__menu-empty">${t("board.widget.noOtherTabs")}</span>`}
-        <div class="board-widget__menu-heading">${t("board.widget.resize")}</div>
-        ${Object.entries(BOARD_SIZE_PRESETS).map(
-          ([label, size]) => html`
-            <wa-dropdown-item
-              class="board-widget__preset"
-              value=${`resize:${label}`}
-              ?disabled=${this.busy || this.actionPending}
-            >
-              ${label.toUpperCase()}
-              <span slot="details">${size.w}×${size.h}</span>
-            </wa-dropdown-item>
-          `,
-        )}
-        <div class="board-widget__menu-separator" role="separator"></div>
-        <wa-dropdown-item
-          class="board-widget__menu-danger"
-          value="remove"
-          ?disabled=${this.busy || this.actionPending}
-        >
-          ${t("board.widget.remove")}
-        </wa-dropdown-item>
-      </wa-dropdown>
-    `;
-  }
-
-  private renderPending(widget: BoardWidget, callbacks: BoardWidgetCellCallbacks): TemplateResult {
-    return html`
-      <div class="board-widget__grant board-widget__grant--pending" data-test-id="board-pending">
-        <div class="board-widget__grant-mark" aria-hidden="true">!</div>
-        <strong>${t("board.widget.needsApproval")}</strong>
-        <span>${t("board.widget.needsApprovalDetail")}</span>
-        <div class="board-widget__grant-actions">
-          <button
-            class="btn btn--small btn--primary"
-            type="button"
-            data-test-id="board-grant-allow"
-            ?disabled=${this.busy || this.actionPending}
-            @click=${() => void this.runAction(() => callbacks.grant(widget.name, "granted"))}
-          >
-            ${t("board.widget.allow")}
-          </button>
-          <button
-            class="btn btn--small"
-            type="button"
-            data-test-id="board-grant-reject"
-            ?disabled=${this.busy || this.actionPending}
-            @click=${() => void this.runAction(() => callbacks.grant(widget.name, "rejected"))}
-          >
-            ${t("board.widget.reject")}
-          </button>
-        </div>
-        ${this.actionError ? this.renderActionError(this.actionError, true) : nothing}
-      </div>
-    `;
-  }
-
-  private renderRejected(widget: BoardWidget, callbacks: BoardWidgetCellCallbacks): TemplateResult {
-    return html`
-      <div class="board-widget__grant board-widget__grant--rejected" data-test-id="board-rejected">
-        <strong>${t("board.widget.rejected")}</strong>
-        <span>${t("board.widget.rejectedDetail")}</span>
-        <button
-          class="btn btn--small"
-          type="button"
-          ?disabled=${this.busy || this.actionPending}
-          @click=${() => void this.runAction(() => callbacks.remove(widget))}
-        >
-          ${t("board.widget.remove")}
-        </button>
-      </div>
-    `;
-  }
-
-  private renderFrame(widget: BoardWidget): TemplateResult {
-    if (!this.widgetFrameUrl) {
-      throw new Error(t("board.widget.frameResolverMissing"));
-    }
-    const src = this.widgetFrameUrl(widget.name, widget.revision);
-    return html`
-      <iframe
-        class="board-widget__frame"
-        sandbox="allow-scripts"
-        referrerpolicy="no-referrer"
-        loading="lazy"
-        title=${widget.title || widget.name}
-        src=${src}
-      ></iframe>
-    `;
+  private renderMcpApp(widget: BoardWidget, callbacks: BoardWidgetCellCallbacks): TemplateResult {
+    void ensureCustomElementDefined("mcp-app-view", loadMcpAppView).catch(() => undefined);
+    const accessNotice =
+      widget.grantState === "pending"
+        ? renderBoardWidgetPending({
+            widget,
+            disabled: this.busy || this.actionPending || !this.canGrant,
+            onGrant: (decision) =>
+              void this.runAction(() => callbacks.grant(widget.name, decision)),
+            ...(this.actionError
+              ? { error: renderBoardWidgetActionError(this.actionError, true) }
+              : {}),
+          })
+        : widget.grantState === "rejected"
+          ? renderBoardWidgetRejected({
+              widget,
+              disabled: this.busy || this.actionPending || !this.canMutate,
+              onRemove: () => void this.runAction(() => callbacks.remove(widget)),
+            })
+          : nothing;
+    return renderBoardMcpAppContent({
+      accessNotice,
+      appView: this.appView.state,
+      busy: this.busy || this.actionPending || !this.canMutate,
+      active: this.active,
+      loading: this.appView.loading,
+      nearVisible: this.appView.nearVisible,
+      rectHeight: this.rect?.h ?? 4,
+      sessionKey: this.sessionKey,
+      widget,
+      expired: () => this.appView.expire(),
+      remove: () => void this.runAction(() => callbacks.remove(widget)),
+      retry: () => this.appView.retry(),
+    });
   }
 
   private renderBody(widget: BoardWidget, callbacks: BoardWidgetCellCallbacks): TemplateResult {
+    if (widget.contentKind === "mcp-app") {
+      return this.renderMcpApp(widget, callbacks);
+    }
     if (widget.grantState === "pending") {
-      return this.renderPending(widget, callbacks);
+      return renderBoardWidgetPending({
+        widget,
+        disabled: this.busy || this.actionPending || !this.canGrant,
+        onGrant: (decision) => void this.runAction(() => callbacks.grant(widget.name, decision)),
+        ...(this.actionError
+          ? { error: renderBoardWidgetActionError(this.actionError, true) }
+          : {}),
+      });
     }
     if (widget.grantState === "rejected") {
-      return this.renderRejected(widget, callbacks);
+      return renderBoardWidgetRejected({
+        widget,
+        disabled: this.busy || this.actionPending || !this.canMutate,
+        onRemove: () => void this.runAction(() => callbacks.remove(widget)),
+      });
     }
-    if (widget.contentKind === "builtin") {
-      const renderer = getBuiltinWidgetRenderer(widget.builtin);
-      if (!renderer) {
-        throw new Error(t("board.widget.frameResolverMissing"));
+    if (widget.contentKind === "plugin") {
+      if (this.pluginRendererError) {
+        return renderBoardWidgetError(this.pluginRendererError, () => this.retryPluginRenderer());
       }
-      return renderer({ sessions: this.sessions, sessionKey: this.sessionKey });
+      if (this.pluginRenderer) {
+        return this.pluginRenderer({
+          widget,
+          sessionKey: this.sessionKey,
+          active: this.active,
+          canMutate: this.canMutate,
+          requestUpdate: () => this.requestUpdate(),
+        });
+      }
+      const pluginId = pluginIdForWidgetKind(widget.pluginKind);
+      const activeKinds = this.context?.gateway.snapshot.hello?.controlUiWidgetKinds ?? [];
+      const contribution = getPluginWidgetKindContribution(widget.pluginKind, activeKinds);
+      return contribution
+        ? html`<p class="board-widget__plugin-loading">${t("board.widget.pluginLoading")}</p>`
+        : renderBoardDisabledPlugin({
+            pluginId,
+            disabled: this.busy || this.actionPending || !this.canMutate,
+            onRemove: () => void this.runAction(() => callbacks.remove(widget)),
+          });
     }
-    return this.renderFrame(widget);
+    return this.frame.render(widget);
   }
 
-  private renderError(error: unknown): TemplateResult {
-    const message = error instanceof Error ? error.message : String(error);
-    return html`
-      <div class="board-widget__error" role="alert" data-test-id="board-widget-error">
-        <strong>${t("board.widget.errorTitle")}</strong>
-        <span>${t("board.widget.errorDetail")}</span>
-        <details>
-          <summary>${t("board.widget.errorShow")}</summary>
-          <code>${message}</code>
-        </details>
-      </div>
-    `;
+  private syncPluginRenderer(): void {
+    const widget = this.widget;
+    const activeKinds = this.context?.gateway.snapshot.hello?.controlUiWidgetKinds ?? [];
+    const contribution =
+      widget?.contentKind === "plugin"
+        ? getPluginWidgetKindContribution(widget.pluginKind, activeKinds)
+        : null;
+    if (!contribution) {
+      if (this.pluginRendererKind || this.pluginRenderer || this.pluginRendererError) {
+        this.resetPluginRenderer();
+      }
+      return;
+    }
+    if (this.pluginRendererKind === contribution.kind) {
+      return;
+    }
+    const loadToken = {};
+    this.pluginRendererKind = contribution.kind;
+    this.pluginRendererLabel = contribution.label;
+    this.pluginRenderer = null;
+    this.pluginRendererError = "";
+    this.pluginRendererLoadToken = loadToken;
+    void loadPluginWidgetRenderer(contribution)
+      .then((renderer) => {
+        if (this.pluginRendererLoadToken === loadToken) {
+          this.pluginRenderer = renderer;
+          this.requestUpdate();
+        }
+      })
+      .catch((error: unknown) => {
+        if (this.pluginRendererLoadToken === loadToken) {
+          this.pluginRendererError = formatUiError(error);
+          this.requestUpdate();
+        }
+      });
   }
 
-  private renderActionError(error: string, inline = false): TemplateResult {
-    return html`
-      <div
-        class=${`board-widget__error ${inline ? "board-widget__error--inline" : ""}`}
-        role="alert"
-        data-test-id="board-widget-action-error"
-      >
-        <strong>${t("board.widget.actionErrorTitle")}</strong>
-        <span>${t("board.widget.actionErrorDetail")}</span>
-        <details>
-          <summary>${t("board.widget.errorShow")}</summary>
-          <code>${error}</code>
-        </details>
-      </div>
-    `;
+  private resetPluginRenderer(): void {
+    this.pluginRendererLoadToken = null;
+    this.pluginRendererKind = "";
+    this.pluginRendererLabel = "";
+    this.pluginRenderer = null;
+    this.pluginRendererError = "";
+  }
+
+  private retryPluginRenderer(): void {
+    this.resetPluginRenderer();
+    this.requestUpdate();
   }
 
   private handleKeyDown(
@@ -277,7 +339,7 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
     widget: BoardWidget,
     callbacks: BoardWidgetCellCallbacks,
   ): void {
-    if (event.target !== event.currentTarget || widget.readOnly) {
+    if (event.target !== event.currentTarget || !this.canMutate) {
       return;
     }
     const direction =
@@ -309,24 +371,38 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
       return nothing;
     }
     let body: TemplateResult;
-    let bodyErrored = false;
+    let bodyErrored: boolean;
     try {
-      body = this.renderBody(widget, callbacks);
+      body = this.frame.error
+        ? renderBoardWidgetError(this.frame.error)
+        : this.renderBody(widget, callbacks);
+      bodyErrored = Boolean(this.frame.error);
     } catch (error) {
-      body = this.renderError(error);
+      body = renderBoardWidgetError(error);
       bodyErrored = true;
     }
     const label = widget.title || widget.name;
-    const readOnly = widget.readOnly === true;
+    const readOnly = !this.canMutate;
     const bodyScrollable =
       bodyErrored ||
       this.actionError !== "" ||
       widget.grantState === "pending" ||
       widget.grantState === "rejected";
+    const contentScrollable =
+      bodyScrollable || widget.contentKind === "mcp-app" || widget.contentKind === "plugin";
+    const presentation =
+      widget.contentKind === "html" ? (widget.presentation ?? "card") : undefined;
+    // While a move/resize gesture runs, the card fills its (preview) cell so
+    // the user manipulates the quantized rect they will actually commit.
+    const exactHeightPx = this.dragging
+      ? undefined
+      : exactBoardWidgetHeightPx(widget, this.contentHeightPx, boardChromeRowPx());
+    const exactHeightStyle =
+      exactHeightPx === undefined ? "" : ` height: ${exactHeightPx}px; align-self: start;`;
     return html`
       <section
-        class=${`board-widget ${this.dragging ? "board-widget--dragging" : ""}`}
-        style=${toCssPlacement(rect)}
+        class=${`board-widget ${this.dragging ? "board-widget--dragging" : ""} ${presentation ? `board-widget--${presentation}` : ""}`}
+        style=${`${toCssPlacement(rect)}${exactHeightStyle}`}
         role="listitem"
         tabindex=${this.focusTabIndex}
         aria-posinset=${this.positionInSet}
@@ -349,22 +425,30 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
                 <span aria-hidden="true">⠿</span>
               </span>`}
           <span class="board-widget__title" title=${label}>${label}</span>
-          ${widget.contentKind === "builtin"
+          <span class="board-widget__kind"
+            >${widget.contentKind === "mcp-app"
+              ? t("board.widget.kindMcp")
+              : widget.contentKind === "plugin"
+                ? this.pluginRendererLabel || t("board.widget.kindPlugin")
+                : t("board.widget.kindHtml")}</span
+          >
+          ${renderBoardGrantedCapabilities(widget)}
+          ${readOnly
             ? nothing
-            : html`<span class="board-widget__kind"
-                >${widget.contentKind === "mcp-app"
-                  ? t("board.widget.kindMcp")
-                  : t("board.widget.kindHtml")}</span
-              >`}
-          ${readOnly ? nothing : this.renderMenu(widget, callbacks)}
+            : renderBoardWidgetMenu({
+                widget,
+                tabs: this.tabs,
+                disabled: this.busy || this.actionPending,
+                onSelect: (event) => this.handleMenuSelect(event, widget, callbacks),
+              })}
         </header>
         <div
-          class=${`board-widget__body ${bodyScrollable ? "board-widget__body--scrollable" : ""}`}
+          class=${`board-widget__body ${contentScrollable ? "board-widget__body--scrollable" : ""} ${presentation === "card" ? "board-widget__body--card" : ""}`}
         >
           ${body}
           ${this.actionError && widget.grantState !== "pending"
             ? html`<div class="board-widget__error-overlay">
-                ${this.renderActionError(this.actionError)}
+                ${renderBoardWidgetActionError(this.actionError)}
               </div>`
             : nothing}
         </div>
@@ -376,6 +460,9 @@ class OpenClawBoardWidgetCell extends OpenClawLightDomElement {
               title=${t("board.widget.resizeHandle", { title: label })}
               @pointerdown=${(event: PointerEvent) => callbacks.resizePointerDown(widget, event)}
             ></span>`}
+        ${widget.grantState === "granted"
+          ? html`<span class="board-widget__grant-dot" aria-hidden="true"></span>`
+          : nothing}
       </section>
     `;
   }

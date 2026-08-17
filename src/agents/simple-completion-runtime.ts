@@ -1,6 +1,10 @@
 import { supportsOpenAIReasoningEffort } from "@openclaw/ai/internal/openai";
 import { defaultApiRegistry } from "@openclaw/ai/internal/runtime";
-import { resolveClaudeSonnet5ModelIdentity } from "@openclaw/llm-core";
+import { prepareModelForSimpleCompletion } from "@openclaw/ai/transports";
+import {
+  resolveClaudeOpus5ModelIdentity,
+  resolveClaudeSonnet5ModelIdentity,
+} from "@openclaw/llm-core";
 /**
  * Simple completion runtime preparation.
  *
@@ -21,7 +25,7 @@ import { prepareProviderRuntimeAuth } from "../plugins/provider-runtime.runtime.
 import { resolveAgentDir, resolveAgentEffectiveModelPrimary } from "./agent-scope.js";
 import { ensureAuthProfileStore } from "./auth-profiles/store.js";
 import { DEFAULT_PROVIDER } from "./defaults.js";
-import { resolveModel, resolveModelAsync } from "./embedded-agent-runner/model.js";
+import { resolveModelAsync } from "./embedded-agent-runner/model.js";
 import {
   fingerprintAuthProfileCredential,
   fingerprintResolvedProviderAuth,
@@ -31,8 +35,8 @@ import {
   applySecretRefHeaderSentinels,
   applyLocalNoAuthHeaderOverride,
   formatMissingAuthError,
-  getApiKeyForModel,
-  resolveApiKeyForProvider,
+  getApiKeyForModelCore,
+  resolveApiKeyForProviderCore,
   type ResolvedProviderAuth,
 } from "./model-auth.js";
 import { splitTrailingAuthProfile } from "./model-ref-profile.js";
@@ -40,6 +44,7 @@ import {
   buildModelAliasIndex,
   resolveDefaultModelForAgent,
   resolveModelRefFromString,
+  type ModelManifestNormalizationContext,
 } from "./model-selection.js";
 import { resolveOpenAIModelRoutes, selectOpenAIModelRouteAuth } from "./openai-model-routes.js";
 import { OPENAI_PROVIDER_ID, isOpenAIProvider } from "./openai-routing.js";
@@ -53,7 +58,6 @@ import { buildAgentRuntimeAuthPlan } from "./runtime-plan/auth.js";
 import { materializePreparedRuntimeModel } from "./runtime-plan/materialize-model.js";
 import { getModelRegistryRuntime } from "./sessions/model-registry-runtime.js";
 import { resolveSimpleCompletionModelResolverWorkspace } from "./simple-completion-scope.js";
-import { prepareModelForSimpleCompletion } from "./simple-completion-transport.js";
 import { resolveUtilityModelRefForAgent } from "./utility-model.js";
 
 type SimpleCompletionAuthStorage = {
@@ -114,10 +118,12 @@ export function resolveSimpleCompletionSelectionForAgent(params: {
   agentDir?: string;
   modelRef?: string;
   useUtilityModel?: boolean;
+  manifestPlugins?: ModelManifestNormalizationContext["manifestPlugins"];
 }): AgentSimpleCompletionSelection | null {
   const fallbackRef = resolveDefaultModelForAgent({
     cfg: params.cfg,
     agentId: params.agentId,
+    manifestPlugins: params.manifestPlugins,
   });
   // Utility routing derives a provider-declared small model when unset and
   // treats an explicit empty utilityModel as "use the primary" (disabled).
@@ -135,12 +141,14 @@ export function resolveSimpleCompletionSelectionForAgent(params: {
   const aliasIndex = buildModelAliasIndex({
     cfg: params.cfg,
     defaultProvider: fallbackRef.provider || DEFAULT_PROVIDER,
+    manifestPlugins: params.manifestPlugins,
   });
   const resolved = split
     ? resolveModelRefFromString({
         raw: split.model,
         defaultProvider: fallbackRef.provider || DEFAULT_PROVIDER,
         aliasIndex,
+        manifestPlugins: params.manifestPlugins,
       })
     : null;
   const provider = resolved?.ref.provider ?? fallbackRef.provider;
@@ -226,6 +234,7 @@ function hasMissingApiKeyAllowance(params: {
 
 export async function prepareSimpleCompletionModel(params: {
   cfg: OpenClawConfig | undefined;
+  agentId?: string;
   provider: string;
   modelId: string;
   agentDir?: string;
@@ -233,34 +242,27 @@ export async function prepareSimpleCompletionModel(params: {
   preferredProfile?: string;
   allowMissingApiKeyModes?: ReadonlyArray<AllowedMissingApiKeyMode>;
   allowBundledStaticCatalogFallback?: boolean;
-  useAsyncModelResolution?: boolean;
   skipAgentDiscovery?: boolean;
   bindAuthOwner?: boolean;
   modelResolver?: typeof resolveModelAsync;
 }): Promise<PreparedSimpleCompletionModel> {
   const workspaceDir = resolveSimpleCompletionModelResolverWorkspace(params.modelResolver);
-  const resolved =
-    params.useAsyncModelResolution || params.skipAgentDiscovery
-      ? await (params.modelResolver ?? resolveModelAsync)(
-          params.provider,
-          params.modelId,
-          params.agentDir,
-          params.cfg,
-          {
-            ...(params.allowBundledStaticCatalogFallback !== undefined
-              ? { allowBundledStaticCatalogFallback: params.allowBundledStaticCatalogFallback }
-              : {}),
-            ...(params.skipAgentDiscovery ? { skipAgentDiscovery: true } : {}),
-            workspaceDir,
-            authProfileId: params.profileId,
-            preferredProfile: params.preferredProfile,
-          },
-        )
-      : resolveModel(params.provider, params.modelId, params.agentDir, params.cfg, {
-          workspaceDir,
-          authProfileId: params.profileId,
-          preferredProfile: params.preferredProfile,
-        });
+  const resolved = await (params.modelResolver ?? resolveModelAsync)(
+    params.provider,
+    params.modelId,
+    params.agentDir,
+    params.cfg,
+    {
+      ...(params.agentId ? { agentId: params.agentId } : {}),
+      ...(params.allowBundledStaticCatalogFallback !== undefined
+        ? { allowBundledStaticCatalogFallback: params.allowBundledStaticCatalogFallback }
+        : {}),
+      ...(params.skipAgentDiscovery ? { skipAgentDiscovery: true } : {}),
+      workspaceDir,
+      authProfileId: params.profileId,
+      preferredProfile: params.preferredProfile,
+    },
+  );
   if (!resolved.model) {
     return {
       error: resolved.error ?? `Unknown model: ${params.provider}/${params.modelId}`,
@@ -290,7 +292,7 @@ export async function prepareSimpleCompletionModel(params: {
     : undefined;
   try {
     auth = resolvesAuthBeforePhysicalRoute
-      ? await resolveApiKeyForProvider({
+      ? await resolveApiKeyForProviderCore({
           provider: initialModel.provider,
           cfg: params.cfg,
           agentDir: params.agentDir,
@@ -302,7 +304,7 @@ export async function prepareSimpleCompletionModel(params: {
           modelId: initialModel.id,
           secretSentinels: true,
         })
-      : await getApiKeyForModel({
+      : await getApiKeyForModelCore({
           model: initialModel,
           cfg: params.cfg,
           agentDir: params.agentDir,
@@ -327,6 +329,10 @@ export async function prepareSimpleCompletionModel(params: {
             mode: auth.mode,
             availability: true,
             evidence: "runtime",
+            // The credential is already resolved by the caller and wrapped as
+            // required provider-binding ownership below, so it is not an
+            // ambient discovery competing with declared profiles.
+            authorization: "declared",
           });
       const routeAuthDecision = selectOpenAIModelRouteAuth({
         resolution: routeResolution,
@@ -376,6 +382,7 @@ export async function prepareSimpleCompletionModel(params: {
               params.agentDir,
               config,
               {
+                ...(params.agentId ? { agentId: params.agentId } : {}),
                 authStorage: resolved.authStorage,
                 modelRegistry: resolved.modelRegistry,
                 skipAgentDiscovery: true,
@@ -388,7 +395,7 @@ export async function prepareSimpleCompletionModel(params: {
             ),
         })) ?? initialModel;
       if (resolvesAuthBeforePhysicalRoute) {
-        auth = await getApiKeyForModel({
+        auth = await getApiKeyForModelCore({
           model: resolvedModel,
           cfg: params.cfg,
           agentDir: params.agentDir,
@@ -472,6 +479,7 @@ export async function prepareSimpleCompletionModelForAgent(params: {
   preferredProfile?: string;
   allowMissingApiKeyModes?: ReadonlyArray<AllowedMissingApiKeyMode>;
   allowBundledStaticCatalogFallback?: boolean;
+  /** @deprecated no-op; kept for plugin-SDK source compatibility, remove at next SDK-breaking window. */
   useAsyncModelResolution?: boolean;
   skipAgentDiscovery?: boolean;
   bindAuthOwner?: boolean;
@@ -491,6 +499,7 @@ export async function prepareSimpleCompletionModelForAgent(params: {
   }
   const prepared = await prepareSimpleCompletionModel({
     cfg: params.cfg,
+    agentId: params.agentId,
     provider: selection.runtimeProvider ?? selection.provider,
     modelId: selection.modelId,
     agentDir: selection.agentDir,
@@ -500,7 +509,6 @@ export async function prepareSimpleCompletionModelForAgent(params: {
     ...(params.allowBundledStaticCatalogFallback !== undefined
       ? { allowBundledStaticCatalogFallback: params.allowBundledStaticCatalogFallback }
       : {}),
-    useAsyncModelResolution: params.useAsyncModelResolution,
     skipAgentDiscovery: params.skipAgentDiscovery,
     bindAuthOwner: params.bindAuthOwner,
     modelResolver: params.modelResolver,
@@ -556,7 +564,9 @@ function normalizeSimpleCompletionReasoning(
     case undefined:
       return undefined;
     case "off":
-      return resolveClaudeSonnet5ModelIdentity(model) ? "off" : undefined;
+      return resolveClaudeSonnet5ModelIdentity(model) || resolveClaudeOpus5ModelIdentity(model)
+        ? "off"
+        : undefined;
     case "adaptive":
       return "medium";
     case "ultra":

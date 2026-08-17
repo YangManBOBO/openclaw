@@ -19,10 +19,11 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { getSessionBindingService } from "../infra/outbound/session-binding-service.js";
 import { resolveAgentConfig } from "./agent-scope.js";
-import { resolveSubagentCapabilities } from "./subagent-capabilities.js";
-import { getSubagentDepthFromSessionStore } from "./subagent-depth.js";
-import { countActiveRunsForSession } from "./subagent-registry.js";
-import { resolveSubagentTargetPolicy } from "./subagent-target-policy.js";
+import { resolveChildAdmission, type ChildAdmissionCap } from "./child-admission.js";
+import { countActiveRunsForSession } from "./subagents/registry/subagent-registry.js";
+import { resolveSubagentCapabilities } from "./subagents/spawn/subagent-capabilities.js";
+import { getSubagentDepthFromSessionStore } from "./subagents/spawn/subagent-depth.js";
+import { resolveSubagentTargetPolicy } from "./subagents/spawn/subagent-target-policy.js";
 
 type SpawnMode = "run" | "session";
 type SpawnBackendKind = "subagent" | "acp";
@@ -280,6 +281,12 @@ export function prepareSpawnThreadBinding(params: {
 export function resolveSpawnAdmission(params: {
   cfg: OpenClawConfig;
   enabled?: boolean;
+  collector?: {
+    liveChildren: number;
+    totalChildren: number;
+    maxChildrenPerGroup: number;
+    maxTotalPerGroup: number;
+  };
   requesterSessionKey: string;
   requesterAgentId: string;
   targetAgentId: string;
@@ -289,7 +296,6 @@ export function resolveSpawnAdmission(params: {
 }):
   | {
       ok: true;
-      callerDepth?: number;
       maxSpawnDepth?: number;
       childSessionPatch?: {
         spawnDepth: number;
@@ -297,31 +303,44 @@ export function resolveSpawnAdmission(params: {
         subagentControlScope: "children" | "none";
       };
     }
-  | { ok: false; error: string } {
+  | { ok: false; governingCap?: ChildAdmissionCap; error: string } {
   if (params.enabled === false) {
     return { ok: true };
   }
   const callerDepth = getSubagentDepthFromSessionStore(params.requesterSessionKey, {
     cfg: params.cfg,
+    agentId: params.requesterAgentId,
   });
   const maxSpawnDepth =
     params.cfg.agents?.defaults?.subagents?.maxSpawnDepth ?? DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH;
-  if (callerDepth >= maxSpawnDepth) {
-    return {
-      ok: false,
-      error: `sessions_spawn is not allowed at this depth (current depth: ${callerDepth}, max: ${maxSpawnDepth})`,
-    };
-  }
-  const maxChildren =
-    params.cfg.agents?.defaults?.subagents?.maxChildrenPerAgent ??
-    DEFAULT_SUBAGENT_MAX_CHILDREN_PER_AGENT;
-  const activeChildren =
-    countActiveRunsForSession(params.requesterSessionKey) + (params.additionalActiveChildren ?? 0);
-  if (activeChildren >= maxChildren) {
-    return {
-      ok: false,
-      error: `sessions_spawn has reached max active children for this session (${activeChildren}/${maxChildren})`,
-    };
+  const collector = params.collector;
+  // Build each mode's params in its own branch so collector counts can never
+  // pair with the announce cap (or vice versa) through fallback chaining.
+  const childAdmission = collector
+    ? resolveChildAdmission({
+        callerDepth,
+        maxSpawnDepth,
+        collect: true,
+        activeChildren: collector.liveChildren,
+        maxActiveChildren: collector.maxChildrenPerGroup,
+        totalChildren: collector.totalChildren,
+        maxTotalChildren: collector.maxTotalPerGroup,
+      })
+    : resolveChildAdmission({
+        callerDepth,
+        maxSpawnDepth,
+        collect: false,
+        activeChildren:
+          countActiveRunsForSession(params.requesterSessionKey, {
+            collect: false,
+            requesterAgentId: params.requesterAgentId,
+          }) + (params.additionalActiveChildren ?? 0),
+        maxActiveChildren:
+          params.cfg.agents?.defaults?.subagents?.maxChildrenPerAgent ??
+          DEFAULT_SUBAGENT_MAX_CHILDREN_PER_AGENT,
+      });
+  if (!childAdmission.ok) {
+    return childAdmission;
   }
   const requesterSubagentConfig = resolveAgentConfig(
     params.cfg,
@@ -355,7 +374,6 @@ export function resolveSpawnAdmission(params: {
   });
   return {
     ok: true,
-    callerDepth,
     maxSpawnDepth,
     childSessionPatch: {
       spawnDepth: capabilities.depth,

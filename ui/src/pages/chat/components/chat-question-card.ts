@@ -6,7 +6,7 @@ import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
 
 type QuestionPanelQuestion = {
-  id: string;
+  questionId: string;
   header: string;
   question: string;
   options: Array<{ label: string; description?: string }>;
@@ -21,7 +21,6 @@ type QuestionPanelViewModel = {
   collapsed: boolean;
   disabled: boolean;
   submitting?: boolean;
-  countdown?: string;
   answersById?: Record<string, string[]>;
   error?: string | null;
   requestPosition?: { current: number; total: number };
@@ -39,7 +38,6 @@ type QuestionPanelProps = {
 };
 
 type GatewayQuestionPanelOptions = {
-  nowMs: number;
   onChange?: () => void;
   onSubmit?: (answers: Record<string, string[]>) => void | Promise<void>;
   onSkip?: () => void | Promise<void>;
@@ -50,18 +48,12 @@ type GatewayQuestionPanelOptions = {
   onNextRequest?: () => void;
 };
 
-function formatRemaining(expiresAtMs: number, nowMs: number): string {
-  const seconds = Math.max(0, Math.ceil((expiresAtMs - nowMs) / 1_000));
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
-}
-
 function promptDraftAnswers(prompt: QuestionPrompt): Record<string, string[]> {
   return Object.fromEntries(
     prompt.questions.map((question) => {
-      const draft = prompt.drafts.get(question.id);
+      const draft = prompt.drafts.get(question.questionId);
       return [
-        question.id,
+        question.questionId,
         [...(draft?.selected ?? []), ...(draft?.freeText.trim() ? [draft.freeText.trim()] : [])],
       ];
     }),
@@ -70,9 +62,9 @@ function promptDraftAnswers(prompt: QuestionPrompt): Record<string, string[]> {
 
 function updatePromptDrafts(prompt: QuestionPrompt, answersById: Record<string, string[]>): void {
   for (const question of prompt.questions) {
-    const values = answersById[question.id] ?? [];
+    const values = answersById[question.questionId] ?? [];
     const optionLabels = new Set(question.options.map((option) => option.label));
-    prompt.drafts.set(question.id, {
+    prompt.drafts.set(question.questionId, {
       selected: new Set(values.filter((value) => optionLabels.has(value))),
       freeText: values.find((value) => !optionLabels.has(value)) ?? "",
     });
@@ -91,10 +83,6 @@ export function createGatewayQuestionPanelProps(
       collapsed: options.collapsed ?? false,
       disabled: prompt.status !== "pending" || prompt.submitting,
       submitting: prompt.submitting,
-      countdown:
-        prompt.status === "pending"
-          ? formatRemaining(prompt.expiresAtMs, options.nowMs)
-          : undefined,
       answersById: promptDraftAnswers(prompt),
       error: prompt.error,
       requestPosition: options.requestPosition,
@@ -142,7 +130,7 @@ function terminalAnswer(prompt: QuestionPrompt, question: QuestionPanelQuestion)
   if (prompt.status === "unavailable") {
     return t("chat.questions.unavailable");
   }
-  const answer = prompt.answers?.answers[question.id]?.answers.join(", ");
+  const answer = prompt.answers?.answers[question.questionId]?.join(", ");
   if (answer) {
     return answer;
   }
@@ -234,14 +222,14 @@ class ChatQuestionPanel extends LitElement {
     const freeTextById = new Map<string, string>();
     for (const question of model.questions) {
       const optionLabels = new Set(question.options.map((option) => option.label));
-      const values = model.answersById[question.id] ?? [];
+      const values = model.answersById[question.questionId] ?? [];
       selectedById.set(
-        question.id,
+        question.questionId,
         values.filter((value) => optionLabels.has(value)),
       );
       const custom = values.filter((value) => !optionLabels.has(value)).join(", ");
       if (custom) {
-        freeTextById.set(question.id, custom);
+        freeTextById.set(question.questionId, custom);
       }
     }
     this.selectedById = selectedById;
@@ -257,14 +245,14 @@ class ChatQuestionPanel extends LitElement {
   }
 
   private answerValues(question: QuestionPanelQuestion): string[] {
-    const selected = this.selectedById.get(question.id) ?? [];
-    const freeText = this.freeTextById.get(question.id)?.trim();
+    const selected = this.selectedById.get(question.questionId) ?? [];
+    const freeText = this.freeTextById.get(question.questionId)?.trim();
     return [...selected, ...(freeText ? [freeText] : [])];
   }
 
   private buildAnswers(model: QuestionPanelViewModel): Record<string, string[]> {
     return Object.fromEntries(
-      model.questions.map((question) => [question.id, this.answerValues(question)]),
+      model.questions.map((question) => [question.questionId, this.answerValues(question)]),
     );
   }
 
@@ -288,9 +276,9 @@ class ChatQuestionPanel extends LitElement {
     advance = true,
   ): void {
     const selectedById = new Map(this.selectedById);
-    const current = selectedById.get(question.id) ?? [];
+    const current = selectedById.get(question.questionId) ?? [];
     selectedById.set(
-      question.id,
+      question.questionId,
       question.multiSelect
         ? current.includes(label)
           ? current.filter((value) => value !== label)
@@ -301,7 +289,7 @@ class ChatQuestionPanel extends LitElement {
     this.selectedById = selectedById;
     if (!question.multiSelect) {
       const freeTextById = new Map(this.freeTextById);
-      freeTextById.delete(question.id);
+      freeTextById.delete(question.questionId);
       this.freeTextById = freeTextById;
     }
     this.answersChanged(model);
@@ -320,9 +308,9 @@ class ChatQuestionPanel extends LitElement {
     question: QuestionPanelQuestion,
     value: string,
   ): void {
-    this.freeTextById = new Map(this.freeTextById).set(question.id, value);
+    this.freeTextById = new Map(this.freeTextById).set(question.questionId, value);
     if (!question.multiSelect && value.trim()) {
-      this.selectedById = new Map(this.selectedById).set(question.id, []);
+      this.selectedById = new Map(this.selectedById).set(question.questionId, []);
     }
     this.answersChanged(model);
   }
@@ -528,13 +516,6 @@ class ChatQuestionPanel extends LitElement {
                 </button>
               </div>`
             : nothing}
-          ${model.countdown
-            ? html`<span
-                class="chat-question-panel__countdown"
-                title=${t("chat.questions.timeRemaining")}
-                >${model.countdown}</span
-              >`
-            : nothing}
           <button
             class="chat-question-panel__collapse"
             type="button"
@@ -556,9 +537,13 @@ class ChatQuestionPanel extends LitElement {
           aria-label=${question.header}
         >
           ${question.options.map((option, index) => {
-            const selected = (this.selectedById.get(question.id) ?? []).includes(option.label);
+            const selected = (this.selectedById.get(question.questionId) ?? []).includes(
+              option.label,
+            );
             const radioTabIndex =
-              selected || (!this.selectedById.get(question.id)?.length && index === 0) ? 0 : -1;
+              selected || (!this.selectedById.get(question.questionId)?.length && index === 0)
+                ? 0
+                : -1;
             return html`
               <button
                 class="chat-question-panel__option ${selected
@@ -593,7 +578,7 @@ class ChatQuestionPanel extends LitElement {
                 autocomplete="off"
                 placeholder=${t("chat.questions.other")}
                 aria-label=${t("chat.questions.ownAnswerFor", { header: question.header })}
-                .value=${this.freeTextById.get(question.id) ?? ""}
+                .value=${this.freeTextById.get(question.questionId) ?? ""}
                 ?disabled=${disabled}
                 @input=${(event: Event) =>
                   this.setFreeText(model, question, (event.target as HTMLInputElement).value)}

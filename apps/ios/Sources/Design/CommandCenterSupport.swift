@@ -135,6 +135,8 @@ struct CommandSessionActionsModifier: ViewModifier {
     let categories: [String]
     let isArchived: Bool
     let isEnabled: Bool
+    let canArchive: Bool
+    let canDelete: Bool
     let actions: CommandSessionActions
 
     @State private var editor: Editor?
@@ -153,10 +155,14 @@ struct CommandSessionActionsModifier: ViewModifier {
         content
             .contextMenu {
                 if self.isArchived {
-                    self.actionButton("Unarchive", systemImage: "archivebox") {
-                        self.actions.toggleArchived()
+                    if self.canArchive {
+                        self.actionButton("Unarchive", systemImage: "archivebox") {
+                            self.actions.toggleArchived()
+                        }
                     }
-                    self.deleteButton
+                    if self.canDelete {
+                        self.deleteButton
+                    }
                 } else {
                     self.actionButton(
                         self.session.pinned == true
@@ -177,14 +183,23 @@ struct CommandSessionActionsModifier: ViewModifier {
                     self.actionButton("Rename…", systemImage: "pencil") {
                         self.beginRename()
                     }
-                    self.actionButton("Fork", systemImage: "arrow.triangle.branch") {
+                    self.actionButton(
+                        self.session.hasActiveRun == true
+                            ? OpenClawTextValue.localized("Fork from last completed message")
+                            : OpenClawTextValue.localized("Fork"),
+                        systemImage: "arrow.triangle.branch")
+                    {
                         self.actions.fork()
                     }
                     self.groupMenu
-                    self.actionButton("Archive", systemImage: "archivebox") {
-                        self.actions.toggleArchived()
+                    if self.canArchive {
+                        self.actionButton("Archive", systemImage: "archivebox") {
+                            self.actions.toggleArchived()
+                        }
                     }
-                    self.deleteButton
+                    if self.canDelete {
+                        self.deleteButton
+                    }
                 }
             }
             .alert(self.editorTitle, isPresented: self.editorBinding) {
@@ -206,14 +221,14 @@ struct CommandSessionActionsModifier: ViewModifier {
                 }
             }
             .confirmationDialog(
-                "Delete Thread?",
+                "Delete Session?",
                 isPresented: self.$confirmsDelete,
                 titleVisibility: .visible)
             {
                 Button(role: .destructive) {
                     self.actions.delete()
                 } label: {
-                    Text("Delete Thread")
+                    Text("Delete Session")
                         .font(OpenClawType.subheadSemiBold)
                 }
                 Button(role: .cancel) {} label: {
@@ -221,7 +236,7 @@ struct CommandSessionActionsModifier: ViewModifier {
                         .font(OpenClawType.subheadSemiBold)
                 }
             } message: {
-                Text("This permanently deletes the thread and its transcript.")
+                Text("This permanently deletes the session and its transcript.")
                     .font(OpenClawType.caption)
             }
     }
@@ -266,13 +281,13 @@ struct CommandSessionActionsModifier: ViewModifier {
     private var editorTitle: String {
         self.editor == .newGroup
             ? String(localized: "New Group")
-            : String(localized: "Rename Thread")
+            : String(localized: "Rename Session")
     }
 
     private var editorPlaceholder: String {
         self.editor == .newGroup
             ? String(localized: "Group name")
-            : String(localized: "Thread name")
+            : String(localized: "Session name")
     }
 
     private func actionButton(
@@ -328,6 +343,8 @@ extension View {
         categories: [String],
         isArchived: Bool = false,
         isEnabled: Bool = true,
+        canArchive: Bool = true,
+        canDelete: Bool = true,
         actions: CommandSessionActions) -> some View
     {
         self.modifier(CommandSessionActionsModifier(
@@ -335,6 +352,8 @@ extension View {
             categories: categories,
             isArchived: isArchived,
             isEnabled: isEnabled,
+            canArchive: canArchive,
+            canDelete: canDelete,
             actions: actions))
     }
 }

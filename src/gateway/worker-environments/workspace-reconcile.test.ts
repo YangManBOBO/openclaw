@@ -9,7 +9,11 @@ import type {
   WorkerWorkspaceManifest,
   WorkerWorkspaceManifestEntry,
 } from "./workspace-manifest.js";
-import { serializeWorkerWorkspaceManifest } from "./workspace-manifest.js";
+import {
+  MAX_RECONCILIATION_ENTRIES,
+  parseWorkerWorkspaceReconciliationPlan,
+  serializeWorkerWorkspaceManifest,
+} from "./workspace-manifest.js";
 import {
   applyStagedWorkerWorkspace,
   type WorkerWorkspaceReconciliationJournal,
@@ -99,12 +103,18 @@ async function applyWorkspace(params: {
   begin?: (journal: WorkerWorkspaceReconciliationJournal) => void;
   commit?: (manifestRef: string) => void;
   abort?: () => void;
+  publishAcceptedManifest?: (accepted: {
+    manifestRef: string;
+    manifest: WorkerWorkspaceManifest;
+    conflictPaths: string[];
+  }) => Promise<void>;
 }) {
   let pending: WorkerWorkspaceReconciliationJournal | undefined;
   return await applyStagedWorkerWorkspace({
     ...params,
     baseManifestRef: `sha256:${"a".repeat(64)}`,
     currentManifestRef: `sha256:${"b".repeat(64)}`,
+    publishAcceptedManifest: params.publishAcceptedManifest,
     journal: {
       load: () => pending,
       begin: (journal) => {
@@ -124,6 +134,55 @@ async function applyWorkspace(params: {
 }
 
 describe("worker workspace reconciliation", () => {
+  it("keeps local-only paths outside a Git workspace's accepted manifest", async () => {
+    const local = await temporaryDirectory("workspace-accepted-git-eligibility");
+    const staging = await temporaryDirectory("workspace-accepted-git-eligibility-staging");
+    await fs.writeFile(path.join(local, "tracked.txt"), "tracked\n");
+    const manifest = {
+      ...(await manifestFor(local)),
+      baseCommit: "a".repeat(40),
+    };
+    await fs.writeFile(path.join(local, "local-ignored-secret.txt"), "private\n");
+    let published: WorkerWorkspaceManifest | undefined;
+
+    const applied = await applyWorkspace({
+      root: local,
+      stagingRoot: staging,
+      base: manifest,
+      current: manifest,
+      publishAcceptedManifest: async (accepted) => {
+        published = accepted.manifest;
+      },
+    });
+
+    expect(published?.entries.map((entry) => entry.path)).toEqual(["tracked.txt"]);
+    expect(applied.manifest.entries.map((entry) => entry.path)).toEqual(["tracked.txt"]);
+    await expect(fs.readFile(path.join(local, "local-ignored-secret.txt"), "utf8")).resolves.toBe(
+      "private\n",
+    );
+  });
+
+  it("publishes the accepted manifest before advancing the journal", async () => {
+    const local = await temporaryDirectory("workspace-publish-before-commit");
+    const staging = await temporaryDirectory("workspace-publish-before-commit-staging");
+    await fs.writeFile(path.join(local, "result.txt"), "accepted\n");
+    const manifest = await manifestFor(local);
+    const events: string[] = [];
+
+    const applied = await applyWorkspace({
+      root: local,
+      stagingRoot: staging,
+      base: manifest,
+      current: manifest,
+      publishAcceptedManifest: async (accepted) => {
+        events.push(`publish:${accepted.manifestRef}`);
+      },
+      commit: (manifestRef) => events.push(`commit:${manifestRef}`),
+    });
+
+    expect(events).toEqual([`publish:${applied.manifestRef}`, `commit:${applied.manifestRef}`]);
+  });
+
   it("rejects unsafe claim ids before constructing a staged result ref", () => {
     expect(workerWorkspaceResultRef("6f77e833-83d2-4db4-bdd4-2ad1d37edc28")).toBe(
       "refs/openclaw/worker-results/6f77e833-83d2-4db4-bdd4-2ad1d37edc28",
@@ -135,7 +194,7 @@ describe("worker workspace reconciliation", () => {
     }
   });
 
-  it("applies the complete candidate before publishing its recovery ref", async () => {
+  it("applies the candidate before publishing its recovery ref", async () => {
     const local = await temporaryDirectory("workspace-staged-ref-local");
     const payload = await temporaryDirectory("workspace-staged-ref-payload");
     const complete = await temporaryDirectory("workspace-staged-ref-complete");
@@ -247,6 +306,59 @@ describe("worker workspace reconciliation", () => {
         })
       ).code,
     ).not.toBe(0);
+  });
+
+  it("rejects an over-budget two-record modification before staging", async () => {
+    const local = await temporaryDirectory("workspace-changed-entry-limit-local");
+    const payload = await temporaryDirectory("workspace-changed-entry-limit-payload");
+    await gitInit(local);
+    const currentSha256 = createHash("sha256").update("x").digest("hex");
+    const baseSha256 = createHash("sha256").update("y").digest("hex");
+    const entries = Array.from({ length: MAX_RECONCILIATION_ENTRIES / 2 + 1 }, (_, index) => ({
+      path: `changed-${index.toString().padStart(5, "0")}.txt`,
+      type: "file" as const,
+      mode: 0o644,
+      size: 1,
+      sha256: currentSha256,
+    }));
+    const base = encodeWorkspaceManifest({
+      version: 1,
+      baseCommit: null,
+      entries: entries.map((entry) => ({ ...entry, sha256: baseSha256 })),
+    });
+    const current = encodeWorkspaceManifest({ version: 1, baseCommit: null, entries });
+
+    await expect(
+      stageWorkerWorkspaceResult({
+        root: local,
+        stagingRoot: payload,
+        stagedResultRef: workerWorkspaceResultRef("claim-entry-limit"),
+        baseManifestRef: base.ref,
+        currentManifestRef: current.ref,
+        baseManifestRaw: base.raw,
+        currentManifestRaw: current.raw,
+      }),
+    ).rejects.toThrow(`exceeds the ${MAX_RECONCILIATION_ENTRIES} entry limit`);
+
+    expect(() =>
+      parseWorkerWorkspaceReconciliationPlan(
+        JSON.stringify({
+          version: 1,
+          temporaryNonce: "a".repeat(32),
+          baseManifestRef: base.ref,
+          currentManifestRef: current.ref,
+          baseEntries: Array.from({ length: MAX_RECONCILIATION_ENTRIES + 1 }, (_, index) => ({
+            ...entries[0]!,
+            path: `serialized-${index.toString().padStart(5, "0")}.txt`,
+          })),
+          appliedEntries: [],
+          baseDirectories: [],
+          appliedDirectories: [],
+          baseTree: "b".repeat(40),
+          basePackSha256: "c".repeat(64),
+        }),
+      ),
+    ).toThrow("unsupported shape");
   });
 
   it("preserves the published result when its fence-row update fails", async () => {
@@ -839,7 +951,7 @@ describe("worker workspace reconciliation", () => {
     const staged = await temporaryDirectory("workspace-directory-delete-derived-staged");
     await fs.mkdir(path.join(local, "removed", "nested"), { recursive: true });
     await fs.writeFile(path.join(local, "removed", "nested", "base.txt"), "base");
-    const base = await manifestFor(local);
+    const base = { ...(await manifestFor(local)), baseCommit: "a".repeat(40) };
     await fs.mkdir(path.join(local, "removed", "nested", "__pycache__"));
     await fs.writeFile(
       path.join(local, "removed", "nested", "__pycache__", "cache.pyc"),
@@ -850,7 +962,7 @@ describe("worker workspace reconciliation", () => {
       root: local,
       stagingRoot: staged,
       base,
-      current: await manifestFor(staged),
+      current: { ...(await manifestFor(staged)), baseCommit: "a".repeat(40) },
     });
 
     expect(applied.conflictPaths).toEqual([]);

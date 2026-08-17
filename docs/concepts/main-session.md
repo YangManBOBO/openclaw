@@ -13,8 +13,9 @@ lands in **one rolling conversation**: the main session. Ask something on your
 phone, follow up from your laptop, and the agent has the same context in both
 places. There is one brain, and this is where it thinks.
 
-Under the hood the main session is an ordinary session with the key
-`agent:<agentId>:main` (for example `agent:main:main`). What makes it special
+Under the hood the main session is an ordinary session with the default key
+`agent:<agentId>:main` (for example `agent:main:main`; `session.mainKey` can
+change the final segment). What makes it special
 is that the default DM scope collapses all direct messages into it, and that
 the rest of the system treats it as the agent's root: heartbeats wake it,
 background work reports back to it, and activity elsewhere flows up to it.
@@ -32,12 +33,14 @@ coding/CLI sessions under **Coding**.
 The main session is not just a chat log; it is the place where your agent's
 world converges:
 
-- **Group activity.** Group and room sessions stay isolated (see below), but
-  under the default DM scope the main session automatically watches them.
+- **Group activity.** Group and room sessions stay isolated by default (see
+  below), but under the default DM scope the main session automatically watches them.
   Activity queues up as compact notices — coalesced per conversation, never
   one wake-up per message — and the agent sees them the next time it runs: on
-  your next message or on a scheduled heartbeat. The agent can also read the
-  sessions it watches, so "what did I miss in the family group?" works.
+  your next message or on a scheduled heartbeat. Under the default `tree`
+  visibility, the main session can use session tools across every session of
+  the same agent; its system prompt names watched groups so it knows where
+  recent activity happened.
 - **Background work.** Sub-agents and spawned sessions announce their results
   back to the session that started them, so work the agent kicked off from
   Home reports back to Home.
@@ -60,20 +63,26 @@ continuity comes from layers around it:
   is enabled by default; any configured DM isolation turns it off unless you
   opt in explicitly. See [Memory configuration](/reference/memory-config).
 
-## A rolling session, not an immortal one
+## A rolling session with durable history
 
 The main session rolls forward through resets and compaction rather than
-growing forever:
+making the model carry its entire history at once:
 
 - By default there is no automatic reset; compaction keeps the active context
   bounded while preserving the rolling session. Daily and idle resets are
   opt-in (see [Session management](/concepts/session)). On `/new` and `/reset`,
   the tail of the ending conversation is saved to daily memory notes, and the
-  next session re-primes recent notes.
+  next session re-primes recent notes. Reset assigns a new live session id but
+  keeps the previous SQLite transcript searchable under the same main-session
+  key.
 - When the conversation approaches the context window, compaction summarizes
   and continues in place — the transcript history stays in the session store.
-- The per-agent session store keeps archived transcripts until a disk budget
-  (default 10 GB) evicts the oldest ones.
+- Session lists show the current live conversation, not every historical
+  session id behind it.
+- When the per-agent store's physical database, WAL, and session artifacts
+  exceed the disk budget (default 10 GB), OpenClaw extracts the oldest
+  unreferenced history to a verified compressed archive before removing its
+  database rows. Live, routed, and in-flight sessions are never budget victims.
 
 ## When you want isolation instead
 
@@ -94,6 +103,12 @@ defaults off. `openclaw security audit` recommends isolation when it detects
 multiple DM senders. The full scope matrix, identity linking, and per-route
 overrides are covered in [Session management](/concepts/session) and
 [Channel routing](/channels/channel-routing).
+
+Groups and rooms use separate sessions by default. To make selected trusted
+team rooms part of the rolling main conversation, set
+`bindings[].session.groupScope: "main"` on their route bindings. This changes
+the session key and shared context; mention gating and reply routing still use
+the originating room. See [Session management](/concepts/session#group-and-room-routing).
 
 ## Related
 

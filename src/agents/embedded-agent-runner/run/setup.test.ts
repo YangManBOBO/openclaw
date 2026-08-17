@@ -6,6 +6,7 @@ import type { ModelDefinitionConfig } from "../../../config/types.models.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { ProviderRuntimeModel } from "../../../plugins/provider-runtime-model.types.js";
 import { AGENT_HARNESS_SESSION_ID_LOCKED_MESSAGE } from "../../../sessions/agent-harness-session-key.js";
+import { resolveEmbeddedRunEffectiveModel } from "./model-harness.js";
 import {
   buildBeforeModelResolveAttachments,
   resolveAgentHarnessRunAdmissionError,
@@ -138,7 +139,6 @@ describe("resolveHookModelSelection", () => {
     const hookRunner = {
       hasHooks: vi.fn(() => true),
       runBeforeModelResolve: vi.fn(),
-      runBeforeAgentStart: vi.fn(),
     };
 
     await expect(
@@ -153,11 +153,9 @@ describe("resolveHookModelSelection", () => {
     ).resolves.toEqual({
       provider: "foreground-provider",
       modelId: "foreground-model",
-      beforeAgentStartResult: undefined,
     });
     expect(hookRunner.hasHooks).not.toHaveBeenCalled();
     expect(hookRunner.runBeforeModelResolve).not.toHaveBeenCalled();
-    expect(hookRunner.runBeforeAgentStart).not.toHaveBeenCalled();
   });
 
   it("passes attachment metadata to before_model_resolve hooks", async () => {
@@ -168,7 +166,6 @@ describe("resolveHookModelSelection", () => {
         providerOverride: "vision-provider",
         modelOverride: "vision-model",
       })),
-      runBeforeAgentStart: vi.fn(),
     };
 
     const result = await resolveHookModelSelection({
@@ -184,7 +181,6 @@ describe("resolveHookModelSelection", () => {
       { prompt: "describe this image", attachments },
       hookContext,
     );
-    expect(hookRunner.runBeforeAgentStart).not.toHaveBeenCalled();
     expect(result.provider).toBe("vision-provider");
     expect(result.modelId).toBe("vision-model");
   });
@@ -193,7 +189,6 @@ describe("resolveHookModelSelection", () => {
     const hookRunner = {
       hasHooks: vi.fn((hookName: string) => hookName === "before_model_resolve"),
       runBeforeModelResolve: vi.fn(async () => undefined),
-      runBeforeAgentStart: vi.fn(),
     };
 
     await resolveHookModelSelection({
@@ -301,6 +296,31 @@ describe("resolveEmbeddedRuntimeModelPolicy", () => {
       tokens: 272_000,
     });
     expect(result.effectiveModel.contextWindow).toBe(272_000);
+  });
+
+  it("preserves the effective budget and adds an authored cap for plugin transports (#124702)", () => {
+    const resolve = (models: ModelDefinitionConfig[]) =>
+      resolveEmbeddedRunEffectiveModel({
+        runParams: {
+          config: {
+            models: { providers: { openai: { baseUrl: "https://api.openai.com/v1", models } } },
+          },
+        } as never,
+        provider: "openai",
+        modelConfigProvider: "openai",
+        modelId: "gpt-5.5",
+        agentHarnessId: "claude-cli",
+        runtimeModel: createRuntimeModel(),
+        nativeModelOwned: false,
+      });
+
+    const capped = resolve([createConfiguredModel({ contextTokens: 32_000 })]);
+    expect(capped.contextTokenBudget).toBe(32_000);
+    expect(capped.authoredContextTokenCap).toBe(32_000);
+
+    const discovered = resolve([]);
+    expect(discovered.contextTokenBudget).toBe(272_000);
+    expect(discovered).not.toHaveProperty("authoredContextTokenCap");
   });
 });
 

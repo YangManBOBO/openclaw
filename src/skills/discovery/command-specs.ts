@@ -9,13 +9,10 @@ import { createDedupeCache } from "../../infra/dedupe.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { loadEnabledClaudeBundleCommands } from "../../plugins/bundle-commands.js";
 import { resolveSkillTelemetrySource } from "../loading/source.js";
-import {
-  filterWorkspaceSkillEntriesWithOptions,
-  loadVisibleWorkspaceSkillEntries,
-} from "../loading/workspace.js";
+import { filterWorkspaceSkills, loadVisibleSkills } from "../loading/workspace-skill-loader.js";
 import type { SkillEligibilityContext, SkillCommandSpec, SkillEntry } from "../types.js";
 import { resolveEffectiveAgentSkillFilter } from "./agent-filter.js";
-import { filterUserInvocableSkillEntries } from "./skill-index.js";
+import { filterUserInvocableSkillEntries, isSkillPromptVisible } from "./skill-index.js";
 
 const skillsLogger = createSubsystemLogger("skills");
 const skillCommandDebugOnce = createDedupeCache({ ttlMs: 0, maxSize: 1024 });
@@ -82,19 +79,21 @@ export function buildWorkspaceSkillCommandSpecs(
     entries?: SkillEntry[];
     agentId?: string;
     skillFilter?: string[];
+    includeAllowlistHidden?: boolean;
     eligibility?: SkillEligibilityContext;
     reservedNames?: Set<string>;
   },
 ): SkillCommandSpec[] {
-  const effectiveSkillFilter =
-    opts?.skillFilter ?? resolveEffectiveAgentSkillFilter(opts?.config, opts?.agentId);
+  const effectiveSkillFilter = opts?.includeAllowlistHidden
+    ? undefined
+    : (opts?.skillFilter ?? resolveEffectiveAgentSkillFilter(opts?.config, opts?.agentId));
   const eligible = opts?.entries
-    ? filterWorkspaceSkillEntriesWithOptions(opts.entries, {
+    ? filterWorkspaceSkills(opts.entries, {
         config: opts?.config,
         skillFilter: effectiveSkillFilter,
         eligibility: opts?.eligibility,
       })
-    : loadVisibleWorkspaceSkillEntries(workspaceDir, {
+    : loadVisibleSkills(workspaceDir, {
         config: opts?.config,
         managedSkillsDir: opts?.managedSkillsDir,
         bundledSkillsDir: opts?.bundledSkillsDir,
@@ -173,9 +172,11 @@ export function buildWorkspaceSkillCommandSpecs(
 
     specs.push({
       name: unique,
+      displayName: entry.skill.displayName ?? rawName,
       skillFile: canonicalizePath(entry.skill.filePath),
       skillName: rawName,
       description,
+      modelVisible: isSkillPromptVisible(entry),
       skillSource: resolveSkillTelemetrySource(entry.skill),
       ...(dispatch ? { dispatch } : {}),
     });
@@ -207,6 +208,7 @@ export function buildWorkspaceSkillCommandSpecs(
       name: unique,
       skillName: entry.rawName,
       description: entry.description,
+      modelVisible: false,
       promptTemplate: entry.promptTemplate,
       sourceFilePath: entry.sourceFilePath,
     });

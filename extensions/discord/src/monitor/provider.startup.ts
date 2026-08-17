@@ -8,8 +8,8 @@ import type { DiscordCommandDeployHashStore } from "../command-deploy-store.js";
 import {
   Client,
   ReadyListener,
-  type BaseCommand,
   type BaseMessageInteractiveComponent,
+  type DiscordCommand,
   type Modal,
   type Plugin,
 } from "../internal/discord.js";
@@ -35,6 +35,7 @@ import {
   DiscordPresenceReadyListener,
   DiscordReactionListener,
   DiscordReactionRemoveListener,
+  DiscordThreadDeleteListener,
   DiscordThreadUpdateListener,
   registerDiscordListener,
 } from "./listeners.js";
@@ -92,16 +93,11 @@ export async function createDiscordMonitorClient(params: {
   applicationId: string;
   token: string;
   restFetch?: typeof fetch;
-  commands: BaseCommand[];
+  commands: DiscordCommand[];
   components: BaseMessageInteractiveComponent[];
   modals: Modal[];
   voiceEnabled: boolean;
-  discordConfig: Parameters<typeof resolveDiscordPresenceUpdate>[0] & {
-    eventQueue?: Pick<
-      DiscordEventQueueOptions,
-      "listenerTimeout" | "maxQueueSize" | "maxConcurrency"
-    >;
-  };
+  discordConfig: Parameters<typeof resolveDiscordPresenceUpdate>[0];
   runtime: RuntimeEnv;
   commandDeployHashStore?: DiscordCommandDeployHashStore;
   createClient: CreateClientFn;
@@ -128,7 +124,6 @@ export async function createDiscordMonitorClient(params: {
   const eventQueueOpts = {
     listenerTimeout: 120_000,
     slowListenerThreshold: 30_000,
-    ...params.discordConfig.eventQueue,
   } satisfies DiscordEventQueueOptions;
   const readyListener = createDiscordStatusReadyListener({
     discordConfig: params.discordConfig,
@@ -291,7 +286,11 @@ export function registerDiscordMonitorListeners(params: {
   }
   registerDiscordListener(
     params.client.listeners,
-    new DiscordThreadUpdateListener(params.cfg, params.accountId, params.logger),
+    new DiscordThreadUpdateListener(params.cfg, params.logger),
+  );
+  registerDiscordListener(
+    params.client.listeners,
+    new DiscordThreadDeleteListener(params.cfg, params.accountId, params.logger),
   );
 
   if (params.discordConfig.intents?.presence) {

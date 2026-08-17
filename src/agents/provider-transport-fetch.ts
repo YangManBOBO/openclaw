@@ -4,6 +4,7 @@
  * Applies request timeouts, proxy/TLS overrides, SSRF policy, local-service leases, retry hints, and SSE normalization.
  */
 import { parseRetryAfterHttpDateMs } from "@openclaw/ai/internal/retry-after";
+import { emitModelTransportDebug, formatModelTransportDebugUrl } from "@openclaw/ai/transports";
 import {
   isCloudMetadataIpAddress,
   isLinkLocalIpAddress,
@@ -36,8 +37,6 @@ import {
   SECRET_SENTINEL_PATTERN,
   swapSecretSentinelsInText,
 } from "../secrets/sentinel.js";
-import { emitModelTransportDebug } from "./model-transport-debug.js";
-import { formatModelTransportDebugUrl } from "./model-transport-url.js";
 import { ProviderHttpError, readResponseTextLimited } from "./provider-http-errors.js";
 import {
   ensureModelProviderLocalService,
@@ -45,10 +44,12 @@ import {
 } from "./provider-local-service.js";
 import {
   buildProviderRequestDispatcherPolicy,
+  getModelProviderMetadataOwners,
   getModelProviderRequestTransport,
   mergeModelProviderRequestOverrides,
   resolveProviderRequestPolicyConfig,
 } from "./provider-request-config.js";
+import { getProviderTransportDispatcherPool } from "./provider-transport-dispatcher-pool.js";
 
 const DEFAULT_MAX_SDK_RETRY_WAIT_SECONDS = 60;
 const OPENAI_SDK_STREAM_CONTENT_SNIFF_BYTES = 2 * 1024;
@@ -433,10 +434,10 @@ async function normalizeOpenAISdkStreamContentType(params: {
   });
 }
 
-async function requestBodyHasStreamTrue(
+function requestBodyHasStreamTrue(
   request: Request | undefined,
   init: RequestInit | undefined,
-): Promise<boolean> {
+): boolean {
   const method = request?.method ?? init?.method;
   if (method && method.toUpperCase() !== "POST") {
     return false;
@@ -461,7 +462,7 @@ async function requestBodyHasStreamTrue(
   }
 }
 
-export function parseRetryAfterSeconds(headers: Headers): number | undefined {
+function parseRetryAfterSeconds(headers: Headers): number | undefined {
   const retryAfterMs = headers.get("retry-after-ms");
   if (retryAfterMs) {
     const trimmedRetryAfterMs = retryAfterMs.trim();
@@ -590,10 +591,12 @@ function resolveModelRequestPolicy(model: Model) {
         }
       : undefined,
   });
+  const providerMetadataOwners = getModelProviderMetadataOwners(model);
   return resolveProviderRequestPolicyConfig({
     provider: model.provider,
     api: model.api,
     baseUrl: model.baseUrl,
+    ...(providerMetadataOwners ? { providerMetadataOwners } : {}),
     capability: "llm",
     transport: "stream",
     request,
@@ -846,7 +849,6 @@ export function buildGuardedModelFetch(
     const baseInit =
       requestInit ??
       (swappedEgress.headers && init ? { ...init, headers: swappedEgress.headers } : init);
-    const synthesizeJsonAsSse = await requestBodyHasStreamTrue(request, baseInit);
     const baseSignal = baseInit?.signal ?? undefined;
     const localServiceSignal = buildModelRequestSignal(baseSignal, requestTimeoutMs);
     const guardedFetchOptions = {
@@ -860,6 +862,7 @@ export function buildGuardedModelFetch(
         },
       },
       dispatcherPolicy,
+      dispatcherPool: getProviderTransportDispatcherPool(),
       timeoutMs: requestTimeoutMs,
       ...(baseSignal ? { signal: baseSignal } : {}),
       // Provider transport intentionally keeps the secure default and never
@@ -902,6 +905,7 @@ export function buildGuardedModelFetch(
       log,
       `[model-fetch] response provider=${model.provider} api=${model.api} model=${model.id} ` +
         `status=${response.status} elapsedMs=${Date.now() - fetchStartedAt} ` +
+        `dispatcher=${result.dispatcherReused ? "reused" : "new"} ` +
         `contentType=${response.headers.get("content-type") ?? ""}`,
     );
     if (shouldBypassLongSdkRetry(response)) {
@@ -913,7 +917,11 @@ export function buildGuardedModelFetch(
         headers,
       });
     }
-    if (synthesizeJsonAsSse && options?.sanitizeSse !== false) {
+    const synthesizeJsonAsSse =
+      options?.sanitizeSse !== false &&
+      !/\btext\/event-stream\b/i.test(response.headers.get("content-type") ?? "") &&
+      requestBodyHasStreamTrue(request, baseInit);
+    if (synthesizeJsonAsSse) {
       response = await normalizeOpenAISdkStreamContentType({
         response,
         model,

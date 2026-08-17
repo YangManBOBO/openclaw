@@ -184,6 +184,8 @@ Behavior notes for local/proxied `/v1` backends:
 - Native-OpenAI-only request shaping does not apply: no `service_tier`, no Responses `store`, no OpenAI reasoning-compat payload shaping, no prompt-cache hints.
 - Hidden OpenClaw attribution headers (`originator`, `version`, `User-Agent`) are not injected on custom proxy URLs.
 
+Compat declarations are only for the custom endpoint described by this provider row. Catalog-known routes use provider-owned capabilities instead; see the [custom-provider capability guide](/gateway/config-tools#custom-provider-capability-declarations).
+
 Compat overrides for stricter OpenAI-compatible backends:
 
 - **String-only content**: some servers accept only string `messages[].content`, not structured content-part arrays. Set `models.providers.<provider>.models[].compat.requiresStringContent: true`.
@@ -274,7 +276,7 @@ If the model loads cleanly but full agent turns misbehave, work top-down: confir
 - **Gateway can't reach the proxy?** `curl http://127.0.0.1:1234/v1/models`.
 - **LM Studio model unloaded?** Reload; cold start is a common "hanging" cause.
 - **Local server says `terminated`, `ECONNRESET`, or closes the stream mid-turn?** OpenClaw records a low-cardinality `model.call.error.failureKind` plus the OpenClaw process RSS/heap snapshot in diagnostics. For LM Studio/Ollama memory pressure, match that timestamp against the server log or a macOS crash/jetsam log to confirm whether the model server was killed.
-- **Context errors?** OpenClaw derives context-window preflight thresholds from the detected model window (or the capped window when `agents.defaults.contextTokens` lowers it), warning below 20% with an **8k** floor and hard-blocking below 10% with a **4k** floor (capped to the effective context window so oversized model metadata can't reject a valid user cap). Lower `contextWindow` or raise the server/model context limit.
+- **Context errors?** OpenClaw derives context-window preflight thresholds from the detected model window or the per-model `models.providers.<provider>.models[].contextTokens` cap, warning below 20% with an **8k** floor and hard-blocking below 10% with a **4k** floor. Lower that model entry's `contextTokens` or raise the server/model context limit.
 - **`messages[].content ... expected a string`?** Add `compat.requiresStringContent: true` on that model entry.
 - **`validation.keys`, or "message entries only allow `role` and `content`"?** Add `compat.strictMessageKeys: true` on that model entry.
 - **Direct `/v1/chat/completions` calls work, but `openclaw infer model run --local` fails on Gemma or another local model?** Check the provider URL, model ref, auth marker, and server logs first - `model run` skips agent tools entirely. If `model run` succeeds but larger agent turns fail, reduce the tool surface with `localModelLean` or `compat.supportsTools: false`.

@@ -2,17 +2,21 @@
  * Session-owned browser tabs. Host-local durable ownership is canonical in
  * plugin SQLite; all other tabs remain process-local.
  */
-import { randomUUID } from "node:crypto";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getRuntimeConfig } from "../config/config.js";
 import { resolveCdpControlPolicy } from "./cdp-reachability-policy.js";
 import { closeTrackedCdpTarget, type CloseTrackedCdpTargetResult } from "./cdp.helpers.js";
 import { browserCloseTabByRawTargetId } from "./client.js";
 import type { BrowserTabOwnership } from "./client.types.js";
-import { resolveBrowserConfig, resolveProfile } from "./config.js";
+import { resolveBrowserConfig, resolveProfile, type ResolvedBrowserConfig } from "./config.js";
+import { BROWSER_TAB_UNREACHABLE_RETIRE_MS } from "./constants.js";
+import {
+  type CleanupKind,
+  claimCleanup,
+  deleteClaimedTab,
+  isIgnorableTabCloseError,
+  ownsCleanupAttempt,
+} from "./session-tab-cleanup-claim.js";
 import {
   clearDurableTabAliases,
   clearVolatileTabAliases,
@@ -36,6 +40,7 @@ import {
   rememberColdNativeActivity,
   type SessionTabInteractionIdentity as InteractionIdentity,
   type VolatileSessionTab as VolatileTab,
+  volatileTabCleanupByTarget,
   volatileTabsBySession,
 } from "./session-tab-process-state.js";
 import {
@@ -74,6 +79,9 @@ type DurableTab = DurableRecord & {
 
 type TrackedTab = VolatileTab | DurableTab;
 type DurableOwnership = Extract<BrowserTabOwnership, { status: "durable" }>;
+type DurableCleanupResult =
+  | CloseTrackedCdpTargetResult
+  | { status: "unavailable"; reason: "extension-relay-unavailable" };
 type CloseTab = (tab: {
   targetId: string;
   nativeTargetId?: string;
@@ -86,10 +94,9 @@ type CloseParams = {
     tab: DurableTab,
     options: { shouldClose: () => boolean },
   ) => Promise<CloseTrackedCdpTargetResult>;
+  getResolvedBrowserConfig?: () => ResolvedBrowserConfig | null;
   onWarn?: (message: string) => void;
 };
-
-type CleanupKind = "lifecycle" | "sweep";
 
 function normalizeSessionKey(value: string): string {
   return normalizeOptionalLowercaseString(value) ?? "";
@@ -471,12 +478,19 @@ export function untrackSessionBrowserTab(params: SessionTabParams): void {
 async function closeCurrentDurableTab(
   tab: DurableTab,
   shouldClose: () => boolean,
-): Promise<CloseTrackedCdpTargetResult> {
-  const cfg = getRuntimeConfig();
-  const resolved = resolveBrowserConfig(cfg.browser, cfg);
+  getResolvedBrowserConfig?: () => ResolvedBrowserConfig | null,
+): Promise<DurableCleanupResult> {
+  let resolved = getResolvedBrowserConfig?.();
+  if (!resolved) {
+    const cfg = getRuntimeConfig();
+    resolved = resolveBrowserConfig(cfg.browser, cfg);
+  }
   const profile = resolveProfile(resolved, tab.profile);
   if (!profile?.cdpUrl) {
     return { status: "ownership-mismatch" };
+  }
+  if (profile.driver === "extension" && !resolved.extensionRelayInternalTokens[profile.name]) {
+    return { status: "unavailable", reason: "extension-relay-unavailable" };
   }
   const cdpControlPolicy = resolveCdpControlPolicy(profile, resolved.ssrfPolicy);
   return await closeTrackedCdpTarget({
@@ -491,74 +505,6 @@ async function closeCurrentDurableTab(
   });
 }
 
-function isIgnorableTabCloseError(error: unknown): boolean {
-  const message = normalizeLowercaseStringOrEmpty(String(error));
-  return (
-    message.includes("tab not found") ||
-    message.includes("target closed") ||
-    message.includes("target not found") ||
-    message.includes("no such target") ||
-    message.includes("no target with given id found")
-  );
-}
-
-function claimCleanup(tab: DurableTab, now: number, kind: CleanupKind): DurableTab | undefined {
-  const cleanupAttemptToken = randomUUID();
-  // Lifecycle intent survives periodic retries; a touch may revoke only an
-  // idle/cap sweep claim, never cleanup for a session that already ended.
-  const cleanupKind = kind === "lifecycle" ? "lifecycle" : (tab.cleanupKind ?? kind);
-  const claimed = updateBrowserSessionTab(tab.storageKey, (current) => {
-    const record = parseBrowserSessionTabRecord(current);
-    if (!record || !sameBrowserSessionTabRecord(record, tab)) {
-      return undefined;
-    }
-    return {
-      ...record,
-      cleanupRequestedAt: now,
-      cleanupAttemptToken,
-      cleanupKind,
-    };
-  });
-  return claimed
-    ? { ...tab, cleanupRequestedAt: now, cleanupAttemptToken, cleanupKind }
-    : undefined;
-}
-
-function matchesCleanupAttempt(
-  current: BrowserSessionTabRecord | undefined,
-  tab: DurableTab,
-): current is BrowserSessionTabRecord {
-  return Boolean(
-    current &&
-    current.cleanupAttemptToken === tab.cleanupAttemptToken &&
-    current.cleanupRequestedAt === tab.cleanupRequestedAt &&
-    current.cleanupKind === tab.cleanupKind &&
-    // Lifecycle activity may advance lastUsedAt without revoking mandatory
-    // cleanup. Every other field, especially the generation, must still match.
-    sameBrowserSessionTabRecord({ ...current, lastUsedAt: tab.lastUsedAt }, tab),
-  );
-}
-
-function ownsCleanupAttempt(tab: DurableTab): boolean {
-  const current = parseBrowserSessionTabRecord(getBrowserSessionTabStore().lookup(tab.storageKey));
-  return matchesCleanupAttempt(current, tab);
-}
-
-function deleteClaimedTab(tab: DurableTab, onWarn?: (message: string) => void): void {
-  try {
-    const deleted = deleteBrowserSessionTabIf(tab.storageKey, (current) => {
-      const record = parseBrowserSessionTabRecord(current);
-      return matchesCleanupAttempt(record, tab);
-    });
-    if (deleted) {
-      clearDurableTabAliases(tab.storageKey);
-      activeDurableStorageKeys().delete(tab.storageKey);
-    }
-  } catch (error) {
-    onWarn?.(`failed to delete tracked browser tab ${tab.nativeTargetId}: ${String(error)}`);
-  }
-}
-
 async function performDurableCleanup(
   candidate: DurableTab,
   params: CloseParams,
@@ -570,7 +516,7 @@ async function performDurableCleanup(
     return 0;
   }
   const shouldClose = () => ownsCleanupAttempt(tab);
-  let outcome: CloseTrackedCdpTargetResult;
+  let outcome: DurableCleanupResult;
   try {
     if (params.closeDurableTab) {
       outcome = await params.closeDurableTab(tab, { shouldClose });
@@ -585,7 +531,7 @@ async function performDurableCleanup(
       });
       outcome = { status: "closed" };
     } else {
-      outcome = await closeCurrentDurableTab(tab, shouldClose);
+      outcome = await closeCurrentDurableTab(tab, shouldClose, params.getResolvedBrowserConfig);
     }
   } catch (error) {
     if (isIgnorableTabCloseError(error)) {
@@ -599,6 +545,23 @@ async function performDurableCleanup(
     return 0;
   }
   if (outcome.status === "unavailable") {
+    if (outcome.reason === "extension-relay-unavailable") {
+      params.onWarn?.(
+        `deferred tracked browser tab ${tab.nativeTargetId}: extension relay runtime unavailable`,
+      );
+      return 0;
+    }
+    // A browser that never comes back leaves its rows unreachable forever: the
+    // sweep re-claims them, fails ownership lookup, and defers again. Without an
+    // age bound the namespace fills to its reject-new cap and every later
+    // `browser open` opens a tab, closes it again, and throws.
+    if (now - tab.lastUsedAt >= BROWSER_TAB_UNREACHABLE_RETIRE_MS) {
+      params.onWarn?.(
+        `retired unreachable tracked browser tab ${tab.nativeTargetId}: ${outcome.reason}`,
+      );
+      deleteClaimedTab(tab, params.onWarn);
+      return 0;
+    }
     params.onWarn?.(`deferred tracked browser tab ${tab.nativeTargetId}: ${outcome.reason}`);
     return 0;
   }
@@ -657,28 +620,48 @@ async function performVolatileCleanup(
   if (cleanupKind === "sweep" && !sameVolatileTab(tab, candidate)) {
     return 0;
   }
-  try {
-    if (params.closeTab) {
-      await params.closeTab({
-        targetId: tab.targetId,
-        ...(tab.baseUrl ? { baseUrl: tab.baseUrl } : {}),
-        ...(tab.profile ? { profile: tab.profile } : {}),
-      });
-    } else {
-      await browserCloseTabByRawTargetId(tab.baseUrl, tab.targetId, {
-        profile: tab.profile,
-      });
-    }
-  } catch (error) {
-    if (isIgnorableTabCloseError(error)) {
-      deleteVolatileTarget(tab);
-      return 0;
-    }
-    params.onWarn?.(`failed to close tracked browser tab ${tab.targetId}: ${String(error)}`);
+  const inFlight = volatileTabCleanupByTarget();
+  const targetKey = volatileId(tab);
+  const existing = inFlight.get(targetKey);
+  if (existing) {
+    await existing;
     return 0;
   }
-  deleteVolatileTarget(tab);
-  return 1;
+
+  // Promise callbacks start in a microtask, so ownership is published before
+  // the close callback can issue the irreversible provider operation.
+  const cleanup = Promise.resolve().then(async () => {
+    try {
+      if (params.closeTab) {
+        await params.closeTab({
+          targetId: tab.targetId,
+          ...(tab.baseUrl ? { baseUrl: tab.baseUrl } : {}),
+          ...(tab.profile ? { profile: tab.profile } : {}),
+        });
+      } else {
+        await browserCloseTabByRawTargetId(tab.baseUrl, tab.targetId, {
+          profile: tab.profile,
+        });
+      }
+    } catch (error) {
+      if (isIgnorableTabCloseError(error)) {
+        deleteVolatileTarget(tab);
+        return 0;
+      }
+      params.onWarn?.(`failed to close tracked browser tab ${tab.targetId}: ${String(error)}`);
+      return 0;
+    }
+    deleteVolatileTarget(tab);
+    return 1;
+  });
+  inFlight.set(targetKey, cleanup);
+  try {
+    return await cleanup;
+  } finally {
+    if (inFlight.get(targetKey) === cleanup) {
+      inFlight.delete(targetKey);
+    }
+  }
 }
 
 async function closeTrackedTabs(
@@ -710,7 +693,7 @@ function volatileTabsForSessions(sessionKeys: Set<string>): VolatileTab[] {
 
 /** Closes and untracks tabs for the supplied session keys. */
 export async function closeTrackedBrowserTabsForSessions(
-  params: CloseParams & { sessionKeys: Array<string | undefined> },
+  params: CloseParams & { sessionKeys: Array<string | undefined>; now?: number },
 ): Promise<number> {
   const sessionKeys = normalizeSessionKeys(params.sessionKeys);
   if (sessionKeys.size === 0) {

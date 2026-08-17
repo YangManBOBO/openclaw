@@ -2,6 +2,12 @@
 import AppKit
 import SwiftUI
 
+extension ChatSessionSidebarModel.Node {
+    fileprivate var outlineChildren: [Self]? {
+        self.children.isEmpty ? nil : self.children
+    }
+}
+
 @MainActor
 struct ChatSessionSidebar: View {
     @Bindable var viewModel: OpenClawChatViewModel
@@ -25,6 +31,11 @@ struct ChatSessionSidebar: View {
             groups: self.groups,
             query: self.query)
         List(selection: self.selectionBinding) {
+            Color.clear
+                .frame(height: 8)
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
+                .accessibilityHidden(true)
             ForEach(sections) { section in
                 if section.id.hasPrefix("group:"), let title = section.title {
                     Section {
@@ -222,7 +233,9 @@ struct ChatSessionSidebar: View {
         let isCurrentSession = self.viewModel.matchesCurrentSessionKey(
             incoming: node.session.key,
             current: self.viewModel.sessionKey)
-        if node.hasUnreadDescendant || (node.session.unread == true && !isCurrentSession) {
+        if node.children.contains(where: \.badges.hasUnread) ||
+            (node.session.unread == true && !isCurrentSession)
+        {
             Circle()
                 .fill(.tint)
                 .frame(width: 7, height: 7)
@@ -252,9 +265,17 @@ struct ChatSessionSidebar: View {
                 systemImage: session.pinned == true ? "pin.slash" : "pin")
         }
         Button {
-            Task { await self.viewModel.forkSession(key: session.key) }
+            Task {
+                await self.viewModel.forkSession(
+                    key: session.key,
+                    fromLastCompleted: session.hasActiveRun == true)
+            }
         } label: {
-            self.actionLabel(String(localized: "Fork"), systemImage: "arrow.triangle.branch")
+            self.actionLabel(
+                session.hasActiveRun == true
+                    ? String(localized: "Fork from last completed message")
+                    : String(localized: "Fork"),
+                systemImage: "arrow.triangle.branch")
         }
         Button {
             self.viewModel.setSessionUnread(key: session.key, unread: session.unread != true)
@@ -263,12 +284,12 @@ struct ChatSessionSidebar: View {
                 session.unread == true ? String(localized: "Mark Read") : String(localized: "Mark Unread"),
                 systemImage: session.unread == true ? "envelope.open" : "envelope.badge")
         }
-        if session.isArchived || ChatSessionSidebarModel.canArchiveSession(
+        if ChatSessionSidebarModel.canArchiveSession(
             session,
             mainSessionKey: self.viewModel.resolvedMainSessionKey)
         {
             Button {
-                self.viewModel.setSessionArchived(key: session.key, archived: !session.isArchived)
+                self.viewModel.setSessionArchived(session, archived: !session.isArchived)
             } label: {
                 self.actionLabel(
                     session.isArchived ? String(localized: "Restore") : String(localized: "Archive"),
@@ -322,7 +343,9 @@ struct ChatSessionSidebar: View {
             let date = Date(timeIntervalSince1970: updatedAt / 1000)
             parts.append(date.formatted(.relative(presentation: .named)))
         }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        return ChatSessionSidebarModel.subtitle(
+            for: session,
+            workSubtitle: parts.isEmpty ? nil : parts.joined(separator: " · "))
     }
 
     private var connectionFooter: some View {

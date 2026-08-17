@@ -19,17 +19,26 @@ import type { McpCatalogTool, SessionMcpRuntime } from "../agents/agent-bundle-m
 import {
   acquireMcpAppViewRequest,
   getMcpAppViewLease,
+  getMcpAppViewLeaseForSession,
   type McpAppViewLease,
 } from "../agents/mcp-ui-resource.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { logWarn } from "../logger.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import { restoreMcpAppView } from "./mcp-app-reconstruction.js";
 
 export type McpAppActiveView = {
   runtime: SessionMcpRuntime;
   view: McpAppViewLease;
 };
+
+export class McpAppViewExpiredError extends Error {
+  constructor() {
+    super("MCP App view expired or is not authorized for this session");
+    this.name = "McpAppViewExpiredError";
+  }
+}
 
 export type McpAppOperation =
   | Pick<CallToolRequest, "method" | "params">
@@ -60,14 +69,38 @@ function isAllowedByView(view: McpAppViewLease, toolName: string): boolean {
   return view.allowedAppToolNames === undefined || view.allowedAppToolNames.has(toolName);
 }
 
+export async function requireMcpAppInteraction(view: McpAppViewLease): Promise<void> {
+  if (view.readOnly === true || view.allowedAppToolNames === undefined) {
+    throw new Error("MCP App view is read-only");
+  }
+  if (view.authorizeAppInteraction && !(await view.authorizeAppInteraction())) {
+    throw new Error("MCP App widget grant is no longer active");
+  }
+}
+
+export async function resolveMcpAppAllowedToolNames(active: McpAppActiveView): Promise<string[]> {
+  if (active.view.readOnly === true || active.view.allowedAppToolNames === undefined) {
+    return [];
+  }
+  const catalog = await active.runtime.getCatalog();
+  return catalog.tools
+    .filter(
+      (tool) =>
+        tool.serverName === active.view.serverName &&
+        isAppCallableTool(tool) &&
+        isAllowedByView(active.view, tool.toolName),
+    )
+    .map((tool) => tool.toolName)
+    .filter((toolName, index, all) => all.indexOf(toolName) === index)
+    .toSorted();
+}
+
 async function requireCallableTool(
   runtime: SessionMcpRuntime,
   view: McpAppViewLease,
   toolName: string,
 ): Promise<void> {
-  if (view.readOnly === true) {
-    throw new Error("MCP App view is read-only");
-  }
+  await requireMcpAppInteraction(view);
   const catalog = await runtime.getCatalog();
   const tool = catalog.tools.find(
     (entry) => entry.serverName === view.serverName && entry.toolName === toolName,
@@ -79,14 +112,29 @@ async function requireCallableTool(
 
 export async function resolveMcpAppActiveView(params: {
   sessionKey: string;
+  agentId?: string;
   viewId: string;
   cfg?: OpenClawConfig;
 }): Promise<McpAppActiveView> {
-  const existingRuntime = peekSessionMcpRuntime({ sessionKey: params.sessionKey });
-  if (
-    (existingRuntime && existingRuntime.mcpAppsEnabled !== true) ||
-    (params.cfg && params.cfg.mcp?.apps?.enabled !== true)
-  ) {
+  if (params.cfg && params.cfg.mcp?.apps?.enabled !== true) {
+    throw new Error("MCP App runtime is unavailable");
+  }
+  const liveView = params.agentId
+    ? getMcpAppViewLeaseForSession(params.viewId, params.sessionKey, params.agentId)
+    : undefined;
+  if (liveView) {
+    if (liveView.runtime.mcpAppsEnabled !== true) {
+      throw new Error("MCP App runtime is unavailable");
+    }
+    return { runtime: liveView.runtime, view: liveView };
+  }
+  // An unscoped runtime key cannot prove its owning agent. Prefer transcript
+  // restoration with the prepared owner instead of adopting a sibling runtime.
+  const existingRuntime =
+    params.agentId && !parseAgentSessionKey(params.sessionKey)
+      ? undefined
+      : peekSessionMcpRuntime({ sessionKey: params.sessionKey });
+  if (existingRuntime && existingRuntime.mcpAppsEnabled !== true) {
     throw new Error("MCP App runtime is unavailable");
   }
   const existingView = existingRuntime
@@ -98,12 +146,13 @@ export async function resolveMcpAppActiveView(params: {
       : params.cfg
         ? await restoreMcpAppView({
             cfg: params.cfg,
+            agentId: params.agentId,
             sessionKey: params.sessionKey,
             viewId: params.viewId,
           })
         : undefined;
   if (!restored) {
-    throw new Error("MCP App view expired or is not authorized for this session");
+    throw new McpAppViewExpiredError();
   }
   return restored;
 }
@@ -146,6 +195,7 @@ export async function executeMcpAppOperation(
       });
     case "tools/list":
       return await withMcpAppActiveView(active, "read", async () => {
+        await requireMcpAppInteraction(view);
         if (!runtime.listTools) {
           throw new Error("MCP tools/list is unavailable");
         }

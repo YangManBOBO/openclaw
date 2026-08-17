@@ -1,6 +1,7 @@
 // Line type declarations define plugin contracts.
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import type { MessageReceipt } from "openclaw/plugin-sdk/channel-outbound";
+import type { MediaKind } from "openclaw/plugin-sdk/media-runtime";
 
 export type LineTokenSource = "config" | "env" | "file" | "none";
 export type LineCredentialStatus = "available" | "configured_unavailable" | "missing";
@@ -71,6 +72,7 @@ export interface LineSendResult {
 }
 
 export type LineProbeResult = BaseProbeResult<string> & {
+  elapsedMs?: number;
   bot?: {
     displayName?: string;
     userId?: string;
@@ -82,6 +84,42 @@ export type LineProbeResult = BaseProbeResult<string> & {
 type LineFlexMessagePayload = {
   altText: string;
   contents: unknown;
+};
+
+export type LineRichCard =
+  | {
+      type: "media_player";
+      title: string;
+      artist?: string;
+      source?: string;
+      imageUrl?: string;
+      status?: "playing" | "paused";
+    }
+  | {
+      type: "event";
+      title: string;
+      date: string;
+      time?: string;
+      location?: string;
+      description?: string;
+    }
+  | {
+      type: "agenda";
+      title: string;
+      events: Array<{ title: string; time?: string; location?: string }>;
+    }
+  | {
+      type: "device";
+      name: string;
+      deviceType?: string;
+      status?: string;
+      controls?: Array<{ label: string; action: string }>;
+    }
+  | { type: "appletv_remote"; name?: string; status?: string };
+
+export type LineQuickReplyItem = {
+  label: string;
+  action: { type: "command"; command: string } | { type: "callback"; value: string };
 };
 
 export type LineTemplateMessagePayload =
@@ -125,7 +163,8 @@ export type LineTemplateMessagePayload =
 
 export type LineChannelData = {
   quickReplies?: string[];
-  mediaKind?: "image" | "video" | "audio";
+  quickReplyItems?: LineQuickReplyItem[];
+  mediaKind?: LineOutboundMediaKind;
   previewImageUrl?: string;
   durationMs?: number;
   trackingId?: string;
@@ -135,6 +174,9 @@ export type LineChannelData = {
     latitude: number;
     longitude: number;
   };
+  card?: LineRichCard;
   flexMessage?: LineFlexMessagePayload;
   templateMessage?: LineTemplateMessagePayload;
 };
+
+export type LineOutboundMediaKind = Extract<MediaKind, "image" | "video" | "audio">;

@@ -2,6 +2,7 @@
 # Usage: powershell -c "irm https://openclaw.ai/install.ps1 | iex"
 #        powershell -c "& ([scriptblock]::Create((irm https://openclaw.ai/install.ps1))) -Tag beta -NoOnboard -DryRun"
 
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Tag = "latest",
     [ValidateSet("npm", "git")]
@@ -9,10 +10,29 @@ param(
     [string]$GitDir,
     [switch]$NoOnboard,
     [switch]$NoGitUpdate,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Help) {
+    @"
+Usage:
+  powershell -File install.ps1 [options]
+  & ([scriptblock]::Create((irm https://openclaw.ai/install.ps1))) [options]
+
+Options:
+  -InstallMethod npm|git  Install method (default: npm)
+  -Tag <tag|version>      OpenClaw version or dist-tag (default: latest)
+  -GitDir <path>          Git checkout directory
+  -NoOnboard              Skip onboarding
+  -NoGitUpdate            Skip git pull
+  -DryRun                 Print actions only
+  -Help                   Show this help
+"@ | Write-Output
+    return
+}
 
 $script:InstallExitCode = 0
 
@@ -20,7 +40,6 @@ function Fail-Install {
     param([int]$Code = 1)
 
     $script:InstallExitCode = $Code
-    return $false
 }
 
 function Test-BooleanSuccessResult {
@@ -91,9 +110,7 @@ function Resolve-NodeOptionsWithMinOldSpace {
 }
 
 function Complete-Install {
-    param([bool]$Succeeded)
-
-    if ($Succeeded) {
+    if ($script:InstallExitCode -eq 0) {
         return
     }
 
@@ -180,20 +197,13 @@ function Initialize-InstallerTempDirectory {
     $env:TMP = $tempDirectory
 }
 
-Initialize-InstallerTempDirectory
-
-Write-Host ""
-Write-Host "  OpenClaw Installer" -ForegroundColor Cyan
-Write-Host ""
-
 # Check if running in PowerShell
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "Error: PowerShell 5+ required" -ForegroundColor Red
-    Complete-Install -Succeeded:$false
+    Fail-Install
+    Complete-Install
     return
 }
-
-Write-Host "[OK] Windows detected" -ForegroundColor Green
 
 if (-not $PSBoundParameters.ContainsKey("InstallMethod")) {
     if (-not [string]::IsNullOrWhiteSpace($env:OPENCLAW_INSTALL_METHOD)) {
@@ -225,6 +235,13 @@ if ([string]::IsNullOrWhiteSpace($GitDir)) {
     $userHome = [Environment]::GetFolderPath("UserProfile")
     $GitDir = (Join-Path $userHome "openclaw")
 }
+
+Initialize-InstallerTempDirectory
+
+Write-Host ""
+Write-Host "  OpenClaw Installer" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "[OK] Windows detected" -ForegroundColor Green
 
 # Check for Node.js
 function Test-NodeVersionSupported {
@@ -409,11 +426,11 @@ function Resolve-PortableNodeDownload {
     $requestTimeouts = Get-WebRequestTimeoutParameters -CommandName "Invoke-RestMethod" -LegacyTimeoutSec 30
     $index = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json" @requestTimeouts
     $release = $index |
-        Where-Object { $_.version -match '^v24\.' } |
+        Where-Object { $_.version -match '^v26\.' } |
         Select-Object -First 1
 
     if (-not $release -or -not $release.version) {
-        throw "Could not resolve latest Node.js 24 release metadata."
+        throw "Could not resolve latest Node.js 26 release metadata."
     }
 
     $fileKey = "win-$architecture-zip"
@@ -579,7 +596,7 @@ function Install-Node {
     Write-Host ""
     Write-Host "Error: Could not install Node.js automatically." -ForegroundColor Red
     Write-Host ""
-    Write-Host "Please install Node.js 24.15+ manually:" -ForegroundColor Yellow
+    Write-Host "Please install Node.js 26 manually:" -ForegroundColor Yellow
     Write-Host "  https://nodejs.org/en/download/" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Or install winget (App Installer) from the Microsoft Store." -ForegroundColor Gray
@@ -882,6 +899,10 @@ function Invoke-OpenClawCommand {
     }
 
     & $commandPath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "openclaw $($Arguments -join ' ') failed with exit code $exitCode."
+    }
 }
 
 function Invoke-InteractiveOpenClawCommand {
@@ -1411,14 +1432,12 @@ function Install-OpenClaw {
     $prevUpdateNotifier = $env:NPM_CONFIG_UPDATE_NOTIFIER
     $prevFund = $env:NPM_CONFIG_FUND
     $prevAudit = $env:NPM_CONFIG_AUDIT
-    $prevNodeLlamaSkipDownload = $env:NODE_LLAMA_CPP_SKIP_DOWNLOAD
     $prevBefore = $env:NPM_CONFIG_BEFORE
     $prevMinReleaseAge = $env:NPM_CONFIG_MIN_RELEASE_AGE
     $env:NPM_CONFIG_LOGLEVEL = "error"
     $env:NPM_CONFIG_UPDATE_NOTIFIER = "false"
     $env:NPM_CONFIG_FUND = "false"
     $env:NPM_CONFIG_AUDIT = "false"
-    $env:NODE_LLAMA_CPP_SKIP_DOWNLOAD = "1"
     Remove-Item Env:NPM_CONFIG_BEFORE -ErrorAction SilentlyContinue
     Remove-Item Env:NPM_CONFIG_MIN_RELEASE_AGE -ErrorAction SilentlyContinue
     try {
@@ -1450,7 +1469,6 @@ function Install-OpenClaw {
         $env:NPM_CONFIG_UPDATE_NOTIFIER = $prevUpdateNotifier
         $env:NPM_CONFIG_FUND = $prevFund
         $env:NPM_CONFIG_AUDIT = $prevAudit
-        $env:NODE_LLAMA_CPP_SKIP_DOWNLOAD = $prevNodeLlamaSkipDownload
         $env:NPM_CONFIG_BEFORE = $prevBefore
         $env:NPM_CONFIG_MIN_RELEASE_AGE = $prevMinReleaseAge
     }
@@ -1459,6 +1477,24 @@ function Install-OpenClaw {
 }
 
 # Install OpenClaw from GitHub
+function Assert-GitCheckoutHasCommit {
+    param([string]$RepoDir)
+
+    $gitDir = Join-Path $RepoDir ".git"
+    if (-not (Test-Path -LiteralPath $gitDir -PathType Container)) {
+        return
+    }
+
+    $hasHead = $false
+    try {
+        git "--git-dir=$gitDir" "--work-tree=$RepoDir" rev-parse --verify --quiet "HEAD^{commit}" 2>$null | Out-Null
+        $hasHead = ($LASTEXITCODE -eq 0)
+    } catch {}
+    if (-not $hasHead) {
+        throw "Git checkout has no commit: $RepoDir. Move or remove this incomplete checkout, then retry."
+    }
+}
+
 function Install-OpenClawFromGit {
     param(
         [string]$RepoDir,
@@ -1471,6 +1507,7 @@ function Install-OpenClawFromGit {
     $repoUrl = "https://github.com/openclaw/openclaw.git"
     Write-Host "[*] Installing OpenClaw from GitHub ($repoUrl)..." -ForegroundColor Yellow
 
+    Assert-GitCheckoutHasCommit -RepoDir $RepoDir
     if (-not (Test-Path $RepoDir)) {
         git clone $repoUrl $RepoDir
     }
@@ -1498,7 +1535,6 @@ function Install-OpenClawFromGit {
     $prevPnpmWorkspaceConcurrency = $env:PNPM_CONFIG_WORKSPACE_CONCURRENCY
     $prevPnpmVerifyDepsBeforeRun = $env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN
     $prevPnpmSideEffectsCache = $env:PNPM_CONFIG_SIDE_EFFECTS_CACHE
-    $prevNodeLlamaPostinstall = $env:NODE_LLAMA_CPP_POSTINSTALL
     $prevNodeOptions = $env:NODE_OPTIONS
     $pnpmCommand = Get-PnpmCommandPath
     if (-not $pnpmCommand) {
@@ -1509,7 +1545,6 @@ function Install-OpenClawFromGit {
     $env:PNPM_CONFIG_WORKSPACE_CONCURRENCY = "1"
     $env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = "false"
     $env:PNPM_CONFIG_SIDE_EFFECTS_CACHE = "false"
-    $env:NODE_LLAMA_CPP_POSTINSTALL = "skip"
     $pushedRepoLocation = $false
     try {
         Push-Location -LiteralPath $RepoDir
@@ -1538,7 +1573,8 @@ function Install-OpenClawFromGit {
             Write-Host "[!] pnpm install failed for the Git checkout" -ForegroundColor Red
             return $false
         }
-        if (-not (& $pnpmCommand ui:build)) {
+        & $pnpmCommand ui:build
+        if ($LASTEXITCODE -ne 0) {
             Write-Host "[!] UI build failed; continuing (CLI may still work)" -ForegroundColor Yellow
         }
         $env:NODE_OPTIONS = Resolve-NodeOptionsWithMinOldSpace -NodeOptions $prevNodeOptions -MinOldSpaceMb 8192
@@ -1556,7 +1592,6 @@ function Install-OpenClawFromGit {
         $env:PNPM_CONFIG_WORKSPACE_CONCURRENCY = $prevPnpmWorkspaceConcurrency
         $env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = $prevPnpmVerifyDepsBeforeRun
         $env:PNPM_CONFIG_SIDE_EFFECTS_CACHE = $prevPnpmSideEffectsCache
-        $env:NODE_LLAMA_CPP_POSTINSTALL = $prevNodeLlamaPostinstall
         $env:NODE_OPTIONS = $prevNodeOptions
     }
 
@@ -1588,10 +1623,10 @@ function Run-Doctor {
     Write-Host "[*] Running doctor to migrate settings..." -ForegroundColor Yellow
     try {
         Invoke-OpenClawCommand doctor --non-interactive
+        Write-Host "[OK] Migration complete" -ForegroundColor Green
     } catch {
-        # Ignore errors from doctor
+        Write-Host "[!] Migration failed; continuing. Run: openclaw doctor --non-interactive" -ForegroundColor Yellow
     }
-    Write-Host "[OK] Migration complete" -ForegroundColor Green
 }
 
 function Test-GatewayServiceLoaded {
@@ -1661,7 +1696,8 @@ function Remove-LegacySubmodule {
 function Main {
     if ($InstallMethod -ne "npm" -and $InstallMethod -ne "git") {
         Write-Host "Error: invalid -InstallMethod (use npm or git)." -ForegroundColor Red
-        return (Fail-Install -Code 2)
+        Fail-Install -Code 2
+        return
     }
 
     if ($DryRun) {
@@ -1687,7 +1723,8 @@ function Main {
     # Step 1: Node.js
     if (-not (Check-Node)) {
         if (-not (Install-Node)) {
-            return (Fail-Install)
+            Fail-Install
+            return
         }
 
         # Verify installation
@@ -1695,7 +1732,8 @@ function Main {
             Write-Host ""
             Write-Host "Error: Node.js installation may require a terminal restart" -ForegroundColor Red
             Write-Host "Please close this terminal, open a new one, and run this installer again." -ForegroundColor Yellow
-            return (Fail-Install)
+            Fail-Install
+            return
         }
     }
 
@@ -1713,7 +1751,8 @@ function Main {
         $finalGitDir = $GitDir
         $gitInstallResults = @(Install-OpenClawFromGit -RepoDir $GitDir -SkipUpdate:$NoGitUpdate)
         if (-not (Test-BooleanSuccessResult -Results $gitInstallResults)) {
-            return (Fail-Install)
+            Fail-Install
+            return
         }
     } else {
         $gitWrapper = Join-Path (Join-Path $env:USERPROFILE ".local\\bin") "openclaw.cmd"
@@ -1723,7 +1762,8 @@ function Main {
         }
         $npmInstallResults = @(Install-OpenClaw)
         if (-not (Test-BooleanSuccessResult -Results $npmInstallResults)) {
-            return (Fail-Install)
+            Fail-Install
+            return
         }
     }
 
@@ -1831,6 +1871,5 @@ function Main {
     return $true
 }
 
-$mainResults = @(Main)
-$installSucceeded = Test-BooleanSuccessResult -Results $mainResults
-Complete-Install -Succeeded:$installSucceeded
+$null = Main
+Complete-Install

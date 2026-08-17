@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
+import { isAcceptedWorkspacePublicationIndeterminateError } from "./workspace-accepted-publication.js";
+import {
+  activeWorkspaceHashContext,
+  withWorkspaceHashContext,
+  withWorkspaceHashMemo,
+} from "./workspace-hash-memo.js";
 import {
   MAX_RECONCILIATION_ENTRIES,
   type WorkerWorkspaceManifest,
@@ -39,9 +45,48 @@ export async function applyStagedWorkerWorkspace(params: {
   base: WorkerWorkspaceManifest;
   current: WorkerWorkspaceManifest;
   journal: WorkerWorkspaceReconciliationJournalAdapter;
+  publishAcceptedManifest?: (accepted: {
+    manifestRef: string;
+    manifest: WorkerWorkspaceManifest;
+    conflictPaths: string[];
+  }) => Promise<void>;
 }): Promise<WorkerWorkspaceApplyResult> {
+  return await withWorkspaceHashContext(
+    async () => await applyStagedWorkerWorkspaceWithMemo(params),
+  );
+}
+
+async function applyStagedWorkerWorkspaceWithMemo(
+  params: Parameters<typeof applyStagedWorkerWorkspace>[0],
+): Promise<WorkerWorkspaceApplyResult> {
+  const { memo: hashMemo, metrics } = activeWorkspaceHashContext()!;
   const root = await fs.realpath(params.root);
   const preserveDirectories = new Set(reconciliationDirectories(params.current.directories));
+  // Git workspaces must keep the eligibility boundary established at dispatch.
+  // Local-only ignored files are outside both manifests and must never enter the accepted state.
+  const includePaths = params.current.baseCommit
+    ? new Set([...manifestNodes(params.base).keys(), ...manifestNodes(params.current).keys()])
+    : undefined;
+  const createApplyResult = (
+    actual: Awaited<ReturnType<typeof readActualWorkspaceManifest>>,
+    conflictPaths: string[],
+  ): WorkerWorkspaceApplyResult => ({
+    ...actual,
+    conflictPaths,
+    verifyLocalStable: async () =>
+      await withWorkspaceHashMemo(
+        hashMemo,
+        async () =>
+          await assertActualWorkspaceManifest({
+            root,
+            expectedRef: actual.manifestRef,
+            baseCommit: actual.manifest.baseCommit,
+            preserveDirectories,
+            includePaths,
+          }),
+        metrics,
+      ),
+  });
   const preflight = await preflightWorkspaceApply({
     root,
     base: params.base,
@@ -53,30 +98,19 @@ export async function applyStagedWorkerWorkspace(params: {
       root,
       baseCommit: params.current.baseCommit,
       preserveDirectories,
-    });
-    const finalPreflight = await preflightWorkspaceApply({
-      root,
-      base: params.base,
-      current: params.current,
+      includePaths,
     });
     await assertActualWorkspaceManifest({
       root,
       expectedRef: actual.manifestRef,
       baseCommit: actual.manifest.baseCommit,
       preserveDirectories,
+      includePaths,
     });
+    const conflictPaths = retainedConflictPaths(preflight, preflight.applyPaths);
+    await params.publishAcceptedManifest?.({ ...actual, conflictPaths });
     params.journal.commit(actual.manifestRef);
-    return {
-      ...actual,
-      conflictPaths: retainedConflictPaths(finalPreflight, preflight.applyPaths),
-      verifyLocalStable: async () =>
-        await assertActualWorkspaceManifest({
-          root,
-          expectedRef: actual.manifestRef,
-          baseCommit: actual.manifest.baseCommit,
-          preserveDirectories,
-        }),
-    };
+    return createApplyResult(actual, conflictPaths);
   }
   const baseByPath = new Map(
     reconciliationEntries(params.base.entries).map((entry) => [entry.path, entry]),
@@ -169,6 +203,7 @@ export async function applyStagedWorkerWorkspace(params: {
       root,
       baseCommit: params.current.baseCommit,
       preserveDirectories,
+      includePaths,
     });
     const finalPreflight = await preflightWorkspaceApply({
       root,
@@ -180,20 +215,18 @@ export async function applyStagedWorkerWorkspace(params: {
       expectedRef: actual.manifestRef,
       baseCommit: actual.manifest.baseCommit,
       preserveDirectories,
+      includePaths,
     });
+    const conflictPaths = retainedConflictPaths(finalPreflight, preflight.applyPaths);
+    await params.publishAcceptedManifest?.({ ...actual, conflictPaths });
     params.journal.commit(actual.manifestRef);
-    return {
-      ...actual,
-      conflictPaths: retainedConflictPaths(finalPreflight, preflight.applyPaths),
-      verifyLocalStable: async () =>
-        await assertActualWorkspaceManifest({
-          root,
-          expectedRef: actual.manifestRef,
-          baseCommit: actual.manifest.baseCommit,
-          preserveDirectories,
-        }),
-    };
+    return createApplyResult(actual, conflictPaths);
   } catch (error) {
+    // Transport or settlement timeouts are observation evidence, never authority
+    // for an inverse operation; recovery owns restoring both sides.
+    if (isAcceptedWorkspacePublicationIndeterminateError(error)) {
+      throw error;
+    }
     try {
       await recoverWorkerWorkspaceReconciliation({ root, journal });
       params.journal.abort();

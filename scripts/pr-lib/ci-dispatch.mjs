@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import { isDirectRunUrl } from "../lib/direct-run.mjs";
-import { execPlainGh } from "../lib/plain-gh.mjs";
+import { execGhJson, execGhRead, execPlainGh, workflowRunsApiArgs } from "../lib/plain-gh.mjs";
 
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
@@ -40,29 +41,13 @@ function buildCiDispatchArgs(record) {
 }
 
 function listCiRuns(headRefOid) {
-  return JSON.parse(
-    execPlainGh(
-      [
-        "run",
-        "list",
-        "--commit",
-        headRefOid,
-        "--workflow",
-        "ci.yml",
-        "--event",
-        "workflow_dispatch",
-        "--limit",
-        "20",
-        "--json",
-        "databaseId,url,headSha,createdAt,status",
-      ],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    ),
-  );
+  return execGhJson(workflowRunsApiArgs("openclaw/openclaw", headRefOid, "workflow_dispatch", 20), {
+    stdio: ["ignore", "pipe", "pipe"],
+  }).workflow_runs;
 }
 
 function readCurrentPrHeadOid(pr) {
-  return execPlainGh(["pr", "view", String(pr), "--json", "headRefOid", "--jq", ".headRefOid"], {
+  return execGhRead(["pr", "view", String(pr), "--json", "headRefOid", "--jq", ".headRefOid"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
@@ -87,7 +72,7 @@ async function dispatchCiForPr(
   } = {},
 ) {
   requirePrRecord(record);
-  const priorRunIds = new Set(listRuns(record.headRefOid).map((run) => run.databaseId));
+  const priorRunIds = new Set(listRuns(record.headRefOid).map((run) => run.id));
   const headBeforeDispatch = readHeadOid(record.pr);
   if (headBeforeDispatch !== record.headRefOid) {
     throw new Error(
@@ -99,10 +84,10 @@ async function dispatchCiForPr(
   for (let attempt = 1; attempt <= pollAttempts; attempt += 1) {
     const run = listRuns(record.headRefOid).find(
       (candidate) =>
-        candidate.headSha === record.headRefOid &&
-        !priorRunIds.has(candidate.databaseId) &&
-        typeof candidate.url === "string" &&
-        candidate.url.length > 0,
+        candidate.head_sha === record.headRefOid &&
+        !priorRunIds.has(candidate.id) &&
+        typeof candidate.html_url === "string" &&
+        candidate.html_url.length > 0,
     );
     if (run) {
       const headAtObservation = readHeadOid(record.pr);
@@ -126,6 +111,27 @@ async function dispatchCiForPr(
   return undefined;
 }
 
+// Dispatch always targets the REMOTE head; unpushed local work silently gets
+// no CI. Warn (never block) when a same-named local branch points elsewhere,
+// so an operator who meant to test local changes pushes first. Best-effort:
+// any git failure (no repo, no branch) skips the check.
+function warnOnLocalHeadDrift(record) {
+  const probe = spawnSync(
+    "git",
+    ["rev-parse", "--verify", "--quiet", `refs/heads/${record.headRefName}`],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  if (probe.status !== 0) {
+    return;
+  }
+  const localOid = probe.stdout.trim();
+  if (SHA_PATTERN.test(localOid) && localOid !== record.headRefOid) {
+    console.error(
+      `warning: local branch ${record.headRefName} is at ${localOid}, but CI is being dispatched for the remote head ${record.headRefOid}; push first if you meant to test local changes.`,
+    );
+  }
+}
+
 async function main(argv = process.argv.slice(2)) {
   if (argv.length !== 4 || !["true", "false"].includes(argv[3])) {
     console.error("Usage: ci-dispatch.mjs <PR> <headRefName> <headRefOid> <isCrossRepository>");
@@ -138,6 +144,8 @@ async function main(argv = process.argv.slice(2)) {
     headRefOid: argv[2],
     isCrossRepository: argv[3] === "true",
   };
+  requirePrRecord(record);
+  warnOnLocalHeadDrift(record);
   const run = await dispatchCiForPr(record);
   if (run) {
     console.log(
@@ -146,7 +154,7 @@ async function main(argv = process.argv.slice(2)) {
     console.log(
       "Observed a new exact-SHA manual run after dispatch; GitHub does not expose a dispatch correlation ID, so concurrent requests cannot be distinguished.",
     );
-    console.log(`observed_run_url=${run.url}`);
+    console.log(`observed_run_url=${run.html_url}`);
   } else {
     console.log(
       `Requested CI for PR #${record.pr} at unchanged remote head ${record.headRefOid} (${record.headRefName}).`,
@@ -155,7 +163,7 @@ async function main(argv = process.argv.slice(2)) {
       "run_url=pending (GitHub accepted the dispatch, but Actions has not indexed it yet)",
     );
     console.log(
-      `inspect_with=gh run list --commit ${record.headRefOid} --workflow ci.yml --event workflow_dispatch`,
+      `inspect_with=gh api --method GET repos/openclaw/openclaw/actions/workflows/ci.yml/runs -f event=workflow_dispatch -f head_sha=${record.headRefOid} -f per_page=20`,
     );
   }
 }

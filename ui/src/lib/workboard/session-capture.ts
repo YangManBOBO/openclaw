@@ -1,21 +1,19 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { GatewaySessionRow } from "../../api/types.ts";
 import {
+  isActiveWorkboardCard,
   isFailedSessionStatus,
   normalizeString,
   replaceCard,
+  selectedWorkboardBoardParams,
   workboardCardSessionKey,
 } from "./card-state.ts";
 import { loadWorkboard } from "./loading.ts";
-import { formatError, isRecord } from "./normalization-utils.ts";
+import { formatError } from "./normalization-utils.ts";
 import { normalizeCardPayload } from "./normalization.ts";
-import {
-  getWorkboardState,
-  invalidateWorkboardLoads,
-  waitForWorkboardLifecycleWrites,
-  type WorkboardHost,
-} from "./runtime.ts";
+import { getWorkboardState, invalidateWorkboardLoads, type WorkboardHost } from "./runtime.ts";
 import type { WorkboardCard, WorkboardStatus } from "./types.ts";
 
 const SESSION_CAPTURE_HISTORY_LIMIT = 40;
@@ -104,6 +102,25 @@ function sessionCaptureStatus(session: GatewaySessionRow): WorkboardStatus {
   return "todo";
 }
 
+function findCapturedSessionCard(cards: WorkboardCard[], sessionKey: string): WorkboardCard | null {
+  let active: WorkboardCard | undefined;
+  let archived: WorkboardCard | undefined;
+  for (const card of cards) {
+    if (workboardCardSessionKey(card) !== sessionKey) {
+      continue;
+    }
+    if (isActiveWorkboardCard(card)) {
+      if (!active || card.updatedAt > active.updatedAt) {
+        active = card;
+      }
+    } else if (!archived || card.updatedAt > archived.updatedAt) {
+      archived = card;
+    }
+  }
+  // Dashboard matches the newest active card; an archived match is only a restore candidate.
+  return active ?? archived ?? null;
+}
+
 async function loadSessionCaptureHistory(params: {
   client: GatewayBrowserClient;
   sessionKey: string;
@@ -125,7 +142,7 @@ function buildSessionCaptureNotes(params: {
   recentUserText: string | null;
   lastAssistantText: string | null;
 }): string {
-  const lines = [`Thread: ${params.session.key}`];
+  const lines = [`Session: ${params.session.key}`];
   if (params.recentUserText) {
     lines.push("", `Recent user prompt: ${clampSessionCaptureText(params.recentUserText)}`);
   }
@@ -146,13 +163,12 @@ export async function captureSessionToWorkboard(params: {
     return null;
   }
   if (state.capturingSessionKeys.has(params.session.key)) {
-    return state.cards.find((card) => workboardCardSessionKey(card) === params.session.key) ?? null;
+    return findCapturedSessionCard(state.cards, params.session.key);
   }
   state.error = null;
   let captureStarted = false;
   try {
     if (!state.loaded) {
-      await waitForWorkboardLifecycleWrites(params.host);
       await loadWorkboard({
         host: params.host,
         client: params.client,
@@ -164,16 +180,12 @@ export async function captureSessionToWorkboard(params: {
       return null;
     }
     if (state.capturingSessionKeys.has(params.session.key)) {
-      return (
-        state.cards.find((card) => workboardCardSessionKey(card) === params.session.key) ?? null
-      );
+      return findCapturedSessionCard(state.cards, params.session.key);
     }
     state.capturingSessionKeys.add(params.session.key);
     captureStarted = true;
     params.requestUpdate?.();
-    const existing = state.cards.find(
-      (card) => workboardCardSessionKey(card) === params.session.key,
-    );
+    const existing = findCapturedSessionCard(state.cards, params.session.key);
     if (existing) {
       if (existing.metadata?.archivedAt) {
         invalidateWorkboardLoads(params.host);
@@ -205,6 +217,7 @@ export async function captureSessionToWorkboard(params: {
       priority: "normal",
       agentId: "",
       sessionKey: params.session.key,
+      ...selectedWorkboardBoardParams(state),
     });
     const card = normalizeCardPayload(payload);
     replaceCard(state, card);

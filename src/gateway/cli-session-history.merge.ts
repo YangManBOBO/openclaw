@@ -6,6 +6,7 @@ import {
   readStringValue,
 } from "@openclaw/normalization-core/string-coerce";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
+import { stripInlineDirectiveTagsForDisplay } from "../utils/directive-tags.js";
 
 const DEDUPE_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 
@@ -40,7 +41,9 @@ function extractComparableText(message: unknown): string | undefined {
   if (!joined) {
     return undefined;
   }
-  const visible = role === "user" ? stripInboundMetadata(joined) : joined;
+  const visible = stripInlineDirectiveTagsForDisplay(
+    role === "user" ? stripInboundMetadata(joined) : joined,
+  ).text;
   const normalized = visible.replace(/\s+/g, " ").trim();
   return normalized || undefined;
 }
@@ -87,11 +90,11 @@ function resolveImportedExternalIdentity(message: unknown): ImportedExternalIden
     : undefined;
 }
 
-function hasSameExternalIdentity(existing: unknown, imported: unknown): boolean {
+function hasSameExternalIdentity(existing: unknown, imported: unknown): boolean | undefined {
   const importedIdentity = resolveImportedExternalIdentity(imported);
   const existingIdentity = resolveImportedExternalIdentity(existing);
   if (!importedIdentity || !existingIdentity) {
-    return false;
+    return undefined;
   }
   return (
     importedIdentity.externalId === existingIdentity.externalId &&
@@ -101,8 +104,10 @@ function hasSameExternalIdentity(existing: unknown, imported: unknown): boolean 
 }
 
 function isEquivalentImportedMessage(existing: unknown, imported: unknown): boolean {
-  if (hasSameExternalIdentity(existing, imported)) {
-    return true;
+  // Text is a fallback only when either message lacks authoritative source identity.
+  const sameExternalIdentity = hasSameExternalIdentity(existing, imported);
+  if (sameExternalIdentity !== undefined) {
+    return sameExternalIdentity;
   }
 
   const existingRole = resolveComparableRole(existing);

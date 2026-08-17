@@ -10,6 +10,10 @@ vi.mock("../agents/harness/runtime-plugin.js", () => ({
   ensureSelectedAgentHarnessPlugin: agentHarnessPluginMocks.ensureSelectedAgentHarnessPlugin,
 }));
 
+vi.mock("../agents/runtime-plugins.js", () => ({
+  withAgentPluginRegistry: ({ run }: { run: () => unknown }) => run(),
+}));
+
 vi.mock("../logging/subsystem.js", () => {
   const createMockLogger = () => ({
     subsystem: "test",
@@ -60,7 +64,15 @@ vi.mock("../agents/embedded-agent.js", () => ({
 
 vi.mock("../agents/model-catalog.js", () => ({
   loadManifestModelCatalog: vi.fn(() => []),
-  loadModelCatalog: vi.fn(),
+}));
+
+vi.mock("../agents/prepared-model-catalog.js", () => ({
+  loadProviderScopedThinkingCatalog: vi.fn(async () => []),
+  loadPreparedModelCatalog: vi.fn(),
+  loadPreparedModelCatalogSnapshot: vi.fn(async () => ({
+    entries: [],
+    routeVariants: [],
+  })),
 }));
 
 vi.mock("../agents/model-selection.js", () => {
@@ -104,8 +116,14 @@ vi.mock("../agents/model-selection.js", () => {
     if (allowedKeys.has(key)) {
       return true;
     }
-    const slash = key.indexOf("/");
-    return slash > 0 && allowedKeys.has(`${key.slice(0, slash)}/*`);
+    let separator = key.indexOf("/");
+    while (separator > 0) {
+      if (allowedKeys.has(`${key.slice(0, separator + 1)}*`)) {
+        return true;
+      }
+      separator = key.indexOf("/", separator + 1);
+    }
+    return false;
   };
   const resolvePrimary = (cfg?: ConfigWithModels): string | undefined => {
     const primary = cfg?.agents?.defaults?.model;
@@ -175,24 +193,28 @@ vi.mock("../agents/model-selection.js", () => {
         const primary = resolveDefaultRef(cfg);
         refs.add(modelKey(primary.provider, primary.model));
         const allowAny = policyRefs.length === 0;
+        const wildcardModelKeys = new Set(
+          policyRefs.filter((key) => key.endsWith("/*")).map((key) => key.trim().toLowerCase()),
+        );
+        const wildcardProviders = new Set(
+          [...wildcardModelKeys].map((key) => key.slice(0, key.indexOf("/"))),
+        );
         const allowsKey = (key: string) => allowAny || isModelKeyAllowedBySet(refs, key);
         return {
           allowAny,
           allowedKeys: refs,
           allowedCatalog: catalog,
           exactModelRefs: policyRefs.filter((key) => !key.endsWith("/*")),
-          providerWildcards: new Set(
-            policyRefs
-              .filter((key) => key.endsWith("/*"))
-              .map((key) => key.slice(0, -2).trim().toLowerCase()),
-          ),
+          providerWildcards: wildcardProviders,
           hasConfiguredEntries: policyRefs.length > 0,
-          hasProviderWildcards: policyRefs.some((key) => key.endsWith("/*")),
+          hasProviderWildcards: wildcardModelKeys.size > 0,
           allowConfigPath: policy.configPath,
           allowRepairConfigPath: "agents.defaults.modelPolicy.allow",
           automaticFallbackKeys: new Set<string>(),
           allowsKey,
           allows: ({ provider, model }: ModelRef) => allowsKey(modelKey(provider, model)),
+          allowsByWildcard: ({ provider, model }: ModelRef) =>
+            isModelKeyAllowedBySet(wildcardModelKeys, modelKey(provider, model)),
           resolveSelection: ({ provider, model }: ModelRef) => {
             const key = modelKey(provider, model);
             if (allowsKey(key)) {
@@ -259,7 +281,7 @@ vi.mock("../agents/model-selection.js", () => {
   };
 });
 
-vi.mock("../agents/subagent-announce.js", () => ({
+vi.mock("../agents/subagents/announce/subagent-announce.js", () => ({
   runSubagentAnnounceFlow: vi.fn(),
 }));
 
@@ -275,13 +297,22 @@ vi.mock("../agents/workspace.js", () => ({
   ensureAgentWorkspace: vi.fn(async ({ dir }: { dir: string }) => ({ dir })),
 }));
 
-vi.mock("../skills/loading/workspace.js", () => ({
-  buildWorkspaceSkillSnapshot: vi.fn(() => undefined),
-  loadWorkspaceSkillEntries: vi.fn(() => []),
+vi.mock("../skills/loading/workspace-skill-prompt.js", () => ({
+  buildSkillSnapshot: vi.fn(() => undefined),
+}));
+
+vi.mock("../skills/loading/workspace-skill-loader.js", () => ({
+  filterWorkspaceSkills: (entries: unknown[]) => entries,
+  loadVisibleSkills: vi.fn(() => []),
+  loadWorkspaceSkills: vi.fn(() => []),
 }));
 
 vi.mock("../skills/runtime/remote.js", () => ({
   getRemoteSkillEligibility: vi.fn(() => undefined),
+}));
+
+vi.mock("../plugins/bundle-commands.js", () => ({
+  loadEnabledClaudeBundleCommands: vi.fn(() => []),
 }));
 
 vi.mock("../skills/discovery/agent-filter.js", () => ({

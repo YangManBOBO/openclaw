@@ -13,7 +13,7 @@ OpenClaw gives agents tools to work across sessions, inspect status, and orchest
 
 | Tool                 | What it does                                                                |
 | -------------------- | --------------------------------------------------------------------------- |
-| `sessions`           | Patch visible session settings and manage the global session-group catalog  |
+| `sessions`           | Patch, reset, or delete visible sessions and manage session groups          |
 | `sessions_list`      | List sessions with optional filters (kind, label, agent, archive, preview)  |
 | `sessions_search`    | Search visible session transcripts and return matching excerpts             |
 | `sessions_history`   | Read the transcript of a specific session                                   |
@@ -26,13 +26,13 @@ OpenClaw gives agents tools to work across sessions, inspect status, and orchest
 | `subagents`          | List or cancel background work in this session tree                         |
 | `session_status`     | Show a `/status`-style card and optionally set a per-session model override |
 
-These tools are still subject to the active tool profile and allow/deny policy. `tools.profile: "coding"` includes the full session orchestration set. `tools.profile: "messaging"` includes session self-service, discovery, recall, cross-session messaging, external-conversation tools, and the complete spawn lifecycle (`sessions_spawn`, `sessions_yield`, and `subagents`). The UI-only task-suggestion tools `spawn_task` and `dismiss_task` remain coding-profile tools.
+These tools are still subject to the active tool profile and allow/deny policy. `tools.profile: "coding"` includes the full session orchestration set. `tools.profile: "messaging"` includes session self-service, discovery, recall, cross-session messaging, external-conversation tools, and the complete spawn lifecycle (`sessions_spawn`, `sessions_yield`, and `subagents`). The UI-only task-suggestion tools `suggest_task` and `dismiss_task` remain coding-profile tools.
 
 Group, provider, sandbox, and per-agent policies can still remove those tools after the profile stage. Use `/tools` from the affected session to inspect the effective tool list.
 
 ## Listing and reading sessions
 
-`sessions_list` returns focused discovery rows: session key, agent, kind, channel, label/title/preview fields, parent and child relationships, last update, archive/pin state, state version, model, context/total token counts, run status, and whether the last run aborted. Filter by `kinds` (array; accepted values: `main`, `group`, `cron`, `hook`, `node`, `other`), exact `label`, exact `agentId`, `search` text, or recency (`activeMinutes`). Active sessions are returned by default; pass `archived: true` to inspect archived sessions instead. Set `includeDerivedTitles`, `includeLastMessage`, or `messageLimit` (capped at 20) when you need mailbox-style triage: a visibility-scoped derived title, a last-message preview snippet, or bounded recent messages on each row. Delivery routing, internal session IDs, per-run timings/settings, cost estimates, and transcript paths are intentionally omitted; use `session_status`, conversation tools, and `sessions_history` for those owner-specific details. Derived titles and previews are produced only for sessions the caller can already see under the configured session tool visibility policy, so unrelated sessions stay hidden. When visibility is restricted, `sessions_list` returns optional `visibility` metadata showing the effective mode and a warning that results may be scope-limited.
+`sessions_list` returns focused discovery rows: session key, durable session ID, agent, kind, channel, label/title/preview fields, parent and child relationships, last update, archive/pin state, state version, model, context/total token counts, run status, and whether the last run aborted. Filter by `kinds` (array; accepted values: `main`, `group`, `cron`, `hook`, `node`, `other`), exact `label`, exact `agentId`, `search` text, or recency (`activeMinutes`). Active sessions are returned by default; pass `archived: true` to inspect archived sessions instead. Set `includeDerivedTitles`, `includeLastMessage`, or `messageLimit` (capped at 20) when you need mailbox-style triage: a visibility-scoped derived title, a last-message preview snippet, or bounded recent messages on each row. Use the returned `sessionId` as `expectedSessionId` when the `sessions` tool archives, restores, or deletes another session; this prevents a stale key from targeting a replacement. Delivery routing, other internal IDs, per-run timings/settings, cost estimates, and transcript paths remain omitted; use `session_status`, conversation tools, and `sessions_history` for those owner-specific details. Derived titles and previews are produced only for sessions the caller can already see under the configured session tool visibility policy, so unrelated sessions stay hidden. When visibility is restricted, `sessions_list` returns optional `visibility` metadata showing the effective mode and a warning that results may be scope-limited.
 
 `sessions_history` fetches the conversation transcript for a specific session. By default, tool results are excluded; pass `includeTools: true` to see them. Use `limit` for the newest bounded tail. Pass `offset: 0` when you need pagination metadata, then pass returned `nextOffset` values to page backward through older OpenClaw transcript windows without reading raw transcript files. Explicit offset pages do not merge external CLI fallback imports; use the default newest-tail view (no `offset`) when you need that merged display history.
 
@@ -50,7 +50,7 @@ The returned view is intentionally bounded and safety-filtered:
 - very large histories can drop older rows or replace an oversized row with `[sessions_history omitted: message too large]`
 - the tool reports summary flags such as `truncated`, `droppedMessages`, `contentTruncated`, `contentRedacted`, `bytes`, and pagination metadata
 
-Use the returned **session key** (like `"main"`) with `sessions_history`, `sessions_send`, and `session_status`. Those target tools can also resolve a known session ID, but `sessions_list` does not expose internal IDs.
+Use the returned **session key** (like `"main"`) with `sessions_history`, `sessions_send`, and `session_status`. Use the durable `sessionId` only as the lifecycle identity described above.
 
 If you need the exact raw transcript, inspect the scoped SQLite transcript rows instead of treating `sessions_history` as an unfiltered dump.
 
@@ -58,10 +58,14 @@ Use [`sessions_search`](/concepts/session-search) for exact full-text recall acr
 
 ## Managing session settings and groups
 
-The owner-gated `sessions` tool exposes two bounded self-service surfaces:
+The owner-gated `sessions` tool exposes bounded self-service surfaces:
 
-- `action: "patch"` changes the current session by default, or another visible session selected by `sessionKey`. It can set the label, sidebar icon, pin/archive state, model, and thinking level. It does not expose reset, delete, or compact actions.
+- `action: "patch"` changes the current session by default, or another visible session selected by `sessionKey`. It can set the label, persistent sidebar `icon`, pin/archive state, model, and thinking level. The icon must be one emoji grapheme or one of the named icons `braces`, `book`, `monitor`, `bot`, `kanban`, and `coins`; pass an empty string to clear it. The Control UI picker also accepts a custom emoji and shows the macOS (Control-Command-Space) or Windows (Windows-period) system emoji picker shortcut. Archiving or restoring another session requires its `sessions_list` `sessionId` as `expectedSessionId`.
+- `action: "reset"` resets another visible session selected by `sessionKey`.
+- `action: "delete"` first archives and then deletes the exact same generation of another visible session selected by `sessionKey`. By default its transcript is retained as a deleted archive; pass `deleteTranscript: false` to leave the transcript state untouched. Resetting or deleting the session currently running the tool is rejected.
 - `group_list`, `group_set`, `group_rename`, and `group_delete` manage the global ordered session-group catalog. `group_set` replaces the ordered name list rather than patching one entry.
+
+Use `sessions_spawn` with `visible: true` to create a persistent dashboard session. This keeps session creation on the controlled spawn path, which enforces the parent's tool policy, sandbox, concurrency limits, and run timeout.
 
 An agent-selected model patch stays reversible until that selection completes a successful run. If the selected model is definitively unusable because of authentication, billing, or model-not-found failure, OpenClaw restores the previous model and writes a visible system note. Transient rate-limit, overload, timeout, network, and server failures do not undo the selection.
 
@@ -86,7 +90,7 @@ Thread-scoped chat sessions, such as keys ending in `:thread:<id>`, are not vali
 
 Messages and A2A follow-up replies are marked as inter-session data in the receiving prompt (`[Inter-session message ... isUser=false]`) and in transcript provenance. The receiving agent should treat them as tool-routed data, not as a direct end-user-authored instruction.
 
-After the target responds, OpenClaw can run a **reply-back loop** where the agents alternate messages (up to `session.agentToAgent.maxPingPongTurns`, range 0-20, default 5). The target agent can reply `REPLY_SKIP` to stop early.
+After the target responds, OpenClaw can run a **reply-back loop** where the agents alternate messages up to the built-in limit. The target agent can reply `REPLY_SKIP` to stop early.
 
 Pass `watch: true` to also register the sender as a state-change watcher of the target: when another actor later sends the target a direct human message or changes its goal, the sender receives a system notice pointing at `session_status` `changesSince`. Registration happens after successful dispatch, targets the session that actually received the message, and starts at its current state version, so only later changes produce notices. The result reports `watched: true` when registration succeeded. See [Session state awareness](/concepts/session-state).
 
@@ -120,6 +124,7 @@ Key options:
 
 - `runtime: "subagent"` (default) or `"acp"` for external harness agents.
 - `model` and `thinking` overrides for the child session.
+- `runTimeoutSeconds` to override the configured child-run timeout; `0` disables it.
 - `thread: true` to bind the spawn to a chat thread (Discord, Slack, etc.).
 - `sandbox: "require"` to enforce sandboxing on the child.
 - `context: "fork"` for native sub-agents when the child needs the current requester transcript; omit it or use `context: "isolated"` for a clean child. `context: "fork"` is only valid with `runtime: "subagent"`. Thread-bound native sub-agents default to `context: "fork"` unless `threadBindings.defaultSpawnContext` says otherwise.
@@ -135,16 +140,19 @@ For ACP-specific behavior, see [ACP Agents](/tools/acp-agents).
 
 Session tools are scoped to limit what the agent can see:
 
-| Level   | Scope                                                      |
-| ------- | ---------------------------------------------------------- |
-| `self`  | Only the current session                                   |
-| `tree`  | Current + spawned; reads include watched same-agent groups |
-| `agent` | All sessions for this agent                                |
-| `all`   | All sessions (cross-agent if configured)                   |
+| Level   | Scope                                                             |
+| ------- | ----------------------------------------------------------------- |
+| `self`  | Only the current session                                          |
+| `tree`  | Current + spawned; when called from main, all same-agent sessions |
+| `agent` | All sessions for this agent                                       |
+| `all`   | All sessions (cross-agent if configured)                          |
 
-Default is `tree`. Sandboxed sessions are clamped to `tree` regardless of config.
-With the default `session.dmScope: "main"`, group activity makes watched
-same-agent group sessions readable from the main session.
+Default is `tree`. The main-session widening applies to list, history, search,
+send, and status, but never crosses agents. `self` remains a strict lockdown,
+including for main. A sandboxed caller under the default spawned-only session
+tool clamp stays limited to its spawn subtree. Incognito sessions remain hidden
+from every cross-session tool. Ambient group watches still add activity notices
+and prompt hints; they do not grant access.
 
 ## Further reading
 

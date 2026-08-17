@@ -2,6 +2,7 @@
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import {
   listAgentIds,
   resolveAgentWorkspaceDir,
@@ -10,19 +11,21 @@ import {
 import { loadAgentIdentityFromFile } from "../agents/identity-file.js";
 import { DEFAULT_IDENTITY_FILENAME } from "../agents/workspace.js";
 import { replaceConfigFile } from "../config/config.js";
+import { migratePersistedImplicitMainRoster } from "../config/legacy.roster.js";
 import { logConfigUpdated } from "../config/logging.js";
 import type { AgentConfig, IdentityConfig } from "../config/types.js";
-import { normalizeAgentId } from "../routing/session-key.js";
-import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import { defaultRuntime } from "../runtime.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { normalizeAgentId, normalizeAgentIdStrict } from "../routing/session-key.js";
+import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 import { resolveUserPath, shortenHomePath } from "../utils.js";
-import { requireValidConfigFileSnapshot } from "./agents.command-shared.js";
 import {
   type AgentIdentity,
   findAgentEntryIndex,
   listAgentEntries,
   loadAgentIdentity,
 } from "./agents.config.js";
+import { requireValidConfigFileSnapshot } from "./config-validation.js";
 
 type AgentsSetIdentityOptions = {
   agent?: string;
@@ -62,10 +65,11 @@ export async function agentsSetIdentityCommand(
   if (!configSnapshot) {
     return;
   }
-  const cfg = configSnapshot.sourceConfig ?? configSnapshot.config;
+  const cfg = migratePersistedImplicitMainRoster(
+    configSnapshot.sourceConfig ?? configSnapshot.config,
+  ).config as OpenClawConfig;
   const baseHash = configSnapshot.hash;
 
-  const agentRaw = normalizeOptionalString(opts.agent);
   const nameRaw = normalizeOptionalString(opts.name);
   const emojiRaw = normalizeOptionalString(opts.emoji);
   const themeRaw = normalizeOptionalString(opts.theme);
@@ -75,7 +79,13 @@ export async function agentsSetIdentityCommand(
   const identityFileRaw = normalizeOptionalString(opts.identityFile);
   const workspaceRaw = normalizeOptionalString(opts.workspace);
   const wantsIdentityFile = Boolean(opts.fromIdentity || identityFileRaw || !hasExplicitIdentity);
-  let agentId = agentRaw ? normalizeAgentId(agentRaw) : undefined;
+  const normalizedAgent = opts.agent === undefined ? null : normalizeAgentIdStrict(opts.agent);
+  if (normalizedAgent && !normalizedAgent.ok) {
+    runtime.error(`Agent "${opts.agent}" not found. Create it with \`openclaw agents add\`.`);
+    runtime.exit(1);
+    return;
+  }
+  let agentId = normalizedAgent?.value;
 
   let identityFilePath: string | undefined;
   let workspaceDir: string | undefined;
@@ -131,7 +141,7 @@ export async function agentsSetIdentityCommand(
       try {
         identityFromFile = await loadAgentIdentityFromFile(identityFilePath);
       } catch (error) {
-        runtime.error(String(error instanceof Error ? error.message : error));
+        runtime.error(formatErrorMessage(error));
         runtime.exit(1);
         return;
       }
@@ -196,7 +206,12 @@ export async function agentsSetIdentityCommand(
     ...cfg,
     agents: {
       ...cfg.agents,
-      list: nextList,
+      entries: Object.fromEntries(
+        nextList.map((entry) => {
+          const { id, ...config } = entry;
+          return [id, config];
+        }),
+      ),
     },
   };
 
@@ -216,20 +231,20 @@ export async function agentsSetIdentityCommand(
   }
 
   logConfigUpdated(runtime);
-  runtime.log(`Agent: ${agentId}`);
+  runtime.log(`Agent: ${sanitizeTerminalText(resolvedAgentId)}`);
   if (nextIdentity.name) {
-    runtime.log(`Name: ${nextIdentity.name}`);
+    runtime.log(`Name: ${sanitizeTerminalText(nextIdentity.name)}`);
   }
   if (nextIdentity.theme) {
-    runtime.log(`Theme: ${nextIdentity.theme}`);
+    runtime.log(`Theme: ${sanitizeTerminalText(nextIdentity.theme)}`);
   }
   if (nextIdentity.emoji) {
-    runtime.log(`Emoji: ${nextIdentity.emoji}`);
+    runtime.log(`Emoji: ${sanitizeTerminalText(nextIdentity.emoji)}`);
   }
   if (nextIdentity.avatar) {
-    runtime.log(`Avatar: ${nextIdentity.avatar}`);
+    runtime.log(`Avatar: ${sanitizeTerminalText(nextIdentity.avatar)}`);
   }
   if (workspaceDir) {
-    runtime.log(`Workspace: ${shortenHomePath(workspaceDir)}`);
+    runtime.log(`Workspace: ${sanitizeTerminalText(shortenHomePath(workspaceDir))}`);
   }
 }

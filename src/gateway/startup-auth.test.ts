@@ -60,19 +60,10 @@ describe("mergeGatewayTailscaleConfig", () => {
   it("preserves explicit preserveFunnel overrides", () => {
     expect(
       mergeGatewayTailscaleConfig(
-        { mode: "serve", resetOnExit: false, preserveFunnel: false },
+        { mode: "serve", preserveFunnel: false },
         { preserveFunnel: true },
       ),
-    ).toEqual({ mode: "serve", resetOnExit: false, preserveFunnel: true });
-  });
-
-  it("preserves explicit serviceName overrides", () => {
-    expect(
-      mergeGatewayTailscaleConfig(
-        { mode: "serve", serviceName: "svc:old-openclaw", resetOnExit: false },
-        { serviceName: "svc:openclaw" },
-      ),
-    ).toEqual({ mode: "serve", serviceName: "svc:openclaw", resetOnExit: false });
+    ).toEqual({ mode: "serve", preserveFunnel: true });
   });
 });
 
@@ -227,14 +218,30 @@ describe("ensureGatewayStartupAuth", () => {
     });
   });
 
-  it("uses OPENCLAW_GATEWAY_TOKEN without resolving configured token SecretRef", async () => {
+  it("keeps configured token SecretRef ahead of OPENCLAW_GATEWAY_TOKEN", async () => {
+    const configuredToken = gatewayEnvSecretRef("GW_TOKEN");
     await expectResolvedToken({
-      cfg: createMissingGatewayTokenSecretRefConfig(),
+      cfg: gatewayAuthConfigWithDefaultEnvProvider({
+        mode: "token",
+        token: configuredToken,
+      }),
       env: {
+        GW_TOKEN: "token-from-config-ref",
         OPENCLAW_GATEWAY_TOKEN: "token-from-env",
       } as NodeJS.ProcessEnv,
-      expectedToken: "token-from-env",
+      expectedToken: "token-from-config-ref",
+      expectedConfiguredToken: configuredToken,
     });
+  });
+
+  it("does not let OPENCLAW_GATEWAY_TOKEN mask an unresolved configured token ref", async () => {
+    await expect(
+      runStartupAuth({
+        cfg: createMissingGatewayTokenSecretRefConfig(),
+        env: { OPENCLAW_GATEWAY_TOKEN: "token-from-env" } as NodeJS.ProcessEnv,
+        persist: true,
+      }),
+    ).rejects.toThrow(/MISSING_GW_TOKEN/i);
   });
 
   it("fails when gateway.auth.token SecretRef is active and unresolved", async () => {
@@ -260,19 +267,35 @@ describe("ensureGatewayStartupAuth", () => {
     expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
   });
 
-  it("uses OPENCLAW_GATEWAY_PASSWORD without resolving configured password SecretRef", async () => {
+  it("keeps configured password SecretRef ahead of OPENCLAW_GATEWAY_PASSWORD", async () => {
+    const configuredPassword = gatewayEnvSecretRef("GW_PASSWORD");
     const result = await runStartupAuth({
       cfg: gatewayAuthConfigWithDefaultEnvProvider({
         mode: "password",
-        password: gatewayEnvSecretRef("MISSING_GW_PASSWORD"),
+        password: configuredPassword,
       }),
       env: {
+        GW_PASSWORD: "password-from-config-ref", // pragma: allowlist secret
         OPENCLAW_GATEWAY_PASSWORD: "password-from-env", // pragma: allowlist secret
       } as NodeJS.ProcessEnv,
       persist: true,
     });
 
-    expectResolvedPassword(result, "password-from-env");
+    expectResolvedPassword(result, "password-from-config-ref");
+    expect(result.cfg.gateway?.auth?.password).toEqual(configuredPassword);
+  });
+
+  it("does not let OPENCLAW_GATEWAY_PASSWORD mask an unresolved configured password ref", async () => {
+    await expect(
+      runStartupAuth({
+        cfg: gatewayAuthConfigWithDefaultEnvProvider({
+          mode: "password",
+          password: gatewayEnvSecretRef("MISSING_GW_PASSWORD"),
+        }),
+        env: { OPENCLAW_GATEWAY_PASSWORD: "password-from-env" } as NodeJS.ProcessEnv,
+        persist: true,
+      }),
+    ).rejects.toThrow(/MISSING_GW_PASSWORD/i);
   });
 
   it("does not resolve gateway.auth.password SecretRef when token mode is explicit", async () => {

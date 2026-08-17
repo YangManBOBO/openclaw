@@ -1,12 +1,13 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import {
   draftPayload,
   removeCardAndReferences,
   replaceCard,
   resetDraftState,
+  selectedWorkboardBoardParams,
 } from "./card-state.ts";
-import { clearPendingStatusTransition, recordPendingStatusTransition } from "./lifecycle.ts";
-import { formatError, isRecord } from "./normalization-utils.ts";
+import { formatError } from "./normalization-utils.ts";
 import { normalizeCardPayload, normalizeCardsPayload } from "./normalization.ts";
 import {
   getWorkboardState,
@@ -54,7 +55,10 @@ async function createWorkboardCard(params: {
   state.error = null;
   params.requestUpdate?.();
   try {
-    const payload = await params.client.request("workboard.cards.create", draftPayload(state));
+    const payload = await params.client.request("workboard.cards.create", {
+      ...draftPayload(state),
+      ...selectedWorkboardBoardParams(state),
+    });
     replaceCard(state, normalizeCardPayload(payload));
     resetDraftState(state);
   } catch (error) {
@@ -91,11 +95,6 @@ export async function saveWorkboardCardDraft(params: {
   state.loading = true;
   state.error = null;
   const cardId = state.editingCardId;
-  const pendingStatusRecorded = recordPendingStatusTransition(
-    params.host,
-    state.cards.find((card) => card.id === cardId),
-    state.draftStatus,
-  );
   params.requestUpdate?.();
   try {
     const payload = await params.client.request("workboard.cards.update", {
@@ -107,7 +106,6 @@ export async function saveWorkboardCardDraft(params: {
   } catch (error) {
     state.error = formatError(error);
   } finally {
-    clearPendingStatusTransition(params.host, cardId, pendingStatusRecorded);
     state.draftSaving = false;
     state.loading = false;
     params.requestUpdate?.();
@@ -178,11 +176,6 @@ export async function moveWorkboardCard(params: {
   invalidateWorkboardLoads(params.host);
   state.busyCardIds.add(params.cardId);
   state.error = null;
-  const pendingStatusRecorded = recordPendingStatusTransition(
-    params.host,
-    state.cards.find((card) => card.id === params.cardId),
-    params.status,
-  );
   params.requestUpdate?.();
   try {
     const payload = await params.client.request("workboard.cards.move", {
@@ -194,7 +187,6 @@ export async function moveWorkboardCard(params: {
   } catch (error) {
     state.error = formatError(error);
   } finally {
-    clearPendingStatusTransition(params.host, params.cardId, pendingStatusRecorded);
     state.busyCardIds.delete(params.cardId);
     if (state.draggedCardId === params.cardId) {
       state.draggedCardId = null;
@@ -287,7 +279,10 @@ export async function dispatchWorkboard(params: {
   state.lastDispatchSummary = null;
   params.requestUpdate?.();
   try {
-    const dispatchResult = await params.client.request("workboard.cards.dispatch", {});
+    const dispatchResult = await params.client.request(
+      "workboard.cards.dispatch",
+      selectedWorkboardBoardParams(state),
+    );
     const payload = await params.client.request("workboard.cards.list", {});
     const normalized = normalizeCardsPayload(payload);
     state.cards = normalized.cards;
