@@ -136,6 +136,53 @@ describe("block HTML islands", () => {
     expect(JSON.stringify(blocks[1])).toContain('"text":"a"');
   });
 
+  it("keeps rich Markdown cell text inside a <details> island table", () => {
+    const block = single(
+      "<details><summary>Rich</summary>\n\n| item | note |\n|---|---|\n| **bold** | [link](https://openclaw.ai) |\n| `code` | *italic* |\n\n</details>",
+    );
+    expect(block.type).toBe("details");
+    if (block.type !== "details") {
+      return;
+    }
+    const table = block.blocks.find((item) => item.type === "table");
+    expect(table?.type).toBe("table");
+    if (table?.type !== "table") {
+      return;
+    }
+    // Cells round-trip through the canonical typed projection: styles, links,
+    // and code spans survive the island HTML re-parse instead of flattening
+    // to plain cell text.
+    expect(table.cells).toEqual([
+      [
+        { text: "item", is_header: true },
+        { text: "note", is_header: true },
+      ],
+      [
+        { text: { type: "bold", text: "bold" } },
+        { text: { type: "url", text: "link", url: "https://openclaw.ai" } },
+      ],
+      [{ text: { type: "code", text: "code" } }, { text: { type: "italic", text: "italic" } }],
+    ]);
+  });
+
+  it("degrades an over-wide Markdown table inside a <details> island to a grid", () => {
+    const header = `| ${Array.from({ length: 21 }, (_value, index) => `H${index + 1}`).join(" | ")} |`;
+    const separator = `| ${Array.from({ length: 21 }, () => "---").join(" | ")} |`;
+    const row = `| ${Array.from({ length: 21 }, (_value, index) => String(index + 1)).join(" | ")} |`;
+    const { blocks, degradationReasons } = markdownToTelegramRichBlocks(
+      `<details><summary>Wide</summary>\n\n${[header, separator, row].join("\n")}\n\n</details>`,
+    );
+    expect(degradationReasons).toEqual(["table-ascii"]);
+    expect(blocks).toHaveLength(1);
+    const block = blocks[0];
+    expect(block?.type).toBe("details");
+    if (block?.type !== "details") {
+      return;
+    }
+    expect(block.blocks.some((item) => item.type === "pre")).toBe(true);
+    expect(block.blocks.some((item) => item.type === "table")).toBe(false);
+  });
+
   it("maps <ul> with checkbox tasks", () => {
     const block = single(
       '<ul><li><input type="checkbox" checked/>Done</li><li><input type="checkbox"/>Todo</li><li>Plain</li></ul>',

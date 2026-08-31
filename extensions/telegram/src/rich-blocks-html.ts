@@ -125,6 +125,67 @@ export function nodeText(nodes: readonly HtmlNode[]): string {
     .join("");
 }
 
+function escapeTelegramHtmlText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+const ISLAND_INLINE_STYLE_TAGS: Record<
+  | "bold"
+  | "italic"
+  | "underline"
+  | "strikethrough"
+  | "code"
+  | "spoiler"
+  | "marked"
+  | "subscript"
+  | "superscript",
+  string
+> = {
+  bold: "b",
+  italic: "i",
+  underline: "u",
+  strikethrough: "s",
+  code: "code",
+  spoiler: "tg-spoiler",
+  marked: "mark",
+  subscript: "sub",
+  superscript: "sup",
+};
+
+/**
+ * Serialize canonical typed RichText back into the inline HTML the island
+ * fragment parser maps natively (see htmlNodesToRichText). Re-projected
+ * markdown table cells run through cellToRichText first, so style/link/
+ * annotation spans survive the island HTML round-trip instead of flattening
+ * to plain cell text.
+ */
+export function richTextToIslandHtml(text: RichText): string {
+  if (typeof text === "string") {
+    return escapeTelegramHtmlText(text);
+  }
+  if (Array.isArray(text)) {
+    return text.map(richTextToIslandHtml).join("");
+  }
+  switch (text.type) {
+    case "url":
+      return `<a href="${escapeTelegramHtmlText(text.url)}">${richTextToIslandHtml(text.text)}</a>`;
+    case "anchor_link":
+      return `<a href="#${escapeTelegramHtmlText(text.anchor_name)}">${richTextToIslandHtml(text.text)}</a>`;
+    case "mathematical_expression":
+      return `<tg-math>${escapeTelegramHtmlText(text.expression)}</tg-math>`;
+    case "custom_emoji":
+      return `<tg-emoji emoji-id="${escapeTelegramHtmlText(text.custom_emoji_id)}">${escapeTelegramHtmlText(text.alternative_text)}</tg-emoji>`;
+    default: {
+      const tag = ISLAND_INLINE_STYLE_TAGS[text.type];
+      return `<${tag}>${richTextToIslandHtml(text.text)}</${tag}>`;
+    }
+  }
+}
+
 function normalizeIslandText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }

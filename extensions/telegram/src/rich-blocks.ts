@@ -23,7 +23,7 @@ import {
   type TelegramRichBlocksDegradationReason,
 } from "./rich-block-model.js";
 import { findTelegramHtmlIslands, parseIslandBlocks } from "./rich-blocks-html-map.js";
-import { parseInlineHtmlIslands } from "./rich-blocks-html.js";
+import { parseInlineHtmlIslands, richTextToIslandHtml } from "./rich-blocks-html.js";
 import {
   collectMarkdownRichListSources,
   renderMarkdownRichListSource,
@@ -400,6 +400,7 @@ function emitGapBlocks(
   start: number,
   end: number,
   tables: readonly MarkdownTableMeta[],
+  degradationReasons: Set<TelegramRichBlocksDegradationReason>,
 ): InputRichBlock[] {
   if (end <= start) {
     return [];
@@ -412,7 +413,7 @@ function emitGapBlocks(
   let cursor = start;
   for (const island of islands) {
     blocks.push(...splitParagraphs(ir, cursor, start + island.start));
-    blocks.push(...renderIslandBlocksWithTables(ir, start, island, tables));
+    blocks.push(...renderIslandBlocksWithTables(ir, start, island, tables, degradationReasons));
     cursor = start + island.end;
   }
   blocks.push(...splitParagraphs(ir, cursor, end));
@@ -421,19 +422,13 @@ function emitGapBlocks(
 
 type AuthoredHtmlIsland = ReturnType<typeof findAuthoredHtmlIslands>[number];
 
-function escapeTelegramHtmlText(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 /**
  * Rebuild a markdown table as an HTML <table> island element. The IR removes
  * markdown table source text (a zero-width placeholder remains), so island
  * bodies would silently drop tables; the island fragment parser renders this
- * element natively, including its over-wide-column ASCII degradation.
+ * element natively, including its over-wide-column ASCII degradation and
+ * typed rich cell text (serialized from the canonical cellToRichText
+ * projection).
  */
 function renderIslandTableHtml(table: MarkdownTableMeta): string {
   const columnCount = Math.max(
@@ -447,7 +442,8 @@ function renderIslandTableHtml(table: MarkdownTableMeta): string {
   };
   const cellHtml = (cell: MarkdownTableCell | undefined, index: number, header: boolean) => {
     const tag = header ? "th" : "td";
-    return `<${tag}${alignAttr(index)}>${escapeTelegramHtmlText(cell?.text ?? "")}</${tag}>`;
+    const rich = cell ? cellToRichText(cell) : undefined;
+    return `<${tag}${alignAttr(index)}>${richTextToIslandHtml(rich ?? "")}</${tag}>`;
   };
   const headerRow =
     table.headerCells.length > 0
@@ -473,6 +469,7 @@ function renderIslandBlocksWithTables(
   gapStart: number,
   island: AuthoredHtmlIsland,
   tables: readonly MarkdownTableMeta[],
+  degradationReasons: Set<TelegramRichBlocksDegradationReason>,
 ): InputRichBlock[] {
   const islandStart = gapStart + island.start;
   const islandEnd = gapStart + island.end;
@@ -481,6 +478,19 @@ function renderIslandBlocksWithTables(
     .toSorted((left, right) => left.placeholderOffset - right.placeholderOffset);
   if (contained.length === 0) {
     return island.blocks;
+  }
+  // The fragment parser degrades over-wide tables to a monospace grid exactly
+  // like the markdown table path; record the same degradation reason so the
+  // island path reports identical delivery diagnostics.
+  for (const table of contained) {
+    const columnCount = Math.max(
+      table.headerCells.length,
+      ...table.rowCells.map((row) => row.length),
+      0,
+    );
+    if (columnCount > TELEGRAM_RICH_TEXT_TABLE_COLUMN_LIMIT) {
+      degradationReasons.add("table-ascii");
+    }
   }
   const source = ir.text.slice(islandStart, islandEnd);
   let html = "";
@@ -646,7 +656,7 @@ function emitSegments(
       break;
     }
     if (segment.start > cursor) {
-      blocks.push(...emitGapBlocks(ir, cursor, segment.start, tables));
+      blocks.push(...emitGapBlocks(ir, cursor, segment.start, tables, degradationReasons));
     }
     // Segments nested inside this one (fences/headings/tables in a blockquote)
     // belong to it; consuming them here prevents a second top-level emission.
@@ -727,7 +737,7 @@ function emitSegments(
     index = next;
   }
   if (cursor < rangeEnd) {
-    blocks.push(...emitGapBlocks(ir, cursor, rangeEnd, tables));
+    blocks.push(...emitGapBlocks(ir, cursor, rangeEnd, tables, degradationReasons));
   }
   return blocks;
 }
