@@ -762,6 +762,45 @@ describe("legacy workspace Doctor migration", () => {
     expect(fs.existsSync(`${attestationPath}.doctor-importing`)).toBe(false);
   });
 
+  it("preserves a reserved attestation recreated after the empty claim", async () => {
+    const context = setup();
+    const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
+    const attestationPath = path.join(
+      context.stateDir,
+      "workspace-attestations",
+      `${identity.workspaceKey}.attested`,
+    );
+    await fsp.mkdir(path.dirname(attestationPath), { recursive: true });
+    await fsp.writeFile(attestationPath, "", "utf8");
+    const sourcePath = attestationPath;
+
+    // An old writer recreates the marker while Doctor removes the claimed
+    // empty file. The discard must not report success while the source exists:
+    // the recreated generation stays visible and readiness keeps blocking.
+    const result = await migrateLegacyWorkspaceState({
+      detected: detect(context),
+      env: context.env,
+      stateDir: context.stateDir,
+      removeSource: async (claimPath) => {
+        await fsp.rm(claimPath);
+        await fsp.writeFile(sourcePath, "", "utf8");
+      },
+    });
+
+    expect(result.changes).toEqual([]);
+    expect(result.warnings[0]).toContain("reappeared during discard");
+    expect(result.warnings[0]).toContain(attestationPath);
+    expect(fs.existsSync(sourcePath)).toBe(true);
+    expect(fs.existsSync(`${sourcePath}.doctor-importing`)).toBe(false);
+
+    // The recreated empty marker is itself discardable on the next run, so a
+    // follow-up Doctor pass converges without manual intervention.
+    const retry = await migrate(context);
+    expect(retry.warnings).toEqual([]);
+    expect(retry.changes).toContain("Discarded empty reserved workspace attestation.");
+    expect(fs.existsSync(sourcePath)).toBe(false);
+  });
+
   it("rejects a setup source beneath a symlinked workspace subdirectory", async () => {
     const context = setup();
     const externalDir = path.join(context.homeDir, "external-workspace-state");

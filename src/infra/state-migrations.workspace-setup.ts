@@ -661,6 +661,11 @@ async function discardEmptyReservedAttestation(params: {
         };
       }
     }
+    // Mirror the import path's pre-delete invariant: a source recreated after
+    // the claim must not be silently covered by a reported discard.
+    if (await params.sourceClaim.exists()) {
+      throw new Error("legacy workspace source reappeared during discard");
+    }
     const unchanged = await params.sourceClaim.read(true);
     if (!snapshotsMatch(snapshot, unchanged)) {
       throw new Error("legacy workspace claim changed before discard");
@@ -668,6 +673,9 @@ async function discardEmptyReservedAttestation(params: {
     await params.sourceClaim.remove({
       removeSource: params.removeSource,
       skipSourceCheck: true,
+      // A recreated source is a new generation that must remain visible to
+      // Doctor; never report a successful discard while the source exists.
+      sourceRemainingMessage: "legacy workspace source reappeared during discard",
     });
     return {
       changes: ["Discarded empty reserved workspace attestation."],
