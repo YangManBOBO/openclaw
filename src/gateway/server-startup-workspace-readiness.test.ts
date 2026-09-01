@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveWorkspaceStateIdentity } from "../agents/workspace-state-identity.js";
 import { writeConfigFile, type OpenClawConfig } from "../config/config.js";
 import {
   detectLegacyWorkspaceState,
@@ -64,5 +65,55 @@ describe("Gateway workspace migration readiness", () => {
     const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
     expect(ready.status).toBe(200);
     await expect(fs.stat(sourcePath)).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it("discards a zero-byte reserved attestation during Doctor migration so the workspace can start", async () => {
+    const stateDir = process.env.OPENCLAW_STATE_DIR!;
+    const workspaceDir = path.join(stateDir, "workspace-zero-byte");
+    const cfg: OpenClawConfig = {
+      gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
+      agents: {
+        ownership: "explicit",
+        entries: {
+          main: { workspace: path.join(stateDir, "workspace-main") },
+          secondary: { workspace: workspaceDir },
+        },
+      },
+    };
+    await writeConfigFile(cfg);
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const identity = resolveWorkspaceStateIdentity(workspaceDir);
+    const attestationPath = path.join(
+      stateDir,
+      "workspace-attestations",
+      `${identity.workspaceKey}.attested`,
+    );
+    await fs.mkdir(path.dirname(attestationPath), { recursive: true });
+    await fs.writeFile(attestationPath, "");
+    const port = await getGatewayTestPort();
+
+    // The zero-byte reserved marker is a presence-only blocker: the gateway
+    // refuses startup exactly like any other unmigrated workspace state.
+    await expect(startTestGatewayServer(port, { auth: { mode: "none" } })).rejects.toThrow(
+      "Legacy workspace setup state requires migration",
+    );
+    await expect(fetch(`http://127.0.0.1:${port}/readyz`)).rejects.toThrow();
+
+    const migration = await migrateLegacyWorkspaceState({
+      stateDir,
+      detected: detectLegacyWorkspaceState({
+        cfg,
+        stateDir,
+        homedir: os.homedir,
+        doctorOnlyStateMigrations: true,
+      }),
+    });
+    expect(migration.warnings).toEqual([]);
+    expect(migration.changes).toContain("Discarded empty reserved workspace attestation.");
+    await expect(fs.stat(attestationPath)).rejects.toHaveProperty("code", "ENOENT");
+
+    server = await startTestGatewayServer(port, { auth: { mode: "none" } });
+    const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(ready.status).toBe(200);
   });
 });

@@ -462,7 +462,9 @@ async function migrateOneSource(params: {
   } catch (error) {
     return {
       changes: [],
-      warnings: [`Failed reading legacy workspace state: ${formatErrorMessage(error)}`],
+      warnings: [
+        `Failed reading legacy workspace state at ${params.source.sourcePath}: ${formatErrorMessage(error)}`,
+      ],
     };
   }
   const receipt = readReceipt(params.source, params.env);
@@ -474,7 +476,9 @@ async function migrateOneSource(params: {
   } catch (error) {
     return {
       changes: [],
-      warnings: [`Failed reading legacy workspace state: ${formatErrorMessage(error)}`],
+      warnings: [
+        `Failed reading legacy workspace state at ${params.source.sourcePath}: ${formatErrorMessage(error)}`,
+      ],
     };
   }
   // One artifact after verified removal is a new generation, including a source
@@ -502,15 +506,39 @@ async function migrateOneSource(params: {
   }
 
   let snapshot: SourceSnapshot;
-  let parsed: ParsedSource;
-  let claimedByThisRun = false;
   try {
     snapshot = await sourceClaim.read(!hasSource);
-    parsed = parseSource(params.source, snapshot);
   } catch (error) {
     return {
       changes: [],
-      warnings: [`Failed reading legacy workspace state: ${formatErrorMessage(error)}`],
+      warnings: [
+        `Failed reading legacy workspace state at ${params.source.sourcePath}: ${formatErrorMessage(error)}`,
+      ],
+    };
+  }
+  let parsed: ParsedSource;
+  let claimedByThisRun = false;
+  try {
+    parsed = parseSource(params.source, snapshot);
+  } catch (error) {
+    // A verified zero-byte regular file at a reserved state-directory
+    // attestation path carries no state and can never parse. Discard it so
+    // Doctor converges instead of blocking the workspace on every run.
+    if (snapshot.size === 0 && isReservedStateDirAttestation(params.source)) {
+      return await discardEmptyReservedAttestation({
+        sourceClaim,
+        source: params.source,
+        snapshot,
+        hasSource,
+        removeSource: params.removeSource,
+        beforeClaim: params.beforeClaim,
+      });
+    }
+    return {
+      changes: [],
+      warnings: [
+        `Failed reading legacy workspace state at ${params.source.sourcePath}: ${formatErrorMessage(error)}`,
+      ],
     };
   }
 
@@ -583,6 +611,76 @@ async function migrateOneSource(params: {
     warnings: [],
     notices: ["Removed retired workspace state after verified SQLite import."],
   };
+}
+
+/**
+ * Reserved hashed state-directory attestations live under the OpenClaw-owned
+ * `workspace-attestations/` directory. Sibling `.attested` files next to a
+ * workspace are not reserved and must keep their header protection.
+ */
+function isReservedStateDirAttestation(source: LegacyWorkspaceStateSource): boolean {
+  return (
+    source.kind === "attestation" &&
+    path.dirname(source.relativePath) === LEGACY_WORKSPACE_ATTESTATION_DIRNAME
+  );
+}
+
+/**
+ * Discard a verified zero-byte regular file at a reserved state-directory
+ * attestation path. The read already proved it is a non-symlink, non-hardlink
+ * regular file, so an empty snapshot carries no state Doctor could import.
+ */
+async function discardEmptyReservedAttestation(params: {
+  sourceClaim: LegacyMigrationSourceClaim<SourceSnapshot>;
+  source: LegacyWorkspaceStateSource;
+  snapshot: SourceSnapshot;
+  hasSource: boolean;
+  removeSource?: (sourcePath: string) => Promise<void> | void;
+  beforeClaim?: (source: LegacyWorkspaceStateSource) => void;
+}): Promise<MigrationMessages> {
+  try {
+    assertConfiguredWorkspaceIdentity(params.source);
+    let snapshot = params.snapshot;
+    if (params.hasSource) {
+      try {
+        snapshot = await params.sourceClaim.claim({
+          snapshot,
+          beforeClaim: () => {
+            params.beforeClaim?.(params.source);
+            assertConfiguredWorkspaceIdentity(params.source);
+          },
+          mismatchMessage: "legacy workspace source changed before Doctor could claim it",
+        });
+      } catch (error) {
+        const restoreError = await params.sourceClaim.restore();
+        return {
+          changes: [],
+          warnings: [
+            `Failed discarding empty reserved workspace attestation at ${params.source.sourcePath}: ${formatErrorMessage(error)}${restoreError ? `; restore failure: ${restoreError}` : ""}`,
+          ],
+        };
+      }
+    }
+    const unchanged = await params.sourceClaim.read(true);
+    if (!snapshotsMatch(snapshot, unchanged)) {
+      throw new Error("legacy workspace claim changed before discard");
+    }
+    await params.sourceClaim.remove({
+      removeSource: params.removeSource,
+      skipSourceCheck: true,
+    });
+    return {
+      changes: ["Discarded empty reserved workspace attestation."],
+      warnings: [],
+    };
+  } catch (error) {
+    return {
+      changes: [],
+      warnings: [
+        `Failed discarding empty reserved workspace attestation at ${params.source.sourcePath}: ${formatErrorMessage(error)}`,
+      ],
+    };
+  }
 }
 
 /** Import retired workspace files while excluding Gateways that can recreate them. */

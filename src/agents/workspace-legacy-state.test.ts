@@ -261,6 +261,50 @@ describe("legacy workspace reset cleanup", () => {
     }
   });
 
+  it("blocks on a zero-byte reserved state-directory attestation until Doctor discards it", async () => {
+    const context = setup();
+    await fs.mkdir(context.workspaceDir, { recursive: true });
+    const attestationPath = context.paths.stateDirAttestationPaths[0]!;
+    await fs.mkdir(path.dirname(attestationPath), { recursive: true });
+    await fs.writeFile(attestationPath, "");
+
+    // Presence-only gate: an empty reserved marker still blocks the workspace
+    // until Doctor's migration removes it.
+    expect(() =>
+      assertWorkspaceStateMigrationReady({
+        workspaceDirs: [context.workspaceDir],
+        env: context.env,
+        homedir: context.homedir,
+      }),
+    ).toThrow(/run openclaw doctor --fix/u);
+
+    const { migrateLegacyWorkspaceState, detectLegacyWorkspaceState } =
+      await import("../infra/state-migrations.workspace-setup.js");
+    const migration = await migrateLegacyWorkspaceState({
+      stateDir: context.stateDir,
+      env: context.env,
+      detected: detectLegacyWorkspaceState({
+        cfg: { agents: { defaults: { workspace: context.workspaceDir } } },
+        stateDir: context.stateDir,
+        env: context.env,
+        homedir: context.homedir,
+        doctorOnlyStateMigrations: true,
+      }),
+    });
+    expect(migration.warnings).toEqual([]);
+    expect(migration.changes).toContain("Discarded empty reserved workspace attestation.");
+    await expect(fs.lstat(attestationPath)).rejects.toHaveProperty("code", "ENOENT");
+    expect(() =>
+      assertWorkspaceStateMigrationReady({
+        workspaceDirs: [context.workspaceDir],
+        env: context.env,
+        homedir: context.homedir,
+      }),
+    ).not.toThrow();
+    const { closeOpenClawStateDatabaseForTest } = await import("../state/openclaw-state-db.js");
+    closeOpenClawStateDatabaseForTest();
+  });
+
   it("does not follow a symlinked attestation directory during reset", async () => {
     const context = setup();
     const markerPath = context.paths.stateDirAttestationPaths[0]!;

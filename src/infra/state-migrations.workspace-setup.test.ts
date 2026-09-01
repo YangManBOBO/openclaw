@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolveWorkspaceStateIdentity } from "../agents/workspace-state-identity.js";
 import {
   deleteWorkspaceState,
@@ -638,6 +638,128 @@ describe("legacy workspace Doctor migration", () => {
         .db.prepare("SELECT workspace_key FROM workspace_setup_state WHERE workspace_key = ?")
         .get(identity.workspaceKey),
     ).toBeUndefined();
+  });
+
+  it("names the exact retained source in the malformed-state warning", async () => {
+    const context = setup();
+    const setupPath = path.join(context.workspaceDir, "openclaw-workspace-state.json");
+    await fsp.writeFile(setupPath, "{invalid", "utf8");
+
+    const result = await migrate(context);
+
+    // Windows temp roots can expose short-name aliases; compare case-insensitively
+    // on the basename and require the "at <path>" phrasing.
+    expect(result.warnings[0]).toMatch(/Failed reading legacy workspace state at /i);
+    expect(result.warnings[0].toLowerCase()).toContain(path.basename(setupPath).toLowerCase());
+    expect(fs.existsSync(setupPath)).toBe(true);
+  });
+
+  it.each(["configured", "orphan"] as const)(
+    "discards a verified zero-byte reserved %s attestation so Doctor converges",
+    async (scope) => {
+      const context = setup();
+      const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
+      const key = scope === "configured" ? identity.workspaceKey : "c".repeat(64);
+      const attestationPath = path.join(
+        context.stateDir,
+        "workspace-attestations",
+        `${key}.attested`,
+      );
+      await fsp.mkdir(path.dirname(attestationPath), { recursive: true });
+      await fsp.writeFile(attestationPath, "", "utf8");
+
+      const detected = detect(context);
+      expect(detected.hasLegacy).toBe(true);
+      const result = await migrate(context);
+
+      expect(result.warnings).toEqual([]);
+      expect(result.changes).toContain("Discarded empty reserved workspace attestation.");
+      expect(fs.existsSync(attestationPath)).toBe(false);
+      expect(fs.existsSync(`${attestationPath}.doctor-importing`)).toBe(false);
+      // The same run converges: a second pass finds nothing left to migrate.
+      const retry = await migrate(context);
+      expect(retry.warnings).toEqual([]);
+      expect(retry.changes).toEqual([]);
+    },
+  );
+
+  it("protects a zero-byte sibling attestation next to the workspace", async () => {
+    const context = setup();
+    const siblingPath = `${context.workspaceDir}.attested`;
+    await fsp.writeFile(siblingPath, "", "utf8");
+
+    // Sibling markers require the owned header; an empty sibling is not
+    // surfaced to Doctor and stays untouched.
+    expect(detect(context).hasLegacy).toBe(false);
+    const result = await migrate(context);
+    expect(result.warnings).toEqual([]);
+    expect(result.changes).toEqual([]);
+    expect(fs.existsSync(siblingPath)).toBe(true);
+    expect(fs.existsSync(`${siblingPath}.doctor-importing`)).toBe(false);
+  });
+
+  it("runs removal hooks when discarding an empty reserved attestation", async () => {
+    const context = setup();
+    const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
+    const attestationPath = path.join(
+      context.stateDir,
+      "workspace-attestations",
+      `${identity.workspaceKey}.attested`,
+    );
+    await fsp.mkdir(path.dirname(attestationPath), { recursive: true });
+    await fsp.writeFile(attestationPath, "", "utf8");
+    let beforeClaimSeen = 0;
+    const removeSource = vi.fn(async () => {
+      throw new Error("simulated unlink failure");
+    });
+
+    const result = await migrateLegacyWorkspaceState({
+      detected: detect(context),
+      env: context.env,
+      stateDir: context.stateDir,
+      beforeClaim: () => {
+        beforeClaimSeen += 1;
+      },
+      removeSource,
+    });
+
+    // The beforeClaim hook runs and the failed removal surfaces the exact
+    // retained source so the operator can resolve it manually.
+    expect(beforeClaimSeen).toBe(1);
+    expect(result.changes).toEqual([]);
+    expect(result.warnings[0]).toContain(attestationPath);
+    expect(removeSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores an empty reserved attestation when its claim fails", async () => {
+    const context = setup();
+    const identity = resolveWorkspaceStateIdentity(context.workspaceDir);
+    const attestationPath = path.join(
+      context.stateDir,
+      "workspace-attestations",
+      `${identity.workspaceKey}.attested`,
+    );
+    await fsp.mkdir(path.dirname(attestationPath), { recursive: true });
+    await fsp.writeFile(attestationPath, "", "utf8");
+
+    const result = await migrateLegacyWorkspaceState({
+      detected: detect(context),
+      env: context.env,
+      stateDir: context.stateDir,
+      beforeClaim: () => {
+        // The workspace identity changes right before the claim, so the
+        // discard aborts and must not leave a stranded claim behind.
+        fs.writeFileSync(
+          attestationPath,
+          "openclaw-workspace-attestation:v1\n2026-07-15T11:00:00.000Z\n",
+          "utf8",
+        );
+      },
+    });
+
+    expect(result.warnings[0]).toMatch(/legacy workspace/i);
+    expect(fs.existsSync(attestationPath)).toBe(true);
+    expect(fs.existsSync(`${attestationPath}.doctor-importing`)).toBe(false);
   });
 
   it("rejects a setup source beneath a symlinked workspace subdirectory", async () => {
