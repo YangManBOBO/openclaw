@@ -7,6 +7,11 @@ import {
   upsertDeliveryQueueEntry,
 } from "./delivery-queue-sqlite.js";
 import { installDeliveryQueueTmpDirHooks } from "./outbound/delivery-queue.test-helpers.js";
+import {
+  enqueueClaimedSessionDelivery,
+  moveSessionDeliveryToFailed,
+  releaseSessionDeliveryClaim,
+} from "./session-delivery-queue-storage.js";
 
 describe("delivery queue SQLite update atomicity", () => {
   const { tmpDir } = installDeliveryQueueTmpDirHooks();
@@ -52,5 +57,30 @@ describe("delivery queue SQLite update atomicity", () => {
     const loaded = loadDeliveryQueueEntry(queueName, id, tmpDir());
     expect(loaded?.retryCount).toBe(0);
     expect(loaded?.lastError).toBeUndefined();
+  });
+
+  it("keeps a committed session delivery terminal across a real caller update", async () => {
+    const payload = {
+      kind: "agentTurn" as const,
+      sessionKey: "agent:main:main",
+      message: "generated image ready",
+      messageId: "image:task-atomic:agent-loop",
+      idempotencyKey: "image:task-atomic:agent-loop",
+      completionRetention: "permanent" as const,
+    };
+    const stateDir = tmpDir();
+    const claimed = await enqueueClaimedSessionDelivery(payload, 60_000, stateDir);
+
+    await moveSessionDeliveryToFailed(claimed.id, stateDir);
+    expect(getDeliveryQueueEntryStatus("session", claimed.id, stateDir)).toBe("failed");
+
+    // The real update caller (releaseSessionDeliveryClaim) must fail closed on
+    // the committed terminal row instead of resurrecting it for recovery.
+    await expect(releaseSessionDeliveryClaim(claimed.id, stateDir)).rejects.toThrow(
+      /No pending session delivery queue entry/,
+    );
+
+    expect(getDeliveryQueueEntryStatus("session", claimed.id, stateDir)).toBe("failed");
+    expect(loadDeliveryQueueEntry("session", claimed.id, stateDir)).toBeNull();
   });
 });
