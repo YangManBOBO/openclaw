@@ -1009,14 +1009,16 @@ describe("failover-error", () => {
   describe("local worker task timeout attribution", () => {
     it("keeps a local worker-task deadline on the configured fallback chain", () => {
       // A local worker deadline is runtime infrastructure, not a provider
-      // timeout, but it must NOT become coordination: a later fallback candidate
-      // rebuilds its own context and can recover from an intermittent deadline.
+      // timeout. It must NOT become coordination (a later candidate rebuilds its
+      // own context and can recover), and it must not fabricate a provider HTTP
+      // status from its timeout reason.
       const timeout = new WorkerTaskError("worker task timed out", "timeout");
       expect(isNonProviderRuntimeCoordinationError(timeout)).toBe(false);
       const resolution = resolveModelFallbackError(timeout);
       expect(resolution.kind).toBe("failover");
       if (resolution.kind === "failover") {
         expect(resolution.error.reason).toBe("timeout");
+        expect(resolution.error.status).toBeUndefined();
       }
     });
 

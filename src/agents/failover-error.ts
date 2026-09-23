@@ -604,6 +604,13 @@ type FailoverErrorContext = {
   sessionId?: string;
   lane?: string;
   timeout?: FailoverError["timeout"];
+  /**
+   * When false, do not fabricate an HTTP status from the failover reason. Used
+   * for local worker-task deadlines, which are runtime infrastructure failure
+   * and must not surface as a provider HTTP status even though they advance the
+   * configured fallback chain.
+   */
+  synthesizeHttpStatus?: boolean;
 };
 
 type ModelFallbackErrorResolution =
@@ -657,7 +664,10 @@ export function coerceToFailoverError(
   const signal = normalizeErrorSignal(err);
   const message = signal.message ?? String(err);
   const code = signal.code;
-  const status = signal.status ?? resolveFailoverStatus(reason, code);
+  const status =
+    context?.synthesizeHttpStatus === false
+      ? signal.status
+      : (signal.status ?? resolveFailoverStatus(reason, code));
 
   // Suspend when hitting rate limits or billing issues in an attributed session
   const shouldSuspend =
@@ -718,7 +728,13 @@ export function resolveModelFallbackError(
   if (isAgentHarnessPreflightError(err)) {
     return { kind: "coordination", error: err };
   }
-  const failoverError = coerceToFailoverError(err, context);
+  const failoverError = coerceToFailoverError(err, {
+    ...context,
+    // A local worker-task deadline carries no HTTP fact; do not synthesize a
+    // provider HTTP status from its timeout reason. Routing still advances the
+    // configured chain, but attribution stays local.
+    synthesizeHttpStatus: hasLocalWorkerTaskTimeout(err) ? false : context?.synthesizeHttpStatus,
+  });
   if (failoverError) {
     return { kind: "failover", error: failoverError };
   }

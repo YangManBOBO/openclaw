@@ -66,7 +66,11 @@ describe("model fallback with a real local worker deadline", () => {
         if (run.mock.calls.length === 1) {
           const deadline = await runPoolTaskWithDeadline(pool);
           expect(hasLocalWorkerTaskTimeout(deadline)).toBe(true);
-          expect(resolveModelFallbackError(deadline).kind).toBe("failover");
+          const resolution = resolveModelFallbackError(deadline);
+          expect(resolution.kind).toBe("failover");
+          if (resolution.kind === "failover") {
+            expect(resolution.error.status).toBeUndefined();
+          }
           throw deadline;
         }
         return "fallback candidate ran";
