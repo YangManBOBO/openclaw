@@ -59,13 +59,10 @@ async function publishImmutableGeneration(params: {
       }
       denial = error;
     }
-    let exists = false;
-    try {
-      await fs.access(outputDir);
-      exists = true;
-    } catch {
-      exists = false;
-    }
+    const exists = await fs.access(outputDir).then(
+      () => true,
+      () => false,
+    );
     if (!exists) {
       // The destination is still absent, so this is a transient Windows denial
       // on the freshly-written staging directory rather than a prior build.
