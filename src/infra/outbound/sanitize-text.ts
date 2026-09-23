@@ -7,8 +7,13 @@ import { stripInternalRuntimeScaffolding } from "./protocol-scaffolding.js";
 // Retained for the deprecated plugin-sdk/infra-runtime compatibility barrel.
 export { stripInternalRuntimeScaffolding };
 
-// A tag name ends at whitespace, `/`, or `>`; `<user@example.com>` is prose, not markup.
-const HTML_TAG_RE = /<\/?[a-z][a-z0-9_.:-]*(?=[\s/>])[^>]*>/gi;
+// A tag name ends at whitespace, `/`, or `>`; `<user@example.com>` is prose,
+// not markup. The body after the name is empty, a `/`-prefixed self-closing
+// tail, or `name="value"` attribute pairs — never free prose — so a comparison
+// like `attempts<max and backoffMs>0` is left intact instead of swallowing
+// everything up to a later `>`.
+const HTML_TAG_RE =
+  /<\/?[a-z][a-z0-9_.:-]*(?:(?:\s+[a-z_][a-z0-9_.:-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))+\s*\/?|\/[^>]*|\s*)>/gi;
 const LABELED_ANGLE_LINK_RE =
   /<(?:https?:\/\/|mailto:)[^<>\s|]+\|([^<>\r\n|]*[^<>\s|][^<>\r\n|]*)>/gi;
 const MAY_CONTAIN_MARKDOWN_CODE_RE = /[`~]|\t| {4}/;

@@ -309,6 +309,37 @@ describe("sanitizeForPlainText", () => {
     expect(sanitizeForPlainText("a < b && c > d")).toBe("a < b && c > d");
   });
 
+  it("keeps unspaced comparisons against identifier operands", () => {
+    // `attempts<max and backoffMs>0` is prose about a comparison, not markup.
+    // The unbounded body of the old tag pattern swallowed everything up to the
+    // later `>` and deleted user-visible text.
+    expect(
+      sanitizeForPlainText(
+        "Guard the retry loop: only retry while attempts<max and backoffMs>0, otherwise give up.",
+      ),
+    ).toBe(
+      "Guard the retry loop: only retry while attempts<max and backoffMs>0, otherwise give up.",
+    );
+  });
+
+  it("keeps a comparison whose span crosses unrelated prose", () => {
+    const input =
+      "Set the threshold so that latency<budget. Then verify the p99 stays flat, confirm the alert fires, and only after that raise concurrency>4.";
+    expect(sanitizeForPlainText(input)).toBe(input);
+  });
+
+  it("keeps unspaced comparisons with numeric operands", () => {
+    expect(sanitizeForPlainText("Use timeout<300 and n>0 for the probe.")).toBe(
+      "Use timeout<300 and n>0 for the probe.",
+    );
+  });
+
+  it("still strips bare and attributed tags next to comparison prose", () => {
+    expect(sanitizeForPlainText("before <code>x</code> and attempts<max>0 after")).toBe(
+      "before `x` and attempts0 after",
+    );
+  });
+
   // --- mixed content ------------------------------------------------------
 
   it("handles mixed HTML content", () => {
