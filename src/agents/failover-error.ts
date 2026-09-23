@@ -317,6 +317,28 @@ function hasRuntimeCoordinationFailure(err: unknown): boolean {
   );
 }
 
+/** A local worker-task deadline is runtime infrastructure failure, not a provider timeout. */
+export function hasLocalWorkerTaskTimeout(err: unknown): boolean {
+  let localTimeout = false;
+  for (const candidate of collectErrorGraphCandidates(err, resolveNestedErrors)) {
+    // Failover wrappers may synthesize HTTP-like statuses; original HTTP facts still win.
+    if (isFailoverError(candidate)) {
+      continue;
+    }
+    const record = asOptionalObjectRecord(candidate);
+    if (record?.status !== undefined || record?.statusCode !== undefined) {
+      return false;
+    }
+    if (
+      readErrorName(candidate) === "WorkerTaskError" &&
+      readStringField(record, "code") === "timeout"
+    ) {
+      localTimeout = true;
+    }
+  }
+  return localTimeout;
+}
+
 function hasDirectProviderFailureIdentity(err: unknown): boolean {
   if (isFailoverError(err)) {
     return true;
@@ -669,6 +691,12 @@ export function resolveModelFallbackError(
   // Gateway admission can fail before any provider turn starts. Preserve that
   // identity through wrappers and aggregates so fallback cannot blame a model.
   if (hasRuntimeCoordinationFailure(err)) {
+    return { kind: "coordination", error: err };
+  }
+  // A local worker-task deadline is runtime infrastructure failure, not a
+  // provider timeout. Changing models cannot repair it; stop fallback and keep
+  // the local identity so terminal copy stays accurate.
+  if (hasLocalWorkerTaskTimeout(err)) {
     return { kind: "coordination", error: err };
   }
   const staleLifecycleFailure = hasStaleAgentRunLifecycleFailure(err);
