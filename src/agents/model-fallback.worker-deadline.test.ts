@@ -82,7 +82,7 @@ describe("model fallback with a real local worker deadline", () => {
       // deadline timer deterministically.
       const resultPromise = attempt.then(
         (value) => ({ ok: true as const, value }),
-        (value) => ({ ok: false as const, value }),
+        (value: unknown) => ({ ok: false as const, value }),
       );
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(50);
