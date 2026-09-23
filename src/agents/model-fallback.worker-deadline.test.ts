@@ -1,15 +1,14 @@
-// Real-boundary regression coverage: a genuine worker-pool deadline must stop
-// model fallback (coordination), while a genuine provider HTTP timeout must
-// still rotate. The deadline fires through the pool's production timer
-// (worker-task-pool-core.ts:522) while runWithModelFallback is awaiting the
-// candidate attempt, so the context-worker failure reaches the fallback owner
-// during one connected turn. Only the deadline timers are faked; the worker
+// Real-boundary regression coverage: a genuine worker-pool deadline is detected
+// as local infrastructure (so reply copy stays accurate) while the configured
+// fallback chain is preserved — a later candidate rebuilds its own context and
+// can recover from an intermittent worker deadline. A genuine provider HTTP
+// timeout also keeps rotating. Only the deadline timers are faked; the worker
 // spawn and IPC stay real, and the check never depends on CI scheduling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { workerTaskPoolEntrypoints } from "../infra/worker-task-pool-runtime.test-support.js";
 import { WorkerTaskPool } from "../infra/worker-task-pool.js";
-import { resolveModelFallbackError } from "./failover-error.js";
+import { hasLocalWorkerTaskTimeout, resolveModelFallbackError } from "./failover-error.js";
 import { runWithModelFallback } from "./model-fallback-runner.js";
 
 const workerUrl = resolveRuntimeWorkerUrl(workerTaskPoolEntrypoints.worker);
@@ -54,33 +53,41 @@ const fallbackOptions = {
 };
 
 describe("model fallback with a real local worker deadline", () => {
-  it("stops fallback when a real pool deadline fires during the connected turn", async () => {
+  it("preserves configured fallback when a real pool deadline fires during the turn", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const pool = new WorkerTaskPool<unknown, { label: string }>({ workerUrl, maxWorkers: 1 });
     pools.push(pool);
     try {
-      // The candidate attempt performs context-worker work during the turn; that
+      // The first candidate performs context-worker work during the turn; that
       // work hangs and the host deadline aborts it while the fallback owner is
-      // awaiting this attempt.
+      // awaiting this attempt. The deadline is still detected as local, but the
+      // configured chain must advance so a later candidate can recover.
       const run = vi.fn<() => Promise<string>>().mockImplementation(async () => {
-        throw await runPoolTaskWithDeadline(pool);
+        if (run.mock.calls.length === 1) {
+          const deadline = await runPoolTaskWithDeadline(pool);
+          expect(hasLocalWorkerTaskTimeout(deadline)).toBe(true);
+          expect(resolveModelFallbackError(deadline).kind).toBe("failover");
+          throw deadline;
+        }
+        return "fallback candidate ran";
       });
       const attempt = runWithModelFallback({ ...fallbackOptions, run });
       // Attach the handler before advancing so the rejection that the deadline
       // triggers is always handled, then let the owner reach the candidate
       // attempt (microtask-only path when cfg is unset) and fire the production
       // deadline timer deterministically.
-      const errorPromise = attempt.catch((value: unknown) => value);
+      const resultPromise = attempt.then(
+        (value) => ({ ok: true as const, value }),
+        (value) => ({ ok: false as const, value }),
+      );
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(50);
-      const error = (await errorPromise) as Error & { code?: string };
-      expect(error).toMatchObject({
-        name: "WorkerTaskError",
-        code: "timeout",
-        message: "worker task timed out",
-      });
-      expect(resolveModelFallbackError(error)).toEqual({ kind: "coordination", error });
-      expect(run).toHaveBeenCalledTimes(1);
+      const result = await resultPromise;
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.outcome).toBe("completed");
+      }
+      expect(run).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

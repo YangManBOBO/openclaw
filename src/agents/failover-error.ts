@@ -694,11 +694,10 @@ export function resolveModelFallbackError(
     return { kind: "coordination", error: err };
   }
   // A local worker-task deadline is runtime infrastructure failure, not a
-  // provider timeout. Changing models cannot repair it; stop fallback and keep
-  // the local identity so terminal copy stays accurate.
-  if (hasLocalWorkerTaskTimeout(err)) {
-    return { kind: "coordination", error: err };
-  }
+  // provider timeout. Attribution stays local (the reply renders the
+  // "local worker task timed out" copy), but routing deliberately preserves the
+  // configured fallback chain: a later candidate rebuilds its own context, so it
+  // can recover from an intermittent worker deadline.
   const staleLifecycleFailure = hasStaleAgentRunLifecycleFailure(err);
   if (
     staleLifecycleFailure &&

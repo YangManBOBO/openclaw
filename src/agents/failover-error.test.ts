@@ -1007,20 +1007,30 @@ describe("failover-error", () => {
   });
 
   describe("local worker task timeout attribution", () => {
-    it("classifies a local worker-task deadline as coordination, not a provider timeout", () => {
+    it("keeps a local worker-task deadline on the configured fallback chain", () => {
+      // A local worker deadline is runtime infrastructure, not a provider
+      // timeout, but it must NOT become coordination: a later fallback candidate
+      // rebuilds its own context and can recover from an intermittent deadline.
       const timeout = new WorkerTaskError("worker task timed out", "timeout");
-      expect(isNonProviderRuntimeCoordinationError(timeout)).toBe(true);
-      expect(resolveModelFallbackError(timeout)).toEqual({ kind: "coordination", error: timeout });
+      expect(isNonProviderRuntimeCoordinationError(timeout)).toBe(false);
+      const resolution = resolveModelFallbackError(timeout);
+      expect(resolution.kind).toBe("failover");
+      if (resolution.kind === "failover") {
+        expect(resolution.error.reason).toBe("timeout");
+      }
     });
 
-    it("finds the local deadline through wrappers and aggregates", () => {
+    it("keeps the chain advancing through wrappers and aggregates", () => {
       const timeout = new WorkerTaskError("worker task timed out", "timeout");
       for (const error of [
         new Error("preparation failed", { cause: timeout }),
         new AggregateError([timeout], "run failed"),
       ]) {
-        expect(isNonProviderRuntimeCoordinationError(error)).toBe(true);
-        expect(resolveModelFallbackError(error)).toEqual({ kind: "coordination", error });
+        // Whatever the classification shape (a non-classifying wrapper message
+        // can surface as unknown), it must never become coordination: only
+        // coordination stops the fallback chain (model-fallback-attempt.ts:281).
+        expect(isNonProviderRuntimeCoordinationError(error)).toBe(false);
+        expect(resolveModelFallbackError(error).kind).not.toBe("coordination");
       }
     });
 
