@@ -831,6 +831,35 @@ describe("handleLineWebhookEvents", () => {
     },
   );
 
+  it.each([
+    { name: "a fetch that may have reached LINE", error: () => new TypeError("fetch failed") },
+    {
+      name: "an aborted reply request",
+      error: () => Object.assign(new Error("reply was aborted"), { name: "AbortError" }),
+    },
+  ])("does not push a duplicate pairing reply after $name", async ({ error }) => {
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(error());
+    const event = createTestMessageEvent({
+      message: {
+        id: "pairing-ambiguous",
+        type: "text",
+        text: "hello",
+        quoteToken: "pairing-ambiguous-quote",
+      },
+      source: { type: "user", userId: "pairing-user" },
+      webhookEventId: "pairing-ambiguous-event",
+    });
+
+    await handleLineWebhookEvents(
+      [event],
+      createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
+    );
+
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
   it("does not authorize DM senders from another account's pairing-store entries", async () => {
     const processMessage = vi.fn();
     readAllowFromStoreMock.mockImplementation(async (...args: unknown[]) => {

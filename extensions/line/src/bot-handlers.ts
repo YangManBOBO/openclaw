@@ -57,6 +57,7 @@ import { hasAnyLineMention, isLineBotMentioned } from "./mentions.js";
 import { quotesLineBotMessage } from "./outbound-message-log.js";
 import { parseLineQuestionPostbackData, resolveLineQuestionPostback } from "./question-postback.js";
 import { getLineRuntime } from "./runtime.js";
+import { canFallbackAfterLineReplyFailure } from "./send-retry.js";
 import { getLineGroupName, getUserDisplayName, pushMessageLine, replyMessageLine } from "./send.js";
 import type { ResolvedLineAccount } from "./types.js";
 import type { LineWebhookTurnAdoptionLifecycle } from "./webhook-spool.js";
@@ -110,8 +111,9 @@ function normalizeLineIngressEntry(value: string): string | null {
 
 /**
  * Say one line back to a sender, preferring their reply token so the answer costs no
- * push quota, and falling back to a push when no token is usable. A partial-delivery
- * failure means the reply was seen, so it never falls back.
+ * push quota, and falling back to a push only when LINE definitively rejected the
+ * reply. A partial-delivery or ambiguous failure means the reply may have been seen,
+ * so it never falls back to a duplicate push.
  */
 async function sendLineHandlerText(params: {
   context: LineHandlerContext;
@@ -137,7 +139,7 @@ async function sendLineHandlerText(params: {
       return;
     } catch (err) {
       logVerbose(`${logLabel}: ${String(err)}`);
-      if (isChannelPartialDeliveryError(err)) {
+      if (isChannelPartialDeliveryError(err) || !canFallbackAfterLineReplyFailure(err)) {
         return;
       }
     }
