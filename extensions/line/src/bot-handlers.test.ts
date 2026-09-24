@@ -1010,7 +1010,9 @@ describe("handleLineWebhookEvents", () => {
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
 
     pairingDeliveryMocks.invokePairingReply = false;
-    upsertPairingRequestMock.mockResolvedValue({ code: "OTHCODE", created: false });
+    // Same sender and same pending code, only the account differs: the recovery
+    // marker from "work" must not authorize a resend under "default".
+    upsertPairingRequestMock.mockResolvedValue({ code: "CODE", created: false });
     pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
     await handleLineWebhookEvents([event("pairing-default-pending")], context("default"));
 
