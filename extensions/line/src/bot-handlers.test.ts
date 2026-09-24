@@ -952,6 +952,35 @@ describe("handleLineWebhookEvents", () => {
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });
 
+  it("does not re-arm recovery when the recovery resend itself fails ambiguously", async () => {
+    const senderId = "pairing-rearm-user";
+    const event = (id: string) =>
+      createTestMessageEvent({
+        message: { id, type: "text", text: "hi", quoteToken: `${id}-quote` },
+        source: { type: "user", userId: senderId },
+        webhookEventId: `${id}-event`,
+      });
+    const context = createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" });
+
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await handleLineWebhookEvents([event("pairing-first")], context);
+
+    pairingDeliveryMocks.invokePairingReply = false;
+    upsertPairingRequestMock.mockResolvedValue({ code: "CODE", created: false });
+    pairingDeliveryMocks.replyMessageLine
+      .mockReset()
+      .mockRejectedValueOnce(new TypeError("fetch failed"));
+    await handleLineWebhookEvents([event("pairing-second")], context);
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+
+    pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
+    await handleLineWebhookEvents([event("pairing-third")], context);
+    expect(pairingDeliveryMocks.replyMessageLine).not.toHaveBeenCalled();
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
   it("does not re-send a pending code into another LINE account", async () => {
     const senderId = "pairing-cross-account-user";
     const event = (id: string) =>

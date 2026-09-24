@@ -69,9 +69,10 @@ export async function sendLineHandlerText(params: {
 // deliberately sends nothing while a request is pending, so a challenge whose
 // first delivery was uncertain could otherwise be lost for the pending request's
 // one-hour lifetime. A later message from such a sender re-sends the same code
-// once; a successful first delivery never marks the sender, so it is not repeated.
-// The marker is keyed by the LINE account, sender and exact pending code so
-// recovery state never authorizes a resend under another account or request.
+// once, and that re-send never re-arms the marker, so recovery fires at most
+// once; a successful first delivery never marks the sender at all. The marker
+// is keyed by the LINE account, sender and exact pending code so recovery state
+// never authorizes a resend under another account or request.
 const LINE_PAIRING_RECOVERY_TTL_MS = 60 * 60 * 1000;
 const linePairingRecovery = new Map<string, number>();
 
@@ -114,19 +115,20 @@ export async function sendLinePairingReply(params: {
   })();
   const senderIdLine = `Your ${idLabel}: ${senderId}`;
   const accountId = context.account.accountId;
-  const sendReply = (text: string, logLabel: string) =>
+  const rearmRecovery = () => {
+    const code = upsertResult?.code;
+    if (code) {
+      markLinePairingRecoveryNeeded(accountId, senderId, code);
+    }
+  };
+  const sendReply = (text: string, logLabel: string, onAmbiguousReplyFailure?: () => void) =>
     sendLineHandlerText({
       context,
       text,
       replyToken,
       pushTarget: `line:${senderId}`,
       logLabel,
-      onAmbiguousReplyFailure: () => {
-        const code = upsertResult?.code;
-        if (code) {
-          markLinePairingRecoveryNeeded(accountId, senderId, code);
-        }
-      },
+      ...(onAmbiguousReplyFailure ? { onAmbiguousReplyFailure } : {}),
     });
   let upsertResult: { code: string; created: boolean } | undefined;
   await createChannelPairingChallengeIssuer({
@@ -148,7 +150,7 @@ export async function sendLinePairingReply(params: {
       logVerbose(`line pairing request sender=${senderId}`);
     },
     sendPairingReply: async (text) =>
-      await sendReply(text, `line pairing reply failed for ${senderId}`),
+      await sendReply(text, `line pairing reply failed for ${senderId}`, rearmRecovery),
   });
   if (
     upsertResult?.code &&
