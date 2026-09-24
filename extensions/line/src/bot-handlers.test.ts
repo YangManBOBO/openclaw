@@ -870,6 +870,7 @@ describe("handleLineWebhookEvents", () => {
         webhookEventId: `${id}-event`,
       });
 
+    upsertPairingRequestMock.mockResolvedValue({ code: "FIRSTCODE", created: true });
     pairingDeliveryMocks.invokePairingReply = true;
     pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(new TypeError("fetch failed"));
     await handleLineWebhookEvents(
@@ -879,7 +880,7 @@ describe("handleLineWebhookEvents", () => {
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
 
     pairingDeliveryMocks.invokePairingReply = false;
-    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    upsertPairingRequestMock.mockResolvedValue({ code: "FIRSTCODE", created: false });
     pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
     await handleLineWebhookEvents(
       [event("pairing-pending", "hello again")],
@@ -893,7 +894,7 @@ describe("handleLineWebhookEvents", () => {
       unknown[],
       unknown,
     ];
-    expect(JSON.stringify(messages)).toContain("PENDCODE");
+    expect(JSON.stringify(messages)).toContain("FIRSTCODE");
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });
 
@@ -940,13 +941,50 @@ describe("handleLineWebhookEvents", () => {
     await handleLineWebhookEvents([event("pairing-first")], context);
 
     pairingDeliveryMocks.invokePairingReply = false;
-    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    upsertPairingRequestMock.mockResolvedValue({ code: "CODE", created: false });
     pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
     await handleLineWebhookEvents([event("pairing-second")], context);
     expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
 
     pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
     await handleLineWebhookEvents([event("pairing-third")], context);
+    expect(pairingDeliveryMocks.replyMessageLine).not.toHaveBeenCalled();
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
+  it("does not re-send a pending code into another LINE account", async () => {
+    const senderId = "pairing-cross-account-user";
+    const event = (id: string) =>
+      createTestMessageEvent({
+        message: { id, type: "text", text: "hi", quoteToken: `${id}-quote` },
+        source: { type: "user", userId: senderId },
+        webhookEventId: `${id}-event`,
+      });
+    const context = (accountId: string) => ({
+      cfg: { channels: { line: { dmPolicy: "pairing" } } },
+      account: {
+        accountId,
+        enabled: true,
+        channelAccessToken: `token-${accountId}`, // pragma: allowlist secret
+        channelSecret: `secret-${accountId}`, // pragma: allowlist secret
+        tokenSource: "config" as const,
+        config: { dmPolicy: "pairing" as const },
+      },
+      runtime: createRuntime(),
+      mediaMaxBytes: 1,
+      processMessage: vi.fn(),
+    });
+
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await handleLineWebhookEvents([event("pairing-work-first")], context("work"));
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+
+    pairingDeliveryMocks.invokePairingReply = false;
+    upsertPairingRequestMock.mockResolvedValue({ code: "OTHCODE", created: false });
+    pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
+    await handleLineWebhookEvents([event("pairing-default-pending")], context("default"));
+
     expect(pairingDeliveryMocks.replyMessageLine).not.toHaveBeenCalled();
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });

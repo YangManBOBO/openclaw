@@ -2,7 +2,6 @@ import type { webhook } from "@line/bot-sdk";
 import {
   type buildChannelInboundEventContext,
   buildMentionRegexes,
-  isChannelPartialDeliveryError,
   logInboundDrop,
   matchesMentionPatterns,
   implicitMentionKindWhen,
@@ -14,16 +13,10 @@ import {
   type ResolvedChannelMessageIngress,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import { reportChannelRoomJoin } from "openclaw/plugin-sdk/channel-join-intro-runtime";
-import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
 import { resolveChannelGroupsConfigPath } from "openclaw/plugin-sdk/channel-policy";
 import { hasControlCommand } from "openclaw/plugin-sdk/command-auth-native";
 import type { GroupPolicy, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import {
-  buildPairingReply,
-  readChannelAllowFromStore,
-  resolvePairingIdLabel,
-  upsertChannelPairingRequest,
-} from "openclaw/plugin-sdk/conversation-runtime";
+import { readChannelAllowFromStore } from "openclaw/plugin-sdk/conversation-runtime";
 import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import {
   DEFAULT_GROUP_HISTORY_LIMIT,
@@ -56,11 +49,10 @@ import { reserveLineGroupHistory } from "./group-history.js";
 import { resolveLineGroupConfigEntry } from "./group-keys.js";
 import { hasAnyLineMention, isLineBotMentioned } from "./mentions.js";
 import { quotesLineBotMessage } from "./outbound-message-log.js";
-import { consumeLinePairingRecovery, markLinePairingRecoveryNeeded } from "./pairing-recovery.js";
+import { sendLineHandlerText, sendLinePairingReply } from "./pairing-reply.js";
 import { parseLineQuestionPostbackData, resolveLineQuestionPostback } from "./question-postback.js";
 import { getLineRuntime } from "./runtime.js";
-import { canFallbackAfterLineReplyFailure } from "./send-retry.js";
-import { getLineGroupName, getUserDisplayName, pushMessageLine, replyMessageLine } from "./send.js";
+import { getLineGroupName, getUserDisplayName } from "./send.js";
 import type { ResolvedLineAccount } from "./types.js";
 import type { LineWebhookTurnAdoptionLifecycle } from "./webhook-spool.js";
 
@@ -87,7 +79,7 @@ function isDownloadableLineMessageType(
   return LINE_DOWNLOADABLE_MESSAGE_TYPES.has(messageType);
 }
 
-interface LineHandlerContext {
+export interface LineHandlerContext {
   cfg: OpenClawConfig;
   account: ResolvedLineAccount;
   runtime: RuntimeEnv;
@@ -109,109 +101,6 @@ interface LineHandlerContext {
 
 function normalizeLineIngressEntry(value: string): string | null {
   return normalizeLineAllowEntry(value) || null;
-}
-
-/**
- * Say one line back to a sender, preferring their reply token so the answer costs no
- * push quota, and falling back to a push only when LINE definitively rejected the
- * reply. A partial-delivery or ambiguous failure means the reply may have been seen,
- * so it never falls back to a duplicate push.
- */
-async function sendLineHandlerText(params: {
-  context: LineHandlerContext;
-  text: string;
-  replyToken?: string;
-  pushTarget: string;
-  logLabel: string;
-  authorize?: () => boolean | Promise<boolean>;
-  /** Called when the reply failed ambiguously and no duplicate push was sent. */
-  onAmbiguousReplyFailure?: () => void;
-}): Promise<void> {
-  const { context, logLabel, text } = params;
-  const sendOptions = {
-    cfg: context.cfg,
-    accountId: context.account.accountId,
-    channelAccessToken: context.account.channelAccessToken,
-    ...(params.authorize ? { authorize: params.authorize } : {}),
-  };
-  if (params.replyToken) {
-    if (params.authorize && !(await params.authorize())) {
-      return;
-    }
-    try {
-      await replyMessageLine(params.replyToken, [{ type: "text", text }], sendOptions);
-      return;
-    } catch (err) {
-      logVerbose(`${logLabel}: ${String(err)}`);
-      if (isChannelPartialDeliveryError(err) || !canFallbackAfterLineReplyFailure(err)) {
-        if (!isChannelPartialDeliveryError(err)) {
-          params.onAmbiguousReplyFailure?.();
-        }
-        return;
-      }
-    }
-  }
-  if (params.authorize && !(await params.authorize())) {
-    return;
-  }
-  try {
-    await pushMessageLine(params.pushTarget, text, sendOptions);
-  } catch (err) {
-    logVerbose(`${logLabel}: ${String(err)}`);
-  }
-}
-
-async function sendLinePairingReply(params: {
-  senderId: string;
-  replyToken?: string;
-  context: LineHandlerContext;
-}): Promise<void> {
-  const { senderId, replyToken, context } = params;
-  const idLabel = (() => {
-    try {
-      return resolvePairingIdLabel("line");
-    } catch {
-      return "lineUserId";
-    }
-  })();
-  const senderIdLine = `Your ${idLabel}: ${senderId}`;
-  const sendReply = (text: string, logLabel: string) =>
-    sendLineHandlerText({
-      context,
-      text,
-      replyToken,
-      pushTarget: `line:${senderId}`,
-      logLabel,
-      onAmbiguousReplyFailure: () => markLinePairingRecoveryNeeded(senderId),
-    });
-  let upsertResult: { code: string; created: boolean } | undefined;
-  await createChannelPairingChallengeIssuer({
-    channel: "line",
-    accountId: context.account.accountId,
-    upsertPairingRequest: async ({ id, meta }) => {
-      upsertResult = await upsertChannelPairingRequest({
-        channel: "line",
-        id,
-        accountId: context.account.accountId,
-        meta,
-      });
-      return upsertResult;
-    },
-  })({
-    senderId,
-    senderIdLine,
-    onCreated: () => {
-      logVerbose(`line pairing request sender=${senderId}`);
-    },
-    sendPairingReply: async (text) =>
-      await sendReply(text, `line pairing reply failed for ${senderId}`),
-  });
-  if (upsertResult?.code && !upsertResult.created && consumeLinePairingRecovery(senderId)) {
-    await sendReply(
-      buildPairingReply({ channel: "line", idLine: senderIdLine, code: upsertResult.code }),
-      `line pairing reply re-sent for ${senderId}`,
-    );
-  }
 }
 
 function isLineEventAdmitted(access: ResolvedChannelMessageIngress): boolean {
