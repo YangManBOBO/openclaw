@@ -574,6 +574,31 @@ describe("operator role policy", () => {
     });
   });
 
+  it("treats a human creator whose id is not a user profile as having no role sandbox", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const cfg = roleConfig();
+      const guest = cfg.gateway?.roles?.definitions.guest;
+      if (!guest) {
+        throw new Error("missing guest role");
+      }
+      guest.sandbox = "required";
+
+      // A channel sender (e.g. Slack) is stamped with its channel-native id, which is not
+      // a user-profile id. Role resolution for such a creator must not throw: there is no
+      // profile to derive a sandbox restriction from, so the run proceeds like an un-roles setup.
+      expect(
+        resolveCreatorSandbox(cfg, {
+          actor: { type: "human", source: "channel", id: "U-CHANNEL-SENDER" },
+        }),
+      ).toBeUndefined();
+      expect(
+        resolveCreatorSandbox(cfg, {
+          actor: { type: "human", source: "unknown", id: "U-UNKNOWN-SENDER" },
+        }),
+      ).toBeUndefined();
+    });
+  });
+
   it("keeps owner attribution out of named roles and preserves explicit authority", () => {
     const cfg = roleConfig();
     const owner = identifiedClient(GATEWAY_OWNER_PROFILE_ID);
