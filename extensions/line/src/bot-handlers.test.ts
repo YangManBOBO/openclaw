@@ -168,6 +168,7 @@ const downloadLineMediaMock = vi.hoisted(() => vi.fn());
 const getUserDisplayNameMock = vi.hoisted(() => vi.fn(async (userId: string) => userId));
 
 vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
+  buildPairingReply: ({ code }: { code: string }) => `Pairing code: ${code}`,
   resolvePairingIdLabel: () => "lineUserId",
   readChannelAllowFromStore: readAllowFromStoreMock,
   upsertChannelPairingRequest: upsertPairingRequestMock,
@@ -857,6 +858,36 @@ describe("handleLineWebhookEvents", () => {
     );
 
     expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
+  it("re-sends the pending pairing code on a later sender message", async () => {
+    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    pairingDeliveryMocks.replyMessageLine.mockResolvedValue(undefined);
+    const event = createTestMessageEvent({
+      message: {
+        id: "pairing-pending",
+        type: "text",
+        text: "hello again",
+        quoteToken: "pairing-pending-quote",
+      },
+      source: { type: "user", userId: "pairing-user" },
+      webhookEventId: "pairing-pending-event",
+    });
+
+    await handleLineWebhookEvents(
+      [event],
+      createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
+    );
+
+    expect(upsertPairingRequestMock).toHaveBeenCalledOnce();
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+    const [, messages] = pairingDeliveryMocks.replyMessageLine.mock.calls[0] as [
+      string,
+      unknown[],
+      unknown,
+    ];
+    expect(JSON.stringify(messages)).toContain("PENDCODE");
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });
 

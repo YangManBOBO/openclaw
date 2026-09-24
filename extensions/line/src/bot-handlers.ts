@@ -19,6 +19,7 @@ import { resolveChannelGroupsConfigPath } from "openclaw/plugin-sdk/channel-poli
 import { hasControlCommand } from "openclaw/plugin-sdk/command-auth-native";
 import type { GroupPolicy, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
+  buildPairingReply,
   readChannelAllowFromStore,
   resolvePairingIdLabel,
   upsertChannelPairingRequest,
@@ -167,19 +168,23 @@ async function sendLinePairingReply(params: {
       return "lineUserId";
     }
   })();
+  const senderIdLine = `Your ${idLabel}: ${senderId}`;
+  let upsertResult: { code: string; created: boolean } | undefined;
   await createChannelPairingChallengeIssuer({
     channel: "line",
     accountId: context.account.accountId,
-    upsertPairingRequest: async ({ id, meta }) =>
-      await upsertChannelPairingRequest({
+    upsertPairingRequest: async ({ id, meta }) => {
+      upsertResult = await upsertChannelPairingRequest({
         channel: "line",
         id,
         accountId: context.account.accountId,
         meta,
-      }),
+      });
+      return upsertResult;
+    },
   })({
     senderId,
-    senderIdLine: `Your ${idLabel}: ${senderId}`,
+    senderIdLine,
     onCreated: () => {
       logVerbose(`line pairing request sender=${senderId}`);
     },
@@ -192,6 +197,19 @@ async function sendLinePairingReply(params: {
         logLabel: `line pairing reply failed for ${senderId}`,
       }),
   });
+  if (upsertResult && !upsertResult.created && upsertResult.code) {
+    await sendLineHandlerText({
+      context,
+      text: buildPairingReply({
+        channel: "line",
+        idLine: senderIdLine,
+        code: upsertResult.code,
+      }),
+      replyToken,
+      pushTarget: `line:${senderId}`,
+      logLabel: `line pairing reply re-sent for ${senderId}`,
+    });
+  }
 }
 
 function isLineEventAdmitted(access: ResolvedChannelMessageIngress): boolean {
