@@ -183,6 +183,32 @@ describe("reconcileTerminalSourceReplyDelivery", () => {
     expect(receiptMocks.complete).not.toHaveBeenCalled();
     expect(receiptMocks.cancel).not.toHaveBeenCalled();
   });
+
+  it("does not settle a Telegram source reply explicitly reported to another topic", async () => {
+    const topicMirror = {
+      ...mirror,
+      channel: "telegram",
+      sessionKey: "agent:main:telegram:group:-100123:topic:77",
+      actionParams: { target: "telegram:-100123:topic:77", message: "explicit wrong topic answer" },
+      toolContext: {
+        currentChannelProvider: "telegram",
+        currentChannelId: "telegram:-100123:topic:77",
+        currentThreadTs: "77",
+      },
+    };
+    const deliveredPayload = {
+      ok: true,
+      messageId: "outbound-1",
+      target: { id: "telegram:-100123:topic:99" },
+      receipt: { threadId: "77" },
+    };
+
+    await expect(
+      reconcileTerminalSourceReplyDelivery({ deliveredPayload, mirror: topicMirror, receipt }),
+    ).resolves.toBe("not-source");
+    expect(receiptMocks.complete).not.toHaveBeenCalled();
+    expect(receiptMocks.cancel).not.toHaveBeenCalled();
+  });
 });
 
 describe("isDeliveredCurrentSourceReply", () => {
@@ -415,6 +441,47 @@ describe("isDeliveredCurrentSourceReply with thread-qualified Telegram sources",
       }),
     ).toBe(false);
   });
+
+  it("rejects an explicitly mismatched delivered topic even when the aggregate receipt thread matches", () => {
+    expect(
+      isDeliveredCurrentSourceReply({
+        ...topicParams,
+        actionParams: { target: "telegram:-100123:topic:77", message: "topic reply" },
+        toolContext: {
+          currentChannelProvider: "telegram",
+          currentChannelId: "telegram:-100123:topic:77",
+          currentThreadTs: "77",
+        },
+        deliveredPayload: {
+          ok: true,
+          messageId: "outbound-1",
+          target: { id: "telegram:-100123:topic:99" },
+          receipt: { threadId: "77" },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a source reply whose physical part explicitly reports another topic", () => {
+    expect(
+      isDeliveredCurrentSourceReply({
+        ...topicParams,
+        actionParams: { target: "telegram:-100123:topic:77", message: "topic reply" },
+        toolContext: {
+          currentChannelProvider: "telegram",
+          currentChannelId: "telegram:-100123:topic:77",
+          currentThreadTs: "77",
+        },
+        deliveredPayload: {
+          ok: true,
+          messageId: "outbound-1",
+          chatId: "-100123",
+          parts: [{ platformMessageId: "outbound-1", channelId: "telegram:-100123:topic:99" }],
+          receipt: { threadId: "77" },
+        },
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("mirrorDeliveredSourceReplyToTranscript", () => {
@@ -558,6 +625,32 @@ describe("mirrorDeliveredSourceReplyToTranscript", () => {
         messageId: "outbound-1",
         chatId: "-100123",
         receipt: { threadId: "99" },
+      },
+    });
+
+    expect(mirrored).toBe(false);
+    expect(transcriptMocks.append).not.toHaveBeenCalled();
+  });
+
+  it("does not mirror a Telegram source reply explicitly reported to another topic", async () => {
+    transcriptMocks.append.mockClear();
+
+    const mirrored = await mirrorDeliveredSourceReplyToTranscript({
+      action: "send",
+      channel: "telegram",
+      actionParams: { target: "telegram:-100123:topic:77", message: "explicit wrong topic answer" },
+      cfg: {},
+      sessionKey: "agent:main:telegram:group:-100123:topic:77",
+      toolContext: {
+        currentChannelProvider: "telegram",
+        currentChannelId: "telegram:-100123:topic:77",
+        currentThreadTs: "77",
+      },
+      deliveredPayload: {
+        ok: true,
+        messageId: "outbound-1",
+        target: { id: "telegram:-100123:topic:99" },
+        receipt: { threadId: "77" },
       },
     });
 

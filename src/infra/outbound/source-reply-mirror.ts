@@ -402,10 +402,21 @@ function matchesDeliveredSourceTarget(
   if (matchesCurrentSourceTarget({ ...params, actionParams: { target } }, "match")) {
     return true;
   }
+  // The chat-level fallback below may only apply to recipients that lack their
+  // own thread identity. A recipient that explicitly reports a topic must be
+  // judged at full identity by the exact matcher above; erasing that suffix here
+  // could credit a delivery to another topic as a reply to the current one.
+  if (hasDeliveredSourceThreadIdentity(target)) {
+    return false;
+  }
   // Transport receipts report chat ids separately from topic ids, so a chat-only
   // delivered target must still match a thread-qualified current source. Compare
   // chat identity without provider prefixes, kind prefixes, or thread suffixes.
   return matchesDeliveredSourceChat(params, target);
+}
+
+function hasDeliveredSourceThreadIdentity(value: string): boolean {
+  return /:(?:topic|direct-topic):\d+$/i.test(value.trim());
 }
 
 function matchesDeliveredSourceChat(
