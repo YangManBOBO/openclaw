@@ -861,26 +861,32 @@ describe("handleLineWebhookEvents", () => {
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });
 
-  it("re-sends the pending pairing code on a later sender message", async () => {
-    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
-    pairingDeliveryMocks.replyMessageLine.mockResolvedValue(undefined);
-    const event = createTestMessageEvent({
-      message: {
-        id: "pairing-pending",
-        type: "text",
-        text: "hello again",
-        quoteToken: "pairing-pending-quote",
-      },
-      source: { type: "user", userId: "pairing-user" },
-      webhookEventId: "pairing-pending-event",
-    });
+  it("re-sends the pending pairing code once after an ambiguous first delivery", async () => {
+    const senderId = "pairing-recovery-user";
+    const event = (id: string, text: string) =>
+      createTestMessageEvent({
+        message: { id, type: "text", text, quoteToken: `${id}-quote` },
+        source: { type: "user", userId: senderId },
+        webhookEventId: `${id}-event`,
+      });
 
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(new TypeError("fetch failed"));
     await handleLineWebhookEvents(
-      [event],
+      [event("pairing-first", "hi")],
+      createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
+    );
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+
+    pairingDeliveryMocks.invokePairingReply = false;
+    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
+    await handleLineWebhookEvents(
+      [event("pairing-pending", "hello again")],
       createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
     );
 
-    expect(upsertPairingRequestMock).toHaveBeenCalledOnce();
+    expect(upsertPairingRequestMock).toHaveBeenCalledTimes(2);
     expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
     const [, messages] = pairingDeliveryMocks.replyMessageLine.mock.calls[0] as [
       string,
@@ -888,6 +894,60 @@ describe("handleLineWebhookEvents", () => {
       unknown,
     ];
     expect(JSON.stringify(messages)).toContain("PENDCODE");
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
+  it("does not re-send the pairing code when the first delivery succeeded", async () => {
+    const senderId = "pairing-success-user";
+    const event = (id: string) =>
+      createTestMessageEvent({
+        message: { id, type: "text", text: "hi", quoteToken: `${id}-quote` },
+        source: { type: "user", userId: senderId },
+        webhookEventId: `${id}-event`,
+      });
+
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockResolvedValue(undefined);
+    await handleLineWebhookEvents(
+      [event("pairing-first")],
+      createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
+    );
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+
+    pairingDeliveryMocks.invokePairingReply = false;
+    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    await handleLineWebhookEvents(
+      [event("pairing-pending")],
+      createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" }),
+    );
+
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledTimes(1);
+    expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
+  });
+
+  it("re-sends the pending pairing code only once", async () => {
+    const senderId = "pairing-once-user";
+    const event = (id: string) =>
+      createTestMessageEvent({
+        message: { id, type: "text", text: "hi", quoteToken: `${id}-quote` },
+        source: { type: "user", userId: senderId },
+        webhookEventId: `${id}-event`,
+      });
+    const context = createLineWebhookTestContext({ processMessage: vi.fn(), dmPolicy: "pairing" });
+
+    pairingDeliveryMocks.invokePairingReply = true;
+    pairingDeliveryMocks.replyMessageLine.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await handleLineWebhookEvents([event("pairing-first")], context);
+
+    pairingDeliveryMocks.invokePairingReply = false;
+    upsertPairingRequestMock.mockResolvedValue({ code: "PENDCODE", created: false });
+    pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
+    await handleLineWebhookEvents([event("pairing-second")], context);
+    expect(pairingDeliveryMocks.replyMessageLine).toHaveBeenCalledOnce();
+
+    pairingDeliveryMocks.replyMessageLine.mockReset().mockResolvedValue(undefined);
+    await handleLineWebhookEvents([event("pairing-third")], context);
+    expect(pairingDeliveryMocks.replyMessageLine).not.toHaveBeenCalled();
     expect(pairingDeliveryMocks.pushMessageLine).not.toHaveBeenCalled();
   });
 

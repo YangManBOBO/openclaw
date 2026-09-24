@@ -56,6 +56,7 @@ import { reserveLineGroupHistory } from "./group-history.js";
 import { resolveLineGroupConfigEntry } from "./group-keys.js";
 import { hasAnyLineMention, isLineBotMentioned } from "./mentions.js";
 import { quotesLineBotMessage } from "./outbound-message-log.js";
+import { consumeLinePairingRecovery, markLinePairingRecoveryNeeded } from "./pairing-recovery.js";
 import { parseLineQuestionPostbackData, resolveLineQuestionPostback } from "./question-postback.js";
 import { getLineRuntime } from "./runtime.js";
 import { canFallbackAfterLineReplyFailure } from "./send-retry.js";
@@ -123,6 +124,8 @@ async function sendLineHandlerText(params: {
   pushTarget: string;
   logLabel: string;
   authorize?: () => boolean | Promise<boolean>;
+  /** Called when the reply failed ambiguously and no duplicate push was sent. */
+  onAmbiguousReplyFailure?: () => void;
 }): Promise<void> {
   const { context, logLabel, text } = params;
   const sendOptions = {
@@ -141,6 +144,9 @@ async function sendLineHandlerText(params: {
     } catch (err) {
       logVerbose(`${logLabel}: ${String(err)}`);
       if (isChannelPartialDeliveryError(err) || !canFallbackAfterLineReplyFailure(err)) {
+        if (!isChannelPartialDeliveryError(err)) {
+          params.onAmbiguousReplyFailure?.();
+        }
         return;
       }
     }
@@ -169,6 +175,15 @@ async function sendLinePairingReply(params: {
     }
   })();
   const senderIdLine = `Your ${idLabel}: ${senderId}`;
+  const sendReply = (text: string, logLabel: string) =>
+    sendLineHandlerText({
+      context,
+      text,
+      replyToken,
+      pushTarget: `line:${senderId}`,
+      logLabel,
+      onAmbiguousReplyFailure: () => markLinePairingRecoveryNeeded(senderId),
+    });
   let upsertResult: { code: string; created: boolean } | undefined;
   await createChannelPairingChallengeIssuer({
     channel: "line",
@@ -189,26 +204,13 @@ async function sendLinePairingReply(params: {
       logVerbose(`line pairing request sender=${senderId}`);
     },
     sendPairingReply: async (text) =>
-      await sendLineHandlerText({
-        context,
-        text,
-        replyToken,
-        pushTarget: `line:${senderId}`,
-        logLabel: `line pairing reply failed for ${senderId}`,
-      }),
+      await sendReply(text, `line pairing reply failed for ${senderId}`),
   });
-  if (upsertResult && !upsertResult.created && upsertResult.code) {
-    await sendLineHandlerText({
-      context,
-      text: buildPairingReply({
-        channel: "line",
-        idLine: senderIdLine,
-        code: upsertResult.code,
-      }),
-      replyToken,
-      pushTarget: `line:${senderId}`,
-      logLabel: `line pairing reply re-sent for ${senderId}`,
-    });
+  if (upsertResult?.code && !upsertResult.created && consumeLinePairingRecovery(senderId)) {
+    await sendReply(
+      buildPairingReply({ channel: "line", idLine: senderIdLine, code: upsertResult.code }),
+      `line pairing reply re-sent for ${senderId}`,
+    );
   }
 }
 
