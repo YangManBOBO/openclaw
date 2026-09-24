@@ -457,6 +457,7 @@ function matchesDeliveredSourceChat(
   if (currentTargets.length === 0) {
     return false;
   }
+  // SAFETY: params.channel is a configured channel id within this mirror scope.
   const plugin = getChannelPlugin(params.channel as ChannelId);
   const deliveredNormalized = normalizeTargetForProvider(params.channel, target, plugin);
   if (!deliveredNormalized) {
