@@ -209,6 +209,35 @@ describe("reconcileTerminalSourceReplyDelivery", () => {
     expect(receiptMocks.complete).not.toHaveBeenCalled();
     expect(receiptMocks.cancel).not.toHaveBeenCalled();
   });
+
+  it("does not settle a chat-only source reply whose physical part reports a conflicting thread", async () => {
+    const topicMirror = {
+      ...mirror,
+      channel: "telegram",
+      sessionKey: "agent:main:telegram:group:-100123:topic:77",
+      actionParams: { target: "telegram:-100123:topic:77", message: "conflicting part answer" },
+      toolContext: {
+        currentChannelProvider: "telegram",
+        currentChannelId: "telegram:-100123:topic:77",
+        currentThreadTs: "77",
+      },
+    };
+    const deliveredPayload = {
+      ok: true,
+      messageId: "outbound-1",
+      chatId: "-100123",
+      receipt: {
+        threadId: "77",
+        parts: [{ platformMessageId: "outbound-1", kind: "text", index: 0, threadId: "99" }],
+      },
+    };
+
+    await expect(
+      reconcileTerminalSourceReplyDelivery({ deliveredPayload, mirror: topicMirror, receipt }),
+    ).resolves.toBe("not-source");
+    expect(receiptMocks.complete).not.toHaveBeenCalled();
+    expect(receiptMocks.cancel).not.toHaveBeenCalled();
+  });
 });
 
 describe("isDeliveredCurrentSourceReply", () => {
@@ -481,6 +510,52 @@ describe("isDeliveredCurrentSourceReply with thread-qualified Telegram sources",
         },
       }),
     ).toBe(false);
+  });
+
+  it("rejects a chat-only source reply whose physical part reports a conflicting thread", () => {
+    expect(
+      isDeliveredCurrentSourceReply({
+        ...topicParams,
+        actionParams: { target: "telegram:-100123:topic:77", message: "topic reply" },
+        toolContext: {
+          currentChannelProvider: "telegram",
+          currentChannelId: "telegram:-100123:topic:77",
+          currentThreadTs: "77",
+        },
+        deliveredPayload: {
+          ok: true,
+          messageId: "outbound-1",
+          chatId: "-100123",
+          receipt: {
+            threadId: "77",
+            parts: [{ platformMessageId: "outbound-1", kind: "text", index: 0, threadId: "99" }],
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts a chat-only source reply whose physical parts all report the current thread", () => {
+    expect(
+      isDeliveredCurrentSourceReply({
+        ...topicParams,
+        actionParams: { target: "telegram:-100123:topic:77", message: "topic reply" },
+        toolContext: {
+          currentChannelProvider: "telegram",
+          currentChannelId: "telegram:-100123:topic:77",
+          currentThreadTs: "77",
+        },
+        deliveredPayload: {
+          ok: true,
+          messageId: "outbound-1",
+          chatId: "-100123",
+          receipt: {
+            threadId: "77",
+            parts: [{ platformMessageId: "outbound-1", kind: "text", index: 0, threadId: "77" }],
+          },
+        },
+      }),
+    ).toBe(true);
   });
 });
 
