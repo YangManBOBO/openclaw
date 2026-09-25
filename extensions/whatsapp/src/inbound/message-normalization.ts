@@ -30,7 +30,7 @@ export type WhatsAppNormalizedInboundMessage = {
  * mapping. Unlike a genuine non-message, this is recoverable: the durable
  * ingress drain retries identity preparation instead of completing the claim.
  */
-export class WhatsAppIngressIdentityUnavailableError extends Error {
+class WhatsAppIngressIdentityUnavailableError extends Error {
   constructor(jid: string) {
     super(`WhatsApp inbound sender identity unavailable for ${jid}`);
     this.name = "WhatsAppIngressIdentityUnavailableError";
