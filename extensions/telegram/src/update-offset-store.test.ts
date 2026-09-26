@@ -210,7 +210,7 @@ describe("deleteTelegramUpdateOffset", () => {
     });
   });
 
-  it("returns null when the plugin-state read fails", async () => {
+  it("surfaces plugin-state read failures instead of treating them as absent", async () => {
     await withStateDirEnv("openclaw-tg-offset-", async () => {
       installStore({
         ...createPluginStateKeyedStoreForTests<unknown>("telegram", {
@@ -222,7 +222,12 @@ describe("deleteTelegramUpdateOffset", () => {
         },
       });
 
-      expect(await readTelegramUpdateOffset({ accountId: "primary" })).toBeNull();
+      // A transient read failure must not look like a fresh account: the caller
+      // would otherwise overwrite a valid saved offset with a null marker and
+      // replay from the beginning.
+      await expect(readTelegramUpdateOffset({ accountId: "primary" })).rejects.toThrow(
+        /failed to read update offset/i,
+      );
     });
   });
 

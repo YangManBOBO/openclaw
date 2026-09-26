@@ -12,7 +12,7 @@ import {
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, describe, expect, it } from "vitest";
-import { setTelegramRuntime } from "./runtime.js";
+import { setTelegramRuntime, getTelegramRuntime } from "./runtime.js";
 import { clearTelegramRuntimeForTest } from "./runtime.test-support.js";
 import {
   openTelegramIngressQueue,
@@ -191,6 +191,58 @@ describe("telegram ingress spool bot rotation", () => {
       expect(rotations).toEqual(["bot-id-changed"]);
       expect(await queue.listPending({ limit: "all" })).toEqual([]);
       expect((await queue.enqueue(telegramQueueEventId(1), {} as never)).kind).toBe("accepted");
+    });
+  });
+
+  it("keeps the stale offset when the spool purge fails so rotation stays retryable", async () => {
+    await withRotationState(async (stateDir, spoolDir) => {
+      const env = { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv;
+      await writeTelegramUpdateOffset({
+        accountId: "default",
+        updateId: 1500,
+        botToken: BOT_A_TOKEN,
+      });
+
+      // A failing spool purge must not delete the offset: the old-bot identity
+      // has to survive so the next restart re-detects the rotation and retries.
+      const originalOpen = getTelegramRuntime().state.openChannelIngressQueue;
+      getTelegramRuntime().state.openChannelIngressQueue = (() => {
+        const queue = createChannelIngressQueue<unknown>({
+          channelId: "telegram",
+          accountId: "default",
+          stateDir,
+        });
+        return {
+          ...queue,
+          clear: async () => {
+            throw new Error("spool unavailable");
+          },
+        };
+      }) as never;
+
+      try {
+        await expect(
+          applyTelegramRotationCleanup(
+            {
+              reason: "bot-id-changed",
+              previousBotId: "111111",
+              currentBotId: "222222",
+              staleLastUpdateId: 1500,
+            },
+            { accountId: "default", env },
+          ),
+        ).rejects.toThrow(/stale ingress spool/i);
+
+        // The offset still names bot A, so a restart re-detects the switch.
+        const offset = await readTelegramUpdateOffset({
+          accountId: "default",
+          botToken: BOT_A_TOKEN,
+          env,
+        });
+        expect(offset).toBe(1500);
+      } finally {
+        getTelegramRuntime().state.openChannelIngressQueue = originalOpen;
+      }
     });
   });
 });

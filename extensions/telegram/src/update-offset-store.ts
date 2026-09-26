@@ -133,8 +133,11 @@ export async function readTelegramUpdateOffset(params: {
   let storedValue: unknown;
   try {
     storedValue = await openUpdateOffsetStore(params.env).lookup(key);
-  } catch {
-    storedValue = undefined;
+  } catch (err) {
+    // A failed read is not the same as an absent offset: the caller must not
+    // mistake a transient read failure for a fresh account and overwrite saved
+    // state with a null-offset marker (which would replay from the beginning).
+    throw new Error(`telegram: failed to read update offset: ${String(err)}`);
   }
   const parsed = safeParseState(storedValue);
   if (!parsed) {
@@ -195,7 +198,7 @@ export async function recordTelegramAccountBotIdentity(params: {
     tokenFingerprint: fingerprintFromToken(params.botToken),
   };
   await openUpdateOffsetStore(params.env).register(
-    normalizeTelegramUpdateOffsetAccountId(params.accountId),
+    normalizeTelegramStateAccountId(params.accountId),
     payload,
   );
 }
@@ -220,11 +223,10 @@ export async function applyTelegramRotationCleanup(
   options: TelegramRotationCleanupOptions = {},
 ): Promise<void> {
   const failures: string[] = [];
-  try {
-    await deleteTelegramUpdateOffset({ accountId: options.accountId, env: options.env });
-  } catch (err) {
-    failures.push(`stale update offset: ${String(err)}`);
-  }
+  // Purge the previous bot's spooled rows BEFORE discarding the offset. If the
+  // purge fails, the stale offset (with its old-bot identity) must survive so a
+  // restart re-detects the rotation and retries; deleting the offset first
+  // would drop that retry signal and leave old rows colliding with the new bot.
   if (info.reason === "bot-id-changed") {
     try {
       const removed = await clearTelegramIngressSpool({
@@ -234,6 +236,13 @@ export async function applyTelegramRotationCleanup(
       await options.onSpoolPurged?.(removed);
     } catch (err) {
       failures.push(`stale ingress spool: ${String(err)}`);
+    }
+  }
+  if (failures.length === 0) {
+    try {
+      await deleteTelegramUpdateOffset({ accountId: options.accountId, env: options.env });
+    } catch (err) {
+      failures.push(`stale update offset: ${String(err)}`);
     }
   }
   if (failures.length > 0) {

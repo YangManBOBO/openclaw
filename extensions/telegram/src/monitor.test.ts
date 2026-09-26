@@ -37,6 +37,8 @@ vi.mock("./update-offset-store.js", () => ({
   readTelegramUpdateOffset: mocks.readOffset,
   writeTelegramUpdateOffset: mocks.writeOffset,
   deleteTelegramUpdateOffset: mocks.deleteOffset,
+  applyTelegramRotationCleanup: vi.fn(async () => {}),
+  recordTelegramAccountBotIdentity: vi.fn(async () => {}),
 }));
 vi.mock("./webhook.js", () => ({ startTelegramWebhook: mocks.startWebhook }));
 vi.mock("./fetch.js", () => ({

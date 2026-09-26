@@ -153,22 +153,16 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       botToken: token,
       onRotationDetected: async (info) => {
         log(formatTelegramOffsetRotationMessage(account.accountId, info));
-        try {
-          await applyTelegramRotationCleanup(info, {
-            accountId: account.accountId,
-            onSpoolPurged: (removed) => {
-              if (removed > 0) {
-                log(
-                  `[telegram] Discarded ${removed} stale spooled update(s) for account "${account.accountId}" after bot identity change.`,
-                );
-              }
-            },
-          });
-        } catch (err) {
-          logError(
-            `telegram: failed to discard stale update state after bot rotation: ${String(err)}`,
-          );
-        }
+        await applyTelegramRotationCleanup(info, {
+          accountId: account.accountId,
+          onSpoolPurged: (removed) => {
+            if (removed > 0) {
+              log(
+                `[telegram] Discarded ${removed} stale spooled update(s) for account "${account.accountId}" after bot identity change.`,
+              );
+            }
+          },
+        });
       },
     });
     const lastUpdateId = normalizeTelegramUpdateId(persistedOffsetRaw);
