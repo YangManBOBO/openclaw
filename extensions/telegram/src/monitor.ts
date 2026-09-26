@@ -19,6 +19,7 @@ import {
 } from "./update-offset-persistence.js";
 import {
   applyTelegramRotationCleanup,
+  recordTelegramAccountBotIdentity,
   type TelegramOffsetRotationReason,
   type TelegramUpdateOffsetRotationInfo,
 } from "./update-offset-store.js";
@@ -35,7 +36,9 @@ function formatTelegramOffsetRotationMessage(
 ): string {
   const previousLabel = info.previousBotId ?? "(legacy unscoped offset)";
   const reasonLabel = TELEGRAM_OFFSET_ROTATION_LABELS[info.reason];
-  return `[telegram] Detected ${reasonLabel} for account "${accountId}" (was ${previousLabel}, now ${info.currentBotId}); discarding stale update offset ${info.staleLastUpdateId} and starting fresh.`;
+  const staleOffset =
+    info.staleLastUpdateId === null ? "(none saved)" : String(info.staleLastUpdateId);
+  return `[telegram] Detected ${reasonLabel} for account "${accountId}" (was ${previousLabel}, now ${info.currentBotId}); discarding stale update offset ${staleOffset} and starting fresh.`;
 }
 
 const loadTelegramMonitorPollingRuntime = createLazyRuntimeModule(
@@ -173,6 +176,13 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       log(
         `[telegram] Ignoring invalid persisted update offset (${String(persistedOffsetRaw)}); starting without offset confirmation.`,
       );
+    }
+    if (persistedOffsetRaw === null) {
+      // Ingress admission commits before the offset write is scheduled, so a
+      // crash can leave old-bot rows without offset state. Record which bot the
+      // account uses so a later switch is still detected (and the stale spool
+      // purged) even though no offset was ever persisted.
+      await recordTelegramAccountBotIdentity({ accountId: account.accountId, botToken: token });
     }
 
     const offsetPersistence = createTelegramUpdateOffsetPersistence({

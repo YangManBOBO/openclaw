@@ -12,6 +12,7 @@ import type { TelegramRuntime } from "./runtime.types.js";
 import {
   deleteTelegramUpdateOffset,
   readTelegramUpdateOffset,
+  recordTelegramAccountBotIdentity,
   writeTelegramUpdateOffset,
 } from "./update-offset-store.js";
 
@@ -157,6 +158,55 @@ describe("deleteTelegramUpdateOffset", () => {
           staleLastUpdateId: 777,
         },
       ]);
+    });
+  });
+
+  it("detects a bot identity change from the marker when no offset was saved", async () => {
+    await withStateDirEnv("openclaw-tg-offset-", async () => {
+      await recordTelegramAccountBotIdentity({
+        accountId: "default",
+        botToken: "111111:token-a",
+      });
+
+      const rotations: Array<Record<string, unknown>> = [];
+      const offset = await readTelegramUpdateOffset({
+        accountId: "default",
+        botToken: "222222:token-b",
+        onRotationDetected: (info) => {
+          rotations.push({ ...info });
+        },
+      });
+
+      expect(offset).toBeNull();
+      expect(rotations).toEqual([
+        {
+          reason: "bot-id-changed",
+          previousBotId: "111111",
+          currentBotId: "222222",
+          staleLastUpdateId: null,
+        },
+      ]);
+    });
+  });
+
+  it("keeps the marker from triggering rotation for the same bot", async () => {
+    await withStateDirEnv("openclaw-tg-offset-", async () => {
+      await recordTelegramAccountBotIdentity({
+        accountId: "default",
+        botToken: "111111:token-a",
+      });
+
+      const rotations: Array<Record<string, unknown>> = [];
+      const offset = await readTelegramUpdateOffset({
+        accountId: "default",
+        botToken: "111111:token-a",
+        onRotationDetected: (info) => {
+          rotations.push({ ...info });
+        },
+      });
+
+      expect(offset).toBeNull();
+      expect(rotations).toEqual([]);
     });
   });
 

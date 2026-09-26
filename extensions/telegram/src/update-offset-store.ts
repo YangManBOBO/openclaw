@@ -86,7 +86,7 @@ export type TelegramUpdateOffsetRotationInfo = {
   reason: TelegramOffsetRotationReason;
   previousBotId: string | null;
   currentBotId: string;
-  staleLastUpdateId: number;
+  staleLastUpdateId: number | null;
 };
 
 function rotationForToken(
@@ -94,7 +94,13 @@ function rotationForToken(
   botToken?: string,
 ): TelegramUpdateOffsetRotationInfo | null {
   const currentBotId = extractBotIdFromToken(botToken);
-  if (!currentBotId || parsed.lastUpdateId === null) {
+  if (!currentBotId) {
+    return null;
+  }
+  // A marker row (no saved offset yet) still records the previous bot identity,
+  // so a switch is detectable even when queue admission preceded any offset
+  // write. Only bail when there is nothing to compare: no offset and no bot.
+  if (parsed.lastUpdateId === null && parsed.botId === null) {
     return null;
   }
   let reason: TelegramOffsetRotationReason | null = null;
@@ -168,6 +174,30 @@ export async function deleteTelegramUpdateOffset(params: {
   env?: NodeJS.ProcessEnv;
 }): Promise<void> {
   await openUpdateOffsetStore(params.env).delete(normalizeTelegramStateAccountId(params.accountId));
+}
+
+/**
+ * Record which bot the account is currently using even when no update offset has
+ * been saved yet. Ingress admission commits to the durable queue before the
+ * offset write is scheduled, so a crash can leave old-bot rows without any
+ * offset state; the marker lets a later bot switch be detected from the queue's
+ * bot identity instead of requiring a completed offset write.
+ */
+export async function recordTelegramAccountBotIdentity(params: {
+  accountId?: string;
+  botToken?: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const payload: TelegramUpdateOffsetState = {
+    version: STORE_VERSION,
+    lastUpdateId: null,
+    botId: extractBotIdFromToken(params.botToken),
+    tokenFingerprint: fingerprintFromToken(params.botToken),
+  };
+  await openUpdateOffsetStore(params.env).register(
+    normalizeTelegramUpdateOffsetAccountId(params.accountId),
+    payload,
+  );
 }
 
 export type TelegramRotationCleanupOptions = {

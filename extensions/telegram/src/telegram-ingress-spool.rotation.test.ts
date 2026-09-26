@@ -23,6 +23,7 @@ import { writeTelegramSpooledUpdate } from "./telegram-ingress-spool.test-suppor
 import {
   applyTelegramRotationCleanup,
   readTelegramUpdateOffset,
+  recordTelegramAccountBotIdentity,
   writeTelegramUpdateOffset,
 } from "./update-offset-store.js";
 
@@ -157,6 +158,39 @@ describe("telegram ingress spool bot rotation", () => {
       expect(offset).toBeNull();
       expect(rotations).toEqual(["token-rotated"]);
       expect((await queue.enqueue(telegramQueueEventId(7), {} as never)).kind).toBe("completed");
+    });
+  });
+
+  it("purges the spool when the bot switches before any offset was saved", async () => {
+    await withRotationState(async (stateDir, spoolDir) => {
+      const env = { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv;
+      // Bot A admitted updates but crashed before the offset write; only the
+      // account bot-identity marker is persisted (lastUpdateId null).
+      await recordTelegramAccountBotIdentity({
+        accountId: "default",
+        botToken: BOT_A_TOKEN,
+      });
+      const queue = openTelegramIngressQueue(spoolDir);
+      await writeTelegramSpooledUpdate({ spoolDir, update: botMessage(1, "old") });
+      await queue.complete(telegramQueueEventId(1));
+      expect((await queue.enqueue(telegramQueueEventId(1), {} as never)).kind).toBe("completed");
+
+      // A different bot starts with no saved offset: the marker still identifies
+      // the previous bot, so the stale spool is purged before polling.
+      const rotations: string[] = [];
+      const offset = await readTelegramUpdateOffset({
+        accountId: "default",
+        botToken: BOT_B_TOKEN,
+        env,
+        onRotationDetected: async (info) => {
+          rotations.push(info.reason);
+          await applyTelegramRotationCleanup(info, { accountId: "default", env });
+        },
+      });
+      expect(offset).toBeNull();
+      expect(rotations).toEqual(["bot-id-changed"]);
+      expect(await queue.listPending({ limit: "all" })).toEqual([]);
+      expect((await queue.enqueue(telegramQueueEventId(1), {} as never)).kind).toBe("accepted");
     });
   });
 });
