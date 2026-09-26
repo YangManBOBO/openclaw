@@ -17,9 +17,10 @@ import {
   createTelegramUpdateOffsetPersistence,
   normalizeTelegramUpdateId,
 } from "./update-offset-persistence.js";
-import type {
-  TelegramOffsetRotationReason,
-  TelegramUpdateOffsetRotationInfo,
+import {
+  applyTelegramRotationCleanup,
+  type TelegramOffsetRotationReason,
+  type TelegramUpdateOffsetRotationInfo,
 } from "./update-offset-store.js";
 
 const TELEGRAM_OFFSET_ROTATION_LABELS: Record<TelegramOffsetRotationReason, string> = {
@@ -113,12 +114,8 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
     return;
   }
 
-  const {
-    TelegramPollingSession,
-    deleteTelegramUpdateOffset,
-    readTelegramUpdateOffset,
-    writeTelegramUpdateOffset,
-  } = await loadTelegramMonitorPollingRuntime();
+  const { TelegramPollingSession, readTelegramUpdateOffset, writeTelegramUpdateOffset } =
+    await loadTelegramMonitorPollingRuntime();
 
   const pollingLease = await acquireTelegramPollingLease({
     token,
@@ -154,9 +151,20 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       onRotationDetected: async (info) => {
         log(formatTelegramOffsetRotationMessage(account.accountId, info));
         try {
-          await deleteTelegramUpdateOffset({ accountId: account.accountId });
+          await applyTelegramRotationCleanup(info, {
+            accountId: account.accountId,
+            onSpoolPurged: (removed) => {
+              if (removed > 0) {
+                log(
+                  `[telegram] Discarded ${removed} stale spooled update(s) for account "${account.accountId}" after bot identity change.`,
+                );
+              }
+            },
+          });
         } catch (err) {
-          logError(`telegram: failed to delete stale update offset after rotation: ${String(err)}`);
+          logError(
+            `telegram: failed to discard stale update state after bot rotation: ${String(err)}`,
+          );
         }
       },
     });

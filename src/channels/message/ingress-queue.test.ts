@@ -582,6 +582,51 @@ describe("channel ingress queue", () => {
     });
   });
 
+  it("clears every durable row and lets matching event ids be re-accepted", async () => {
+    await withTempState(async (stateDir) => {
+      const queue = createTestIngressQueue<{ text: string }>(stateDir, { now: () => 10 });
+
+      await queue.enqueue("pending-1", { text: "pending" });
+      await queue.enqueue("completed-1", { text: "completed" });
+      await queue.complete("completed-1", { completedAt: 15 });
+      await queue.enqueue("claimed-1", { text: "claimed" });
+      const claimed = await queue.claim("claimed-1", { ownerId: "worker" });
+      if (!claimed) {
+        throw new Error("Expected a claimed ingress event");
+      }
+      await queue.enqueue("failed-1", { text: "poison" });
+      await queue.fail("failed-1", { reason: "poison", message: "bad", failedAt: 15 });
+
+      // A previously completed event id must no longer deduplicate after clear().
+      expect(await queue.enqueue("completed-1", { text: "replayed" })).toMatchObject({
+        kind: "completed",
+        duplicate: true,
+      });
+
+      expect(await queue.clear?.()).toBe(4);
+      expect(await queue.listPending()).toEqual([]);
+      expect(await queue.listClaims()).toEqual([]);
+      expect(await queue.listFailed?.({ limit: "all" })).toEqual([]);
+
+      const readded = await queue.enqueue("completed-1", { text: "new bot" });
+      expect(readded.kind).toBe("accepted");
+      if (readded.kind !== "accepted") {
+        throw new Error(`Expected accepted after clear, got ${readded.kind}`);
+      }
+      expect(readded.record.payload).toEqual({ text: "new bot" });
+
+      // clear() only removes this queue's rows, not sibling account scopes.
+      const sibling = createChannelIngressQueue<{ text: string }>({
+        channelId: "test",
+        accountId: "other",
+        stateDir,
+      });
+      await sibling.enqueue("kept", { text: "other account" });
+      expect(await queue.clear?.()).toBe(1);
+      expect((await sibling.listPending()).map((record) => record.id)).toEqual(["kept"]);
+    });
+  });
+
   describe("corrupt JSON resilience", () => {
     function insertCorruptRow(
       stateDir: string,

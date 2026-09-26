@@ -196,6 +196,15 @@ export type ChannelIngressQueue<TPayload, TMetadata = unknown, TCompletedMetadat
       | ChannelIngressQueueRecord<TPayload, TMetadata>
       | ChannelIngressQueueClaimRef,
   ): Promise<boolean>;
+  /**
+   * Remove every durable row (pending, claimed, completed, failed) for this
+   * queue. Used when a channel account's identity resets (for example a
+   * Telegram bot rotation reuses the same update_id space), so stale rows from
+   * the previous identity cannot deduplicate the new identity's events.
+   * Returns the number of rows removed. Optional so existing external queue
+   * test doubles remain compatible.
+   */
+  clear?(): Promise<number>;
   recoverStaleClaims(options?: {
     staleMs?: number;
     now?: number;
@@ -1293,6 +1302,26 @@ export function createChannelIngressQueue<
     );
   };
 
+  const clearQueue: ChannelIngressQueue<
+    TPayload,
+    TMetadata,
+    TCompletedMetadata
+  >["clear"] = async () => {
+    const database = openChannelIngressDatabase(options.stateDir);
+    return runOpenClawStateWriteTransaction(
+      (tx) => {
+        const result = executeSqliteQuerySync(
+          tx.db,
+          getChannelIngressKysely(tx.db)
+            .deleteFrom("channel_ingress_events")
+            .where("queue_name", "=", queueName),
+        );
+        return affectedRows(result);
+      },
+      { path: database.path },
+    );
+  };
+
   const prune: ChannelIngressQueue<TPayload, TMetadata, TCompletedMetadata>["prune"] = async (
     pruneOptions,
   ) => {
@@ -1415,6 +1444,7 @@ export function createChannelIngressQueue<
     fail,
     resubmit,
     delete: deleteEntry,
+    clear: clearQueue,
     recoverStaleClaims,
     prune,
   };

@@ -307,6 +307,13 @@ function guardIngressQueueMutations<TPayload, TMetadata, TCompletedMetadata>(
       return resubmit(...args);
     };
   }
+  const clear = queue.clear?.bind(queue);
+  if (clear) {
+    guarded.clear = (...args) => {
+      assertCurrent();
+      return clear(...args);
+    };
+  }
   return guarded;
 }
 

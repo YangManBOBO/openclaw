@@ -1,6 +1,7 @@
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { getTelegramRuntime } from "./runtime.js";
 import { normalizeTelegramStateAccountId } from "./state-account-id.js";
+import { clearTelegramIngressSpool } from "./telegram-ingress-spool.js";
 import {
   fingerprintTelegramBotToken,
   resolveTelegramBotUserIdFromToken,
@@ -167,4 +168,45 @@ export async function deleteTelegramUpdateOffset(params: {
   env?: NodeJS.ProcessEnv;
 }): Promise<void> {
   await openUpdateOffsetStore(params.env).delete(normalizeTelegramStateAccountId(params.accountId));
+}
+
+export type TelegramRotationCleanupOptions = {
+  accountId?: string;
+  env?: NodeJS.ProcessEnv;
+  onSpoolPurged?: (removed: number) => void | Promise<void>;
+};
+
+/**
+ * Discard the state that belongs to the previous bot identity after a rotation:
+ * the stale update offset and, on a bot identity change, the previous bot's
+ * spooled ingress rows. A new bot restarts its update_id sequence at low values
+ * while the account-scoped ingress queue still holds the old bot's tombstones;
+ * purging them prevents the new bot's first updates from being silently dropped
+ * as duplicates. A same-bot token rotation keeps the spool intact so its dedup
+ * still guards the post-reset replay window.
+ */
+export async function applyTelegramRotationCleanup(
+  info: TelegramUpdateOffsetRotationInfo,
+  options: TelegramRotationCleanupOptions = {},
+): Promise<void> {
+  const failures: string[] = [];
+  try {
+    await deleteTelegramUpdateOffset({ accountId: options.accountId, env: options.env });
+  } catch (err) {
+    failures.push(`stale update offset: ${String(err)}`);
+  }
+  if (info.reason === "bot-id-changed") {
+    try {
+      const removed = await clearTelegramIngressSpool({
+        accountId: options.accountId,
+        env: options.env,
+      });
+      await options.onSpoolPurged?.(removed);
+    } catch (err) {
+      failures.push(`stale ingress spool: ${String(err)}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(failures.join("; "));
+  }
 }

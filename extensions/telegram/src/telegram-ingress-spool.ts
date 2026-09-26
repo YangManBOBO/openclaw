@@ -75,3 +75,24 @@ export function openTelegramIngressQueue(
 export function resolveSpooledUpdatePersistenceRetryDelayMs(attempt: number): number {
   return computeBackoff(TELEGRAM_SPOOLED_COMPLETION_RETRY_POLICY, attempt);
 }
+
+/**
+ * Purge every durable row for the account's Telegram ingress queue.
+ *
+ * A bot identity change reuses the same per-account queue but resets the bot's
+ * update_id sequence to low values. Without a purge, the new bot's first updates
+ * collide with the previous bot's completed/pending/failed tombstone rows and are
+ * silently deduplicated (dropped). Rotation already discards the stale update
+ * offset; the spooled rows must be discarded with it.
+ */
+export async function clearTelegramIngressSpool(params: {
+  accountId?: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<number> {
+  const spoolDir = resolveTelegramIngressSpoolDir(params);
+  const queue = openTelegramIngressQueue(spoolDir);
+  if (queue.clear === undefined) {
+    return 0;
+  }
+  return queue.clear();
+}
