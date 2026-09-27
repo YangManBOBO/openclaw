@@ -45,7 +45,7 @@ Who is admitted, how messages route to sessions, and which chats can write confi
     Group routing under `groupPolicy: "allowlist"` runs **two** gates back-to-back:
 
     1. **Sender allowlist** (`channels.imessage.groupAllowFrom`) — handle, `accessGroup:<name>`, `chat_guid`, `chat_identifier`, or `chat_id`. An empty effective list (no `groupAllowFrom` and no `allowFrom` fallback) blocks every group sender.
-    2. **Group registry** (`channels.imessage.groups`) — enforced once the map has entries: the chat must match an explicit per-`chat_id` entry or a `groups: { "*": { ... } }` wildcard. When `groups` is empty or missing, the sender allowlist alone decides admission.
+    2. **Group registry** (`channels.imessage.groups`) — enforced once the map has entries: the chat must match an explicit per-`chat_id` entry or a `groups: { "*": { ... } }` wildcard. When `groups` is empty or missing, the sender allowlist alone decides admission. The registry key is the resolved group anchor: a numeric `chat_id` when present, otherwise the `chat_guid` or `chat_identifier` the bridge emitted (see the anchor fallback note under *Sessions and deterministic replies*). A `"*"` wildcard covers every anchor shape.
 
     If no effective group sender allowlist is configured, every group message is dropped before the registry gate. Each gate has its own `warn`-level signal at the default log level, and each names a different fix:
 
@@ -140,6 +140,10 @@ Who is admitted, how messages route to sessions, and which chats can write confi
     - With default `session.dmScope=main`, iMessage DMs collapse into the agent main session.
     - Group sessions are isolated (`agent:<agentId>:imessage:group:<chat_id>`).
     - Replies route back to iMessage using originating channel/target metadata.
+
+    Group anchor fallback:
+
+    Some iMessage bridges (e.g. Beeper-style bridges, BlueBubbles, or other sync clients) deliver group messages with `chat_id` set to `0` or omitted, exposing only `chat_guid` (or `chat_identifier`). OpenClaw resolves the group anchor in priority order — `chat_id`, then `chat_guid`, then `chat_identifier` — so a group anchored only by `chat_guid` is still routed and replied to instead of being dropped. When `chat_id` is unavailable, the session key, conversation route, and reply target use the guid/identifier anchor (for example, the reply target becomes `chat_guid:<guid>` and the session becomes `agent:<agentId>:imessage:group:<chat_guid>`). The `groups` registry and `groupAllowFrom` already accept `chat_guid`/`chat_identifier` entries, so operators can allowlist and configure GUID-anchored groups the same way as numeric `chat_id` groups.
 
     Group-ish thread behavior:
 
