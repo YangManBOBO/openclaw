@@ -81,6 +81,69 @@ describe("slack sent-thread-cache", () => {
     ).resolves.toBe(true);
   });
 
+  it("reads a pre-upgrade unscoped store record after restart with a monitor workspace id", async () => {
+    await withOpenClawTestState(
+      {
+        label: "slack-thread-participation-unscoped-upgrade",
+        layout: "state-only",
+        applyEnv: false,
+      },
+      async (state) => {
+        resetPluginStateStoreForTests();
+        const repliedAt = 1_711_406_400_000;
+        const threadTs = "1700000000.000006";
+        const unscopedKey = `A1:C123:${threadTs}`;
+        const preUpgradeStore = createPluginStateKeyedStoreForTests<{ repliedAt: number }>(
+          "slack",
+          {
+            namespace: "slack.thread-participation",
+            maxEntries: 1000,
+            env: state.env,
+          },
+        );
+        await preUpgradeStore.register(unscopedKey, { repliedAt });
+        expect((await preUpgradeStore.entries()).some((entry) => entry.key === unscopedKey)).toBe(
+          true,
+        );
+        resetPluginStateStoreForTests();
+        clearSlackThreadParticipationCache();
+
+        const openKeyedStore = vi.fn((options: OpenKeyedStoreOptions) =>
+          createPluginStateKeyedStoreForTests<{ repliedAt: number }>("slack", {
+            ...options,
+            env: state.env,
+          }),
+        );
+        setSlackRuntime({
+          state: { openKeyedStore },
+          logging: { getChildLogger: () => ({ warn: vi.fn() }) },
+        } as never);
+
+        await expect(
+          hasInboundSlackThreadParticipationWithPersistence({
+            accountId: "A1",
+            channelId: "C123",
+            threadTs,
+            workspaceTeamId: "T1",
+          }),
+        ).resolves.toBe(true);
+        await expect(
+          hasInboundSlackThreadParticipationWithPersistence({
+            accountId: "A1",
+            channelId: "C123",
+            threadTs,
+            eventTeamId: "T2",
+            workspaceTeamId: "T1",
+          }),
+        ).resolves.toBe(false);
+        expect(openKeyedStore).toHaveBeenCalledWith({
+          namespace: "slack.thread-participation",
+          maxEntries: 1000,
+        });
+      },
+    );
+  });
+
   it("announces a repeated thread failure only once until its message changes", () => {
     const notice = {
       accountId: "A1",
