@@ -188,6 +188,10 @@ export const isAllowedIMessageReplyContextSender = createAllowedChatSenderMatche
   allowConversationTargets: true,
 });
 
+export function hasPositiveIMessageChatId(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 export function formatIMessageChatTarget(chatId?: number | null): string {
   if (!chatId || !Number.isFinite(chatId)) {
     return "";
@@ -197,19 +201,19 @@ export function formatIMessageChatTarget(chatId?: number | null): string {
 
 /**
  * Format a reply target for an inbound iMessage group from whichever anchor
- * is available. `chat_id:` is preferred because the outbound sender resolves
- * it back to a real chat; `chat_guid:` / `chat_identifier:` cover bridges that
- * only emit a guid-style anchor, so group replies are addressed to the group
- * instead of falling back to the sender's direct handle.
+ * is available. Only a positive `chat_id` is a usable numeric anchor — the
+ * same rule as `resolveIMessageGroupAnchorId` — so a negative sentinel from
+ * some bridges falls through to `chat_guid` / `chat_identifier` instead of
+ * addressing the outbound send to `chat_id:-1`. `chat_id:` is preferred when
+ * it is positive because the outbound sender resolves it back to a real chat.
  */
 export function formatIMessageGroupTarget(params: {
   chatId?: number | null;
   chatGuid?: string | null;
   chatIdentifier?: string | null;
 }): string {
-  const chatIdTarget = formatIMessageChatTarget(params.chatId);
-  if (chatIdTarget) {
-    return chatIdTarget;
+  if (hasPositiveIMessageChatId(params.chatId)) {
+    return `chat_id:${params.chatId}`;
   }
   const chatGuid = params.chatGuid?.trim();
   if (chatGuid) {

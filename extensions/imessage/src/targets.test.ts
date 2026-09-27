@@ -173,6 +173,13 @@ describe("imessage targets", () => {
     ).toBe("chat_guid:iMessage;+;chat42");
     expect(
       formatIMessageGroupTarget({
+        chatId: -1,
+        chatGuid: "iMessage;+;chat42",
+        chatIdentifier: "chat42",
+      }),
+    ).toBe("chat_guid:iMessage;+;chat42");
+    expect(
+      formatIMessageGroupTarget({
         chatId: 0,
         chatGuid: "  ",
         chatIdentifier: "chat42",

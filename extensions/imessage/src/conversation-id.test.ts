@@ -26,6 +26,13 @@ describe("resolveIMessageGroupAnchorId", () => {
     ).toBe("iMessage;+;chat349");
     expect(
       resolveIMessageGroupAnchorId({
+        chatId: -1,
+        chatGuid: "iMessage;+;chat349",
+        chatIdentifier: "chat349",
+      }),
+    ).toBe("iMessage;+;chat349");
+    expect(
+      resolveIMessageGroupAnchorId({
         chatId: undefined,
         chatGuid: "iMessage;+;chat349",
         chatIdentifier: "chat349",

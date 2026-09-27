@@ -1,14 +1,10 @@
 import "./conversation-id-core.js";
-import { normalizeIMessageHandle } from "./targets.js";
+import { hasPositiveIMessageChatId, normalizeIMessageHandle } from "./targets.js";
 export {
   matchIMessageAcpConversation,
   normalizeIMessageAcpConversationId,
   resolveIMessageConversationIdFromTarget,
 } from "./conversation-id-core.js";
-
-function hasPositiveChatId(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
@@ -28,7 +24,7 @@ export function resolveIMessageGroupAnchorId(params: {
   chatGuid?: string | null;
   chatIdentifier?: string | null;
 }): string | undefined {
-  if (hasPositiveChatId(params.chatId)) {
+  if (hasPositiveIMessageChatId(params.chatId)) {
     return String(params.chatId);
   }
   if (isNonEmptyString(params.chatGuid)) {
