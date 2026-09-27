@@ -194,3 +194,30 @@ export function formatIMessageChatTarget(chatId?: number | null): string {
   }
   return `chat_id:${chatId}`;
 }
+
+/**
+ * Format a reply target for an inbound iMessage group from whichever anchor
+ * is available. `chat_id:` is preferred because the outbound sender resolves
+ * it back to a real chat; `chat_guid:` / `chat_identifier:` cover bridges that
+ * only emit a guid-style anchor, so group replies are addressed to the group
+ * instead of falling back to the sender's direct handle.
+ */
+export function formatIMessageGroupTarget(params: {
+  chatId?: number | null;
+  chatGuid?: string | null;
+  chatIdentifier?: string | null;
+}): string {
+  const chatIdTarget = formatIMessageChatTarget(params.chatId);
+  if (chatIdTarget) {
+    return chatIdTarget;
+  }
+  const chatGuid = params.chatGuid?.trim();
+  if (chatGuid) {
+    return `chat_guid:${chatGuid}`;
+  }
+  const chatIdentifier = params.chatIdentifier?.trim();
+  if (chatIdentifier) {
+    return `chat_identifier:${chatIdentifier}`;
+  }
+  return "";
+}
