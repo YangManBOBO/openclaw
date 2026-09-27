@@ -529,9 +529,12 @@ vi.mock("../../limits.js", () => ({ SLACK_TEXT_LIMIT: 4000, SLACK_EDIT_TEXT_MAX_
 
 vi.mock("../../sent-thread-cache.js", () => ({
   clearSlackThreadFailureNotice: () => {},
+  hasInboundSlackThreadParticipation: () => false,
   hasSlackThreadParticipation: () => false,
   recordSlackThreadFailureNotice: () => true,
   recordSlackThreadParticipation: recordSlackThreadParticipationMock,
+  resolveSlackParticipationTeamId: (params: { eventTeamId?: string; workspaceTeamId?: string }) =>
+    params.eventTeamId || params.workspaceTeamId || undefined,
 }));
 
 vi.mock("../../stream-mode.js", () => ({
