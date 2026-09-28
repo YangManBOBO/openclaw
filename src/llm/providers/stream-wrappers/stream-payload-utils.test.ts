@@ -147,7 +147,7 @@ describe("streamWithPayloadPatch through the real OpenAI completions transport",
     const message = (await stream.result()) as { stopReason?: string };
     expect(message.stopReason).toBe("stop");
     expect(requestBodies).toHaveLength(1);
-    const sent = JSON.parse(requestBodies[0]) as Record<string, unknown>;
+    const sent = JSON.parse(requestBodies[0]!) as Record<string, unknown>;
     expect(sent.store).toBeUndefined();
     expect(sent.prompt_cache_key).toBeUndefined();
   });
@@ -177,7 +177,7 @@ describe("streamWithPayloadPatch through the real OpenAI completions transport",
     const message = (await stream.result()) as { stopReason?: string };
     expect(message.stopReason).toBe("stop");
     expect(requestBodies).toHaveLength(1);
-    const sent = JSON.parse(requestBodies[0]) as Record<string, unknown>;
+    const sent = JSON.parse(requestBodies[0]!) as Record<string, unknown>;
     expect(sent.store).toBeUndefined();
     expect(sent.prompt_cache_key).toBeUndefined();
   });
