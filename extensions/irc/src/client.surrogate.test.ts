@@ -161,4 +161,17 @@ describe("irc client PRIVMSG chunking", () => {
 
     client.close();
   });
+
+  it("terminates on whitespace-only chunks and preserves interior space runs", async () => {
+    const { client, socket } = await connectReadyClient(1);
+
+    const text = "a  b";
+    client.sendPrivmsg("#room", text);
+
+    const bodies = privmsgBodies(socket);
+    expect(bodies.join("")).toBe(text);
+    expect(bodies.every((body) => body.length > 0)).toBe(true);
+
+    client.close();
+  });
 });

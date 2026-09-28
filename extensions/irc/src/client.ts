@@ -38,7 +38,7 @@ function takeIrcPrivmsgChunk(text: string, maxChars: number, maxBytes: number): 
     return fitted;
   }
   const splitAt = fitted.lastIndexOf(" ");
-  if (splitAt >= Math.floor(fitted.length / 2)) {
+  if (splitAt > 0 && splitAt >= Math.floor(fitted.length / 2)) {
     return fitted.slice(0, splitAt);
   }
   return fitted;
@@ -247,6 +247,7 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     const lineOverheadBytes = Buffer.byteLength(`PRIVMSG ${normalizedTarget} :\r\n`, "utf8");
     const maxChunkBytes = IRC_MAX_LINE_BYTES - lineOverheadBytes;
     let remaining = cleaned;
+    let pendingWhitespace = "";
     while (remaining.length > 0) {
       // Slice by the trimmed length so whitespace trimmed off a chunk's tail
       // stays in `remaining` as the next chunk's leading space. Trimming both
@@ -254,8 +255,17 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       // spaces in the delivered message.
       const chunk = takeIrcPrivmsgChunk(remaining, messageChunkMaxChars, maxChunkBytes);
       const trimmed = chunk.trimEnd();
-      sendRaw(`PRIVMSG ${normalizedTarget} :${trimmed}`);
-      remaining = remaining.slice(trimmed.length);
+      if (trimmed.length > 0) {
+        sendRaw(`PRIVMSG ${normalizedTarget} :${pendingWhitespace}${trimmed}`);
+        pendingWhitespace = "";
+        remaining = remaining.slice(trimmed.length);
+      } else {
+        // A chunk made of only whitespace preserves an interior space run:
+        // carry it forward as the leading space of the next non-empty chunk
+        // instead of sending an empty PRIVMSG, and guarantee progress.
+        pendingWhitespace += chunk;
+        remaining = remaining.slice(chunk.length);
+      }
     }
   };
 
