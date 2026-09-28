@@ -11,8 +11,16 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { getCommandArgsWithRootOptions } from "../src/infra/cli-root-options.ts";
-import { withDistArtifactOwnership } from "./lib/dist-artifact-ownership.mts";
+import { applyCliProfileEnv, parseCliProfileArgs } from "../src/cli/profile.ts";
+import {
+  getCommandArgsWithRootOptions,
+  getRootOptionAwareCommandPath,
+} from "../src/infra/cli-root-options.ts";
+import {
+  distArtifactEntryArgs,
+  withDistArtifactOwnership,
+} from "./lib/dist-artifact-ownership.mts";
+import { resolveLiveManagedGatewayDistFence } from "./lib/live-gateway-dist-fence.mts";
 import {
   BUILD_STAMP_FILE,
   RUNTIME_POSTBUILD_STAMP_FILE,
@@ -31,6 +39,7 @@ import {
 import { sleep } from "./lib/sleep.mjs";
 import {
   discoverStaticExtensionAssets,
+  resolveStaticExtensionAssetSource,
   shouldCopyStaticExtensionAssets,
 } from "./lib/static-extension-assets.mts";
 import {
@@ -41,8 +50,9 @@ import {
   runNodeWatchedPaths,
 } from "./run-node-watch-paths.mts";
 import { listCoreRuntimePostBuildOutputs, runRuntimePostBuild } from "./runtime-postbuild.mts";
+import { listTsdownOutputRoots } from "./tsdown-build.mts";
 
-type RunNodeInjectedChild = {
+type RunNodeChild = {
   kill?: (signal?: NodeJS.Signals) => boolean | void;
   on(event: string, callback: (...args: never[]) => void): unknown;
   off?(event: string, callback: (...args: never[]) => void): unknown;
@@ -51,7 +61,6 @@ type RunNodeInjectedChild = {
   stdout?: Pick<NodeJS.ReadableStream, "on">;
 };
 
-type RunNodeChild = RunNodeInjectedChild;
 type RunNodeSpawn = (command: string, args: string[], options: SpawnOptions) => unknown;
 type RunNodeSpawnSync = (
   command: string,
@@ -135,7 +144,6 @@ function asRunNodeChild(value: unknown): RunNodeChild {
 
 export { runNodeWatchedPaths };
 
-const runtimeBuildArgs = ["--import", "tsx", "scripts/build-all.mts", "qaRuntime"];
 const RUN_NODE_DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 const RUN_NODE_MAX_SHUTDOWN_GRACE_MS = 5 * 60_000;
 const RUN_NODE_SHUTDOWN_GRACE_MESSAGE_TYPE = "openclaw:shutdown-grace";
@@ -456,7 +464,9 @@ const listRequiredStaticExtensionAssetOutputs = (deps: RunNodeRequirementDeps) =
   const runtimeExtensionsRoot = path.join(runtimeRoot, "extensions");
   const hasRuntimeOverlay = deps.fs.existsSync(runtimeExtensionsRoot);
   return discoverStaticExtensionAssets({ rootDir: deps.cwd, fs: deps.fs })
-    .filter((asset) => deps.fs.existsSync(path.join(deps.cwd, asset.src)))
+    .filter((asset) =>
+      deps.fs.existsSync(resolveStaticExtensionAssetSource(deps.cwd, asset, deps.fs)),
+    )
     .flatMap((asset) => {
       const relativeOutput = normalizePath(asset.dest).replace(/^dist\//u, "");
       const outputs = [path.join(distRoot, relativeOutput)];
@@ -683,14 +693,8 @@ const hasErrorCode = (error: unknown, code: string) =>
 const getErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "unknown error";
 
-const parsePositiveIntegerEnv = (env: NodeJS.ProcessEnv, name: string, fallback: number) => {
-  const raw = env[name];
-  if (raw === undefined || raw === "") {
-    return fallback;
-  }
-  const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-};
+const parsePositiveIntegerEnv = (env: NodeJS.ProcessEnv, name: string, fallback: number) =>
+  parsePositiveInteger(env[name]) ?? fallback;
 
 const resolveRunNodeOutputLogPath = (deps: RunNodeDeps) => {
   const outputLog = deps.env[RUN_NODE_OUTPUT_LOG_ENV]?.trim();
@@ -1345,6 +1349,29 @@ const withRunNodeBuildLock = async <T,>(deps: RunNodeDeps, callback: () => Promi
   }
 };
 
+const withRunNodeRuntimePublication = async <T,>(deps: RunNodeDeps, publish: () => Promise<T>) => {
+  const { withGatewayRuntimeArtifactPublication } =
+    await import("../src/cli/update-cli/update-command-service-publication.ts");
+  const selected = parseCliProfileArgs([deps.execPath, "openclaw.mjs", ...deps.args]);
+  if (!selected.ok) {
+    throw new Error(selected.error);
+  }
+  const env = { ...deps.env };
+  if (selected.profile) {
+    applyCliProfileEnv({ profile: selected.profile, env });
+  }
+  return await withGatewayRuntimeArtifactPublication(
+    {
+      root: deps.cwd,
+      env,
+      timeoutMs: 60_000,
+      outputPaths: listTsdownOutputRoots(),
+      assertCurrent() {},
+    },
+    publish,
+  );
+};
+
 const syncRuntimeArtifacts = async (deps: RunNodeDeps) => {
   try {
     await deps.runRuntimePostBuild({ cwd: deps.cwd, env: deps.env });
@@ -1368,16 +1395,32 @@ const writeRuntimePostBuildStamp = (deps: RunNodeDeps) => {
   }
 };
 
+const refuseLiveDistMutation = async (deps: RunNodeDeps) => {
+  const fence = await resolveLiveManagedGatewayDistFence(deps.cwd, { env: deps.env });
+  if (!fence.refuse) {
+    return false;
+  }
+  const message = `${fence.message}\n`;
+  deps.stderr.write(message);
+  deps.outputTee?.write(message);
+  return true;
+};
+
 const syncRuntimeArtifactsAndStamp = async (deps: RunNodeDeps) =>
   withDistArtifactOwnership(deps.cwd, async () => {
     if (!resolveRuntimePostBuildRequirement(deps).shouldSync) {
       return true;
     }
-    const synced = await syncRuntimeArtifacts(deps);
-    if (synced) {
-      writeRuntimePostBuildStamp(deps);
-    }
-    return synced;
+    return await withRunNodeRuntimePublication(deps, async () => {
+      if (await refuseLiveDistMutation(deps)) {
+        return false;
+      }
+      const synced = await syncRuntimeArtifacts(deps);
+      if (synced) {
+        writeRuntimePostBuildStamp(deps);
+      }
+      return synced;
+    });
   });
 
 const shouldSkipWatchRuntimeSync = (deps: RunNodeDeps, requirement: RuntimePostBuildRequirement) =>
@@ -1386,16 +1429,44 @@ const shouldSkipWatchRuntimeSync = (deps: RunNodeDeps, requirement: RuntimePostB
   hasDirtyRuntimePostBuildInputs(deps) !== true &&
   !hasMissingRequiredRuntimePostBuildOutput(deps);
 
-const isGatewayClientCommand = (args: string[]) =>
-  args[0] === "dashboard" ||
-  (args[0] === "gateway" && (args[1] === "call" || args[1] === "status")) ||
-  (args[0] === "agent" && !args.includes("--local"));
+const resolveRunNodeCommandPath = (args: string[], depth: number) =>
+  getRootOptionAwareCommandPath(["node", "openclaw", ...args], depth);
+
+const isGatewayClientCommand = (args: string[]) => {
+  const [primary, secondary] = resolveRunNodeCommandPath(args, 2);
+  return (
+    primary === "dashboard" ||
+    (primary === "gateway" && (secondary === "call" || secondary === "status")) ||
+    (primary === "agent" && !args.includes("--local"))
+  );
+};
+
+const isGatewayRecoveryCommand = (args: string[]) => {
+  const [primary, secondary] = resolveRunNodeCommandPath(args, 2);
+  return primary === "gateway" && (secondary === "stop" || secondary === "restart");
+};
+
+const shouldFastPathExistingDistForGatewayRecovery = (deps: RunNodeDeps) =>
+  isGatewayRecoveryCommand(deps.args) &&
+  deps.env.OPENCLAW_FORCE_BUILD !== "1" &&
+  statMtime(deps.distEntry, deps.fs) != null;
 
 const shouldFastPathExistingDistForGatewayClient = (deps: RunNodeDeps) =>
   isGatewayClientCommand(deps.args) &&
   deps.env.OPENCLAW_FORCE_BUILD !== "1" &&
   statMtime(deps.distEntry, deps.fs) != null &&
   canUseStampedGatewayClientDist(deps);
+
+const shouldFastPathExistingDist = (deps: RunNodeDeps) =>
+  shouldFastPathExistingDistForGatewayRecovery(deps) ||
+  shouldFastPathExistingDistForGatewayClient(deps);
+
+const applyRunNodeCliProfile = (args: string[], env: NodeJS.ProcessEnv, execPath: string) => {
+  const parsed = parseCliProfileArgs([execPath, "openclaw", ...args]);
+  if (parsed.ok && parsed.profile) {
+    applyCliProfileEnv({ profile: parsed.profile, env });
+  }
+};
 
 const canUseStampedGatewayClientDist = (deps: RunNodeDeps) => {
   const currentHead = resolveGitHead(deps);
@@ -1456,9 +1527,12 @@ const runQaReportFromSource = (deps: RunNodeDeps, script: QaReportScript) => {
 function createRunNodeDeps(params: RunNodeMainParams) {
   const cwd = params.cwd ?? process.cwd();
   const distRoot = path.join(cwd, "dist");
+  const args = params.args ?? process.argv.slice(2);
+  const execPath = params.execPath ?? process.execPath;
   const env = params.env ? { ...params.env } : { ...process.env };
   // Select this checkout's plugins over tracked installs without changing source/dist loading.
   env.OPENCLAW_DEV_SOURCE_ROOT ??= cwd;
+  applyRunNodeCliProfile(args, env, execPath);
   const mutableState: RunNodeMutableState = {
     outputTee: null,
     runNodeProgress: undefined,
@@ -1470,9 +1544,9 @@ function createRunNodeDeps(params: RunNodeMainParams) {
     stderr: params.stderr ?? process.stderr,
     stdout: params.stdout ?? process.stdout,
     process: params.process ?? process,
-    execPath: params.execPath ?? process.execPath,
+    execPath,
     cwd,
-    args: params.args ?? process.argv.slice(2),
+    args,
     env,
     platform: params.platform ?? process.platform,
     signalProcess:
@@ -1502,7 +1576,7 @@ export async function runNodeMain(params: RunNodeMainParams = {}): Promise<RunNo
 
   try {
     let exitCode: RunNodeExit = 1;
-    if (shouldFastPathExistingDistForGatewayClient(deps)) {
+    if (shouldFastPathExistingDist(deps)) {
       exitCode = await runOpenClaw(deps);
       return await closeRunNodeOutputTee(deps, exitCode);
     }
@@ -1558,7 +1632,7 @@ export async function runNodeMain(params: RunNodeMainParams = {}): Promise<RunNo
     }
 
     const buildExitCode = await withRunNodeBuildLock(deps, async () => {
-      if (shouldFastPathExistingDistForGatewayClient(deps)) {
+      if (shouldFastPathExistingDist(deps)) {
         return 0;
       }
       const lockedBuildRequirement = resolveBuildRequirement(deps);
@@ -1574,26 +1648,37 @@ export async function runNodeMain(params: RunNodeMainParams = {}): Promise<RunNo
         return (await syncRuntimeArtifactsAndStamp(deps)) ? 0 : 1;
       }
 
-      logRunner(
-        `Building TypeScript (dist is stale: ${lockedBuildRequirement.reason} - ${formatBuildReason(lockedBuildRequirement.reason)}).`,
-        deps,
+      return await withDistArtifactOwnership(deps.cwd, () =>
+        withRunNodeRuntimePublication(deps, async () => {
+          if (await refuseLiveDistMutation(deps)) {
+            return 1;
+          }
+          logRunner(
+            `Building TypeScript (dist is stale: ${lockedBuildRequirement.reason} - ${formatBuildReason(lockedBuildRequirement.reason)}).`,
+            deps,
+          );
+          return await withRunNodeProgress(deps, "Building local CLI artifacts", async () => {
+            const build = asRunNodeChild(
+              deps.spawn(
+                deps.execPath,
+                distArtifactEntryArgs(path.join(deps.cwd, "scripts/build-all.mts"), ["qaRuntime"]),
+                {
+                  cwd: deps.cwd,
+                  detached: shouldUseRunNodeChildProcessGroup(deps),
+                  env: {
+                    ...deps.env,
+                    [RUN_NODE_SKIP_DTS_BUILD_ENV]: deps.env[RUN_NODE_SKIP_DTS_BUILD_ENV] ?? "1",
+                  },
+                  stdio: ["inherit", "pipe", "pipe"],
+                },
+              ),
+            );
+            pipeSpawnedOutput(build, deps, { stdoutTarget: "stderr" });
+            const result = await waitForSpawnedProcess(build, deps);
+            return getInterruptedSpawnOutcome(result, deps.platform) ?? result.exitCode ?? 1;
+          });
+        }),
       );
-      return await withRunNodeProgress(deps, "Building local CLI artifacts", async () => {
-        const build = asRunNodeChild(
-          deps.spawn(deps.execPath, runtimeBuildArgs, {
-            cwd: deps.cwd,
-            detached: shouldUseRunNodeChildProcessGroup(deps),
-            env: {
-              ...deps.env,
-              [RUN_NODE_SKIP_DTS_BUILD_ENV]: deps.env[RUN_NODE_SKIP_DTS_BUILD_ENV] ?? "1",
-            },
-            stdio: ["inherit", "pipe", "pipe"],
-          }),
-        );
-        pipeSpawnedOutput(build, deps, { stdoutTarget: "stderr" });
-        const result = await waitForSpawnedProcess(build, deps);
-        return getInterruptedSpawnOutcome(result, deps.platform) ?? result.exitCode ?? 1;
-      });
     });
     if (buildExitCode !== 0) {
       return await closeRunNodeOutputTee(deps, buildExitCode);
