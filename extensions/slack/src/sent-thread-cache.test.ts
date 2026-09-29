@@ -120,16 +120,14 @@ describe("slack sent-thread-cache", () => {
         resetPluginStateStoreForTests();
         clearSlackThreadParticipationCache();
 
-        const openKeyedStore = vi.fn((options: OpenKeyedStoreOptions) =>
-          createPluginStateKeyedStoreForTests<{ repliedAt: number }>("slack", {
-            ...options,
-            env: state.env,
-          }),
+        const openKeyedStoreV2 = vi.fn((options: OpenKeyedStoreOptions) =>
+          createPluginStateKeyedStoreV2ForTests<{ repliedAt: number }>(
+            "slack",
+            { ...options, env: state.env },
+            { assertCurrent() {} },
+          ),
         );
-        setSlackRuntime({
-          state: { openKeyedStore },
-          logging: { getChildLogger: () => ({ warn: vi.fn() }) },
-        } as never);
+        installStore(openKeyedStoreV2);
 
         await expect(
           hasInboundSlackThreadParticipationWithPersistence({
@@ -148,7 +146,7 @@ describe("slack sent-thread-cache", () => {
             workspaceTeamId: "T1",
           }),
         ).resolves.toBe(false);
-        expect(openKeyedStore).toHaveBeenCalledWith({
+        expect(openKeyedStoreV2).toHaveBeenCalledWith({
           namespace: "slack.thread-participation",
           maxEntries: 1000,
         });

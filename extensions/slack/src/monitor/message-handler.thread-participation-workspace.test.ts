@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
   createPluginStateKeyedStoreForTests,
+  createPluginStateKeyedStoreV2ForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import {
@@ -10,12 +11,13 @@ import {
   setRuntimeConfigSnapshot,
 } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSlackRuntime, setSlackRuntime } from "../runtime.js";
 import {
   clearSlackThreadParticipationCache,
   recordSlackThreadParticipation,
 } from "../sent-thread-cache.js";
+import type { SlackMessageEvent } from "../types.js";
 import type { SlackEventScope } from "./event-scope.js";
 import { createSlackMessageHandler } from "./message-handler.js";
 import {
@@ -23,7 +25,6 @@ import {
   createSlackSessionStoreFixture,
 } from "./message-handler/prepare.test-helpers.js";
 import type { PreparedSlackMessage } from "./message-handler/types.js";
-import type { SlackMessageEvent } from "./types.js";
 
 const dispatchPreparedSlackMessage = vi.fn(async (_prepared: PreparedSlackMessage) => {});
 
@@ -100,10 +101,6 @@ async function handleFollowUp(params: {
 }
 
 describe("slack inbound thread participation before reply dispatch", () => {
-  beforeAll(() => {
-    storeFixture.setup();
-  });
-
   beforeEach(() => {
     dispatchPreparedSlackMessage.mockClear();
     clearSlackThreadParticipationCache();
@@ -115,10 +112,6 @@ describe("slack inbound thread participation before reply dispatch", () => {
     clearRuntimeConfigSnapshot();
     vi.restoreAllMocks();
     setSlackRuntime(null as never);
-  });
-
-  afterAll(() => {
-    storeFixture.cleanup();
   });
 
   it("dispatches an unmentioned follow-up when send recorded the monitor workspace", async () => {
@@ -174,11 +167,12 @@ describe("slack inbound thread participation before reply dispatch", () => {
               ...runtime,
               state: {
                 ...runtime.state,
-                openKeyedStore: (options: OpenKeyedStoreOptions) =>
-                  createPluginStateKeyedStoreForTests<{ repliedAt: number }>("slack", {
-                    ...options,
-                    env: state.env,
-                  }),
+                openKeyedStoreV2: (options: OpenKeyedStoreOptions) =>
+                  createPluginStateKeyedStoreV2ForTests<{ repliedAt: number }>(
+                    "slack",
+                    { ...options, env: state.env },
+                    { assertCurrent() {} },
+                  ),
               },
             } as never);
           },
