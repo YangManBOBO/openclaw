@@ -25,16 +25,14 @@ export function streamWithPayloadPatch(
       if (isPromiseLike(result)) {
         return Promise.resolve(result).then((resolved) => {
           if (resolved && typeof resolved === "object" && resolved !== payload) {
-            // SAFETY: the typeof check above narrows the resolved replacement
-            // to an object; the patch only deletes known keys.
+            // SAFETY: the typeof check above narrows the resolved replacement to an object.
             patchPayload(resolved as Record<string, unknown>);
           }
           return resolved;
         });
       }
       if (result && typeof result === "object" && result !== payload) {
-        // SAFETY: the typeof check above narrows the replacement to an object;
-        // the patch only deletes known keys.
+        // SAFETY: the typeof check above narrows the replacement to an object.
         patchPayload(result as Record<string, unknown>);
       }
       return result;
