@@ -2580,11 +2580,8 @@ describe("slack implicit mention policy", () => {
     // send.ts records delivery.teamId even when the inbound event later has no
     // enterprise eventScope (relay / non-enterprise monitor).
     recordSlackThreadParticipation("default", "C123", threadTs, { teamId: "T1" });
-    const ctx = createCtxWithImplicitMentions(undefined, {
-      channelsConfig: { C123: { requireMention: true } },
-    });
 
-    const result = await prepareThreadMessage({ ctx, message: { thread_ts: threadTs } });
+    const result = await prepareThreadMessage();
 
     expect(result?.ctxPayload.MentionSource).toBe("implicit_thread");
     expect(result?.ctxPayload.ImplicitMentionKinds).toEqual(["bot_thread_participant"]);

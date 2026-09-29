@@ -16,6 +16,7 @@ import {
   clearSlackThreadParticipationCache,
   recordSlackThreadParticipation,
 } from "../sent-thread-cache.js";
+import type { SlackMessageEvent } from "../types.js";
 import type { SlackEventScope } from "./event-scope.js";
 import { createSlackMessageHandler } from "./message-handler.js";
 import {
@@ -23,7 +24,6 @@ import {
   createSlackSessionStoreFixture,
 } from "./message-handler/prepare.test-helpers.js";
 import type { PreparedSlackMessage } from "./message-handler/types.js";
-import type { SlackMessageEvent } from "./types.js";
 
 const dispatchPreparedSlackMessage = vi.fn(async (_prepared: PreparedSlackMessage) => {});
 
