@@ -122,4 +122,50 @@ describe("channel ingress queue resume", () => {
       expect(claimed?.id).toBe("free");
     });
   });
+
+  it("invalidates the resume cursor when the lane-policy callbacks change", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // row-0 carries no stored lane key. Under the first policy both row-0 and
+      // the blocked prefix derive to "blocked", so the first direct call exhausts
+      // the page budget and saves a resume cursor past the prefix. The second call
+      // uses a changed policy that makes row-0 (before the saved cursor) eligible;
+      // the cursor must be invalidated or row-0 would be skipped.
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row === 0 ? "row-0" : row < blockedPrefixRows ? `blocked-${row}` : "free",
+          receivedAt: row,
+          laneKey: null,
+          lane: row === 0 || row >= blockedPrefixRows ? "free" : "blocked",
+        })),
+      );
+
+      // First policy treats row-0 as blocked too, so the bounded pass spends its
+      // whole budget on the blocked prefix and returns null with a retained cursor.
+      const firstPolicy = () => "blocked";
+      await expect(
+        queue.claimNext({
+          ownerId: "worker",
+          blockedLaneKeys: ["blocked"],
+          scanLimit,
+          deriveLaneKey: firstPolicy,
+        }),
+      ).resolves.toBeNull();
+
+      // Changed policy now derives row-0 to "free". The retained cursor must be
+      // invalidated (policy changed), so the next call rescans from the front and
+      // claims row-0 instead of skipping past it to the tail free row.
+      const changedPolicy = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimed = await queue.claimNext({
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey: changedPolicy,
+      });
+      expect(claimed?.id).toBe("row-0");
+    });
+  });
 });

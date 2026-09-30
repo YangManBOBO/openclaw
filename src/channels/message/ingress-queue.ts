@@ -242,13 +242,21 @@ export function createChannelIngressQueue<
   // Direct scans (no candidate window) remember where a bounded claim pass
   // stopped so the next direct call resumes past a fully blocked prefix instead
   // of re-scanning it from the front. Cleared whenever a claim succeeds or the
-  // scan reaches the end of the queue, so lanes that unblock are revisited.
+  // scan reaches the end of the queue, so lanes that unblock are revisited. The
+  // lane-policy callbacks are retained by identity so a changed policy that makes
+  // an earlier row eligible invalidates the cursor instead of skipping it.
   let directScanResume:
     | {
         cursor: ChannelIngressClaimCursor;
         orderBy?: "received" | "id";
-        reconcileStoredLaneKey: boolean;
-        deriveLaneKey: boolean;
+        reconcileStoredLaneKey?: (
+          record: ChannelIngressQueueRecord<TPayload, TMetadata>,
+          storedLaneKey: string,
+          derivedLaneKey: string,
+        ) => boolean;
+        deriveLaneKey?: (
+          record: ChannelIngressQueueRecord<TPayload, TMetadata>,
+        ) => string | undefined;
         blockedLaneKeys: string[];
       }
     | undefined;
@@ -314,8 +322,8 @@ export function createChannelIngressQueue<
       const resume = directScanResume;
       const inputsMatch =
         resume.orderBy === requestBase.orderBy &&
-        resume.reconcileStoredLaneKey === requestBase.reconcileStoredLaneKey &&
-        resume.deriveLaneKey === Boolean(deriveLaneKey) &&
+        resume.reconcileStoredLaneKey === reconcileStoredLaneKey &&
+        resume.deriveLaneKey === deriveLaneKey &&
         resume.blockedLaneKeys.length === requestBase.blockedLaneKeys.length &&
         resume.blockedLaneKeys.every((key, index) => key === requestBase.blockedLaneKeys[index]);
       if (inputsMatch) {
@@ -381,8 +389,8 @@ export function createChannelIngressQueue<
             directScanResume = {
               cursor: { receivedAt: last.received_at, eventId: last.event_id },
               orderBy: requestBase.orderBy,
-              reconcileStoredLaneKey: Boolean(requestBase.reconcileStoredLaneKey),
-              deriveLaneKey: Boolean(deriveLaneKey),
+              reconcileStoredLaneKey,
+              deriveLaneKey,
               blockedLaneKeys: requestBase.blockedLaneKeys,
             };
           } else {
