@@ -254,10 +254,19 @@ export type ChannelIngressClaimRequest = {
   orderBy?: "received" | "id";
   /** Keyset cursor past the last scanned row, used to page beyond a blocked snapshot. */
   claimAfter?: ChannelIngressClaimCursor;
+  /**
+   * Count of scan-visible pending rows before claimAfter expected by a retained
+   * direct-scan resume cursor. The snapshot computes the authoritative count in
+   * the same read, so a write from any handle that inserted or removed a row
+   * before the cursor invalidates the resume.
+   */
+  expectedPendingBeforeCursor?: number;
 };
 export type ChannelIngressClaimSnapshot = {
   pending: ChannelIngressRow[];
   claimed: ChannelIngressRow[];
+  /** Authoritative count of scan-visible pending rows strictly before claimAfter. */
+  pendingBeforeCursor?: number;
 };
 
 /** Keyset cursor matching the pending ordering; the row after it opens the next claim page. */

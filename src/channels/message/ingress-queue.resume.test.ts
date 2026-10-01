@@ -209,4 +209,126 @@ describe("channel ingress queue resume", () => {
       expect(claimed?.id).toBe("earlier-free");
     });
   });
+
+  it("revalidates the resume cursor against authoritative state when another handle enqueues an earlier row", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+      const other = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row < blockedPrefixRows ? `blocked-${row}` : "free-tail",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedPrefixRows ? "blocked" : "free",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // A second queue handle writes an earlier free-lane row. The first handle's
+      // closure invalidation cannot observe this write, so the resume cursor must
+      // be revalidated against the authoritative queue state on the next call.
+      await other.enqueue("earlier-free", { lane: "free" }, { receivedAt: -1 });
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("earlier-free");
+    });
+  });
+
+  it("revalidates the resume cursor when a minimal claim reference releases an earlier row", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      insertPendingIngressRows(stateDir, [
+        { eventId: "before-prefix", receivedAt: -1, laneKey: null, lane: "free" },
+      ]);
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row < blockedPrefixRows ? `blocked-${row}` : "free-tail",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedPrefixRows ? "blocked" : "free",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      const claim = await queue.claim("before-prefix");
+      expect(claim?.id).toBe("before-prefix");
+
+      // First direct call exhausts the budget over the blocked prefix and retains
+      // a resume cursor; the claimed row is not pending so it is not scanned.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // Release through the minimal reference (no receivedAt), so the closure guard
+      // cannot invalidate the retained cursor. The authoritative queue revalidation
+      // on the next direct call must still drop it.
+      await queue.release({ id: "before-prefix", claim: { token: claim!.claim.token } });
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("before-prefix");
+    });
+  });
+
+  it("revalidates the in-flight page cursor when another handle writes during paging", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 0;
+      let injected: Promise<unknown> | undefined;
+      let queued = false;
+      const other = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => 1_000 });
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, {
+        now: () => {
+          const tick = clock++;
+          if (tick >= 1 && !queued) {
+            queued = true;
+            // Lands a free-lane row before the page cursor while the first direct
+            // call is paging; the in-flight revalidation must drop the keyset and
+            // claim the earlier row instead of skipping it.
+            injected = other.enqueue("paging-earlier", { lane: "free" }, { receivedAt: -100 });
+          }
+          return tick;
+        },
+      });
+
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows }, (_, row) => ({
+          eventId: `blocked-${row}`,
+          receivedAt: row,
+          laneKey: null,
+          lane: "blocked",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimed = await queue.claimNext({
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      });
+      await injected;
+      expect(claimed?.id).toBe("paging-earlier");
+    });
+  });
 });

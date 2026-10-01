@@ -245,7 +245,10 @@ export function createChannelIngressQueue<
   // of re-scanning it from the front. Cleared whenever a claim succeeds or the
   // scan reaches the end of the queue, so lanes that unblock are revisited. The
   // lane-policy callbacks are retained by identity so a changed policy that makes
-  // an earlier row eligible invalidates the cursor instead of skipping it.
+  // an earlier row eligible invalidates the cursor instead of skipping it. The
+  // pendingBeforeCursor count is the authoritative queue state at retention; it is
+  // revalidated against the queue on resume so writes from other handles (which
+  // cannot run this closure's invalidation) still invalidate the cursor.
   let directScanResume:
     | {
         cursor: ChannelIngressClaimCursor;
@@ -259,6 +262,7 @@ export function createChannelIngressQueue<
           record: ChannelIngressQueueRecord<TPayload, TMetadata>,
         ) => string | undefined;
         blockedLaneKeys: string[];
+        pendingBeforeCursor: number;
       }
     | undefined;
 
@@ -339,6 +343,13 @@ export function createChannelIngressQueue<
     const directScan = candidateIds === undefined;
     let claimAfter: ChannelIngressClaimCursor | undefined;
     let claimPages = 0;
+    // Scan-visible pending rows walked this call; the retained cursor records the
+    // count strictly before its position so a later resume can revalidate it.
+    let scannedPendingRows = 0;
+    // The authoritative count the queue must still show strictly before the page
+    // cursor; a mismatch means a write from any handle changed those rows, so the
+    // keyset is dropped and the scan restarts from the front.
+    let expectedPendingBeforeCursor: number | undefined;
     if (directScan && directScanResume) {
       const resume = directScanResume;
       const inputsMatch =
@@ -349,14 +360,36 @@ export function createChannelIngressQueue<
         resume.blockedLaneKeys.every((key, index) => key === requestBase.blockedLaneKeys[index]);
       if (inputsMatch) {
         claimAfter = resume.cursor;
+        expectedPendingBeforeCursor = resume.pendingBeforeCursor;
+        // The resume page skips rows before the cursor; seed the walk with the
+        // validated count so a re-retained cursor still records rows before it.
+        scannedPendingRows = resume.pendingBeforeCursor;
       }
       directScanResume = undefined;
     }
     while (true) {
-      const request: ChannelIngressClaimRequest = claimAfter
-        ? { ...requestBase, claimAfter }
-        : requestBase;
+      const request: ChannelIngressClaimRequest =
+        claimAfter && expectedPendingBeforeCursor !== undefined
+          ? { ...requestBase, claimAfter, expectedPendingBeforeCursor }
+          : claimAfter
+            ? { ...requestBase, claimAfter }
+            : requestBase;
       const snapshot = await execute("channelIngress.claimSnapshot", request, context);
+      if (expectedPendingBeforeCursor !== undefined) {
+        // Authoritative revalidation: the queue counts the scan-visible pending
+        // rows before the cursor in this same read. A mismatch means a write from
+        // any handle inserted or removed a row before the cursor, so the retained
+        // or in-flight progress is stale and the keyset must be dropped to rescan
+        // from the front instead of skipping that earlier row.
+        if (snapshot.pendingBeforeCursor !== expectedPendingBeforeCursor) {
+          claimAfter = undefined;
+          expectedPendingBeforeCursor = undefined;
+          scannedPendingRows = 0;
+          continue;
+        }
+        expectedPendingBeforeCursor = undefined;
+      }
+      scannedPendingRows += snapshot.pending.length;
       // Native fingerprinting owns row freshness; retain only the lane observations to recheck.
       const preparedLanes: Array<{ row: ChannelIngressRow; laneKey: string | undefined }> = [];
       const selection = selectChannelIngressClaim(
@@ -387,6 +420,13 @@ export function createChannelIngressQueue<
             : undefined,
         );
         if (result.kind === "conflict") {
+          // The queue changed under the page; a write may sit behind the in-flight
+          // cursor, so rescan from the front instead of trusting the keyset.
+          if (directScan) {
+            claimAfter = undefined;
+            expectedPendingBeforeCursor = undefined;
+            scannedPendingRows = 0;
+          }
           continue;
         }
         if (result.row) {
@@ -400,19 +440,27 @@ export function createChannelIngressQueue<
           }
           claimAfter = { receivedAt: last.received_at, eventId: last.event_id };
           claimPages += 1;
+          if (directScan) {
+            // The next page starts after last; it is only valid while the queue
+            // still holds exactly the walked rows (minus the cursor row) before it.
+            expectedPendingBeforeCursor = scannedPendingRows - 1;
+          }
           continue;
         }
         if (directScan) {
           const last = snapshot.pending.at(-1);
           if (selection.more && last) {
             // The blocked prefix continues beyond this bounded pass; preserve
-            // progress so the next direct call resumes past it.
+            // progress so the next direct call resumes past it. The scanned count
+            // minus the cursor row itself is the authoritative state the resume
+            // revalidates against the queue.
             directScanResume = {
               cursor: { receivedAt: last.received_at, eventId: last.event_id },
               orderBy: requestBase.orderBy,
               reconcileStoredLaneKey,
               deriveLaneKey,
               blockedLaneKeys: requestBase.blockedLaneKeys,
+              pendingBeforeCursor: scannedPendingRows - 1,
             };
           } else {
             // The scan reached the end of the queue; wrap so lanes that unblock
@@ -427,6 +475,11 @@ export function createChannelIngressQueue<
           error instanceof ChannelIngressClaimPolicyConflict &&
           (await error.settled).kind === "completed"
         ) {
+          if (directScan) {
+            claimAfter = undefined;
+            expectedPendingBeforeCursor = undefined;
+            scannedPendingRows = 0;
+          }
           continue;
         }
         throw error;
