@@ -168,4 +168,45 @@ describe("channel ingress queue resume", () => {
       expect(claimed?.id).toBe("row-0");
     });
   });
+
+  it("invalidates the resume cursor when an earlier row is enqueued between direct claims", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // A blocked prefix larger than the page budget fills the first bounded pass,
+      // which retains a resume cursor past the prefix and returns null. Then a new
+      // free-lane row is enqueued with receivedAt BEFORE the cursor. The retained
+      // cursor must be invalidated, or the keyset predicate (received_at > cursor)
+      // would skip the earlier row and claim the tail free row first.
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row < blockedPrefixRows ? `blocked-${row}` : "free-tail",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedPrefixRows ? "blocked" : "free",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // Enqueue an earlier free-lane row before the saved cursor position. This
+      // write must invalidate the resume cursor.
+      await queue.enqueue("earlier-free", { lane: "free" }, { receivedAt: -1 });
+
+      // The next direct call must rescan from the front and claim the earlier row.
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("earlier-free");
+    });
+  });
 });

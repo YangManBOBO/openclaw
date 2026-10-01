@@ -234,6 +234,7 @@ export function createChannelIngressQueue<
       assertQueueCurrent(context);
       if (await execute("channelIngress.recover", { row, cutoff, now: current }, context)) {
         recovered++;
+        invalidateResumeBefore(row.received_at, row.event_id);
       }
     }
     return recovered;
@@ -260,6 +261,26 @@ export function createChannelIngressQueue<
         blockedLaneKeys: string[];
       }
     | undefined;
+
+  // A retained direct-scan cursor is only valid while no pending row exists
+  // before it. Any write that adds a pending row sorting before the cursor
+  // (an explicit earlier receivedAt, a recovered/released claim, a resubmit)
+  // must invalidate the cursor so the next direct call rescans from the front
+  // instead of skipping that earlier row.
+  const invalidateResumeBefore = (receivedAt: number, eventId: string) => {
+    const resume = directScanResume;
+    if (!resume) {
+      return;
+    }
+    const before =
+      resume.orderBy === "id"
+        ? eventId < resume.cursor.eventId
+        : receivedAt < resume.cursor.receivedAt ||
+          (receivedAt === resume.cursor.receivedAt && eventId < resume.cursor.eventId);
+    if (before) {
+      directScanResume = undefined;
+    }
+  };
 
   const claimNext: ChannelIngressQueue<
     TPayload,
@@ -429,6 +450,9 @@ export function createChannelIngressQueue<
       });
       const row = result.row;
       if (result.accepted) {
+        // A new pending row before the retained cursor would be skipped by the
+        // keyset resume; drop the cursor so the earlier row stays reachable.
+        invalidateResumeBefore(receivedAt, eventId);
         return {
           kind: "accepted",
           duplicate: false,
@@ -510,12 +534,21 @@ export function createChannelIngressQueue<
         metadataJson:
           completeOptions?.metadata === undefined ? null : JSON.stringify(completeOptions.metadata),
       }),
-    release: async (value, releaseOptions) =>
-      await execute("channelIngress.release", {
+    release: async (value, releaseOptions) => {
+      const released = await execute("channelIngress.release", {
         ...mutation(value, releaseOptions?.releasedAt ?? now()),
         recordAttempt: releaseOptions?.recordAttempt,
         lastError: releaseOptions?.lastError,
-      }),
+      });
+      if (released && typeof value !== "string" && "receivedAt" in value) {
+        invalidateResumeBefore(
+          (value as ChannelIngressQueueClaim<TPayload, TMetadata> & { receivedAt: number })
+            .receivedAt,
+          value.id,
+        );
+      }
+      return released;
+    },
     fail: async (value, failOptions) =>
       await execute("channelIngress.fail", {
         ...mutation(value, failOptions.failedAt ?? now()),
@@ -537,6 +570,7 @@ export function createChannelIngressQueue<
         case "unrecoverable":
           return { kind: result.kind, record: failedRecord<TPayload, TMetadata>(result.row) };
         case "resubmitted":
+          invalidateResumeBefore(result.row.received_at, result.row.event_id);
           return {
             kind: result.kind,
             record: requiredRecord<TPayload, TMetadata>(result.row),
