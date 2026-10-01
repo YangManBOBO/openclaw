@@ -541,11 +541,11 @@ export function createChannelIngressQueue<
         lastError: releaseOptions?.lastError,
       });
       if (released && typeof value !== "string" && "receivedAt" in value) {
-        invalidateResumeBefore(
+        const releasedAt =
+          // SAFETY: the `in` guard proved the caller passed a full claim with receivedAt.
           (value as ChannelIngressQueueClaim<TPayload, TMetadata> & { receivedAt: number })
-            .receivedAt,
-          value.id,
-        );
+            .receivedAt;
+        invalidateResumeBefore(releasedAt, value.id);
       }
       return released;
     },
