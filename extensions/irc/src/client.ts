@@ -14,6 +14,11 @@ const IRC_ERROR_CODES = new Set(["432", "464", "465"]);
 const IRC_NICK_COLLISION_CODES = new Set(["433", "436"]);
 const IRC_MAX_LINE_BYTES = 512;
 const MAX_UTF8_CODE_POINT_BYTES = 4;
+// Recipients see our line prefixed by the server's `:nick!user@host `, and that relayed
+// line is bounded by 512 bytes too. Reserve the relay prefix's worst case (`~` + USERLEN
+// 10, HOSTLEN 63) so carried whitespace cannot combine into a chunk a server truncates.
+const IRC_MAX_RELAY_USER_BYTES = 11;
+const IRC_MAX_RELAY_HOST_BYTES = 63;
 
 function takeIrcWhitespacePrefix(whitespace: string, maxBytes: number): string {
   let prefix = "";
@@ -257,7 +262,12 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     if (!cleaned) {
       throw new Error("Message must be non-empty for IRC sends");
     }
-    const lineOverheadBytes = Buffer.byteLength(`PRIVMSG ${normalizedTarget} :\r\n`, "utf8");
+    const relayPrefixBytes =
+      Buffer.byteLength(`:${currentNick}!@ `, "utf8") +
+      IRC_MAX_RELAY_USER_BYTES +
+      IRC_MAX_RELAY_HOST_BYTES;
+    const lineOverheadBytes =
+      relayPrefixBytes + Buffer.byteLength(`PRIVMSG ${normalizedTarget} :\r\n`, "utf8");
     const maxChunkBytes = IRC_MAX_LINE_BYTES - lineOverheadBytes;
     // Encode the original text with the reference so escapes are not decoded twice.
     let remaining = replyTo ? sanitizeIrcOutboundText(`${text}\n\n[reply:${replyTo}]`) : cleaned;
