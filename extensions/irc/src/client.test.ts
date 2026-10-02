@@ -351,7 +351,7 @@ describe("irc client PRIVMSG chunking on the wire", () => {
       const bodies = await collectPrivmsgBodies(server, text);
       expect(bodies.length).toBeGreaterThan(1);
       expect(maxLineBytes(bodies)).toBeLessThanOrEqual(512);
-      expect(bodies.join("")).toMatch(/^a +b$/);
+      expect(bodies.join("")).toBe(text);
     } finally {
       await server.close();
     }

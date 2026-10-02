@@ -201,6 +201,14 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     socket.write(`${cleaned}\r\n`);
   };
 
+  const sendRawPreservingWhitespace = (line: string) => {
+    const cleaned = line.replace(/[\r\n]+/g, "");
+    if (!cleaned) {
+      throw new Error("IRC command cannot be empty");
+    }
+    socket.write(`${cleaned}\r\n`);
+  };
+
   const tryRecoverNickCollision = (): boolean => {
     const nickServEnabled = options.nickserv?.enabled !== false;
     const nickservPassword = sanitizeIrcOutboundText(options.nickserv?.password ?? "");
@@ -260,7 +268,11 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       // sides used to drop separator spaces between chunks, collapsing runs of
       // spaces in the delivered message.
       const pendingBytes = Buffer.byteLength(pendingWhitespace, "utf8");
-      const chunk = takeIrcPrivmsgChunk(remaining, messageChunkMaxChars, maxChunkBytes - pendingBytes);
+      const chunk = takeIrcPrivmsgChunk(
+        remaining,
+        messageChunkMaxChars,
+        maxChunkBytes - pendingBytes,
+      );
       const trimmed = chunk.trimEnd();
       if (trimmed.length > 0) {
         sendRaw(`PRIVMSG ${normalizedTarget} :${pendingWhitespace}${trimmed}`);
@@ -271,10 +283,18 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
         // carry it forward as the leading space of the next non-empty chunk
         // instead of sending an empty PRIVMSG, and guarantee progress. Cap the
         // carried run to the line budget so a run longer than one line cannot
-        // overflow the 512-byte IRC limit.
+        // overflow the 512-byte IRC limit, and emit the overflow as its own
+        // whitespace-only lines so no sanitized bytes are dropped.
         const carryBudget = maxChunkBytes - pendingBytes - MAX_UTF8_CODE_POINT_BYTES;
-        pendingWhitespace += carryBudget > 0 ? takeIrcWhitespacePrefix(chunk, carryBudget) : "";
+        const carried = carryBudget > 0 ? takeIrcWhitespacePrefix(chunk, carryBudget) : "";
+        pendingWhitespace += carried;
         remaining = remaining.slice(chunk.length);
+        let overflow = chunk.slice(carried.length);
+        while (overflow.length > 0) {
+          const wsChunk = takeIrcPrivmsgChunk(overflow, messageChunkMaxChars, maxChunkBytes);
+          sendRawPreservingWhitespace(`PRIVMSG ${normalizedTarget} :${wsChunk}`);
+          overflow = overflow.slice(wsChunk.length);
+        }
       }
     }
   };
