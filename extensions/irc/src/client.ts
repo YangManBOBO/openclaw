@@ -1,6 +1,6 @@
-// Irc plugin module implements client behavior.
 import net from "node:net";
 import tls from "node:tls";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { withTimeout } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
@@ -13,6 +13,21 @@ import {
 const IRC_ERROR_CODES = new Set(["432", "464", "465"]);
 const IRC_NICK_COLLISION_CODES = new Set(["433", "436"]);
 const IRC_MAX_LINE_BYTES = 512;
+const MAX_UTF8_CODE_POINT_BYTES = 4;
+
+function takeIrcWhitespacePrefix(whitespace: string, maxBytes: number): string {
+  let prefix = "";
+  let bytes = 0;
+  for (const codePoint of whitespace) {
+    const codePointBytes = Buffer.byteLength(codePoint, "utf8");
+    if (bytes + codePointBytes > maxBytes) {
+      break;
+    }
+    prefix += codePoint;
+    bytes += codePointBytes;
+  }
+  return prefix;
+}
 
 function takeIrcPrivmsgChunk(text: string, maxChars: number, maxBytes: number): string {
   let end = 0;
@@ -87,7 +102,7 @@ export type IrcClient = {
   isReady: () => boolean;
   sendRaw: (line: string) => void;
   join: (channel: string) => void;
-  sendPrivmsg: (target: string, text: string) => void;
+  sendPrivmsg: (target: string, text: string, replyTo?: string) => void;
   quit: (reason?: string) => void;
   close: () => void;
 };
@@ -114,10 +129,6 @@ function buildFallbackNick(nick: string): string {
   return `${base}${suffix}`;
 }
 
-function normalizeIrcNick(value: string): string {
-  return normalizeLowercaseStringOrEmpty(value);
-}
-
 function buildIrcNickServCommands(options?: IrcNickServOptions): string[] {
   if (!options || options.enabled === false) {
     return [];
@@ -139,7 +150,7 @@ function buildIrcNickServCommands(options?: IrcNickServOptions): string[] {
 }
 
 export async function connectIrcClient(options: IrcClientOptions): Promise<IrcClient> {
-  const timeoutMs = options.connectTimeoutMs != null ? options.connectTimeoutMs : 15000;
+  const timeoutMs = options.connectTimeoutMs ?? 15000;
   const messageChunkMaxChars = Math.max(1, Math.floor(options.messageChunkMaxChars ?? 350));
 
   if (!options.host.trim()) {
@@ -167,22 +178,13 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
 
   socket.setEncoding("utf8");
 
-  let resolveReady: (() => void) | null = null;
-  let rejectReady: ((error: Error) => void) | null = null;
-  const readyPromise = new Promise<void>((resolve, reject) => {
-    resolveReady = resolve;
-    rejectReady = reject;
-  });
+  const readyDeferred = createDeferred<void>();
 
   const fail = (err: unknown) => {
     const error = toIrcError(err);
-    if (options.onError) {
-      options.onError(error);
-    }
-    if (!ready && rejectReady) {
-      rejectReady(error);
-      rejectReady = null;
-      resolveReady = null;
+    options.onError?.(error);
+    if (!ready) {
+      readyDeferred.reject(error);
     }
   };
 
@@ -217,7 +219,10 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     if (!fallbackNickAttempted) {
       fallbackNickAttempted = true;
       const fallbackNick = buildFallbackNick(desiredNick);
-      if (normalizeIrcNick(fallbackNick) !== normalizeIrcNick(currentNick)) {
+      if (
+        normalizeLowercaseStringOrEmpty(fallbackNick) !==
+        normalizeLowercaseStringOrEmpty(currentNick)
+      ) {
         try {
           sendRaw(`NICK ${fallbackNick}`);
           currentNick = fallbackNick;
@@ -238,22 +243,24 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     sendRaw(`JOIN ${target}`);
   };
 
-  const sendPrivmsg = (target: string, text: string) => {
+  const sendPrivmsg = (target: string, text: string, replyTo?: string) => {
     const normalizedTarget = sanitizeIrcTarget(target);
     const cleaned = sanitizeIrcOutboundText(text);
     if (!cleaned) {
-      return;
+      throw new Error("Message must be non-empty for IRC sends");
     }
     const lineOverheadBytes = Buffer.byteLength(`PRIVMSG ${normalizedTarget} :\r\n`, "utf8");
     const maxChunkBytes = IRC_MAX_LINE_BYTES - lineOverheadBytes;
-    let remaining = cleaned;
+    // Encode the original text with the reference so escapes are not decoded twice.
+    let remaining = replyTo ? sanitizeIrcOutboundText(`${text}\n\n[reply:${replyTo}]`) : cleaned;
     let pendingWhitespace = "";
     while (remaining.length > 0) {
       // Slice by the trimmed length so whitespace trimmed off a chunk's tail
       // stays in `remaining` as the next chunk's leading space. Trimming both
       // sides used to drop separator spaces between chunks, collapsing runs of
       // spaces in the delivered message.
-      const chunk = takeIrcPrivmsgChunk(remaining, messageChunkMaxChars, maxChunkBytes);
+      const pendingBytes = Buffer.byteLength(pendingWhitespace, "utf8");
+      const chunk = takeIrcPrivmsgChunk(remaining, messageChunkMaxChars, maxChunkBytes - pendingBytes);
       const trimmed = chunk.trimEnd();
       if (trimmed.length > 0) {
         sendRaw(`PRIVMSG ${normalizedTarget} :${pendingWhitespace}${trimmed}`);
@@ -262,8 +269,11 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       } else {
         // A chunk made of only whitespace preserves an interior space run:
         // carry it forward as the leading space of the next non-empty chunk
-        // instead of sending an empty PRIVMSG, and guarantee progress.
-        pendingWhitespace += chunk;
+        // instead of sending an empty PRIVMSG, and guarantee progress. Cap the
+        // carried run to the line budget so a run longer than one line cannot
+        // overflow the 512-byte IRC limit.
+        const carryBudget = maxChunkBytes - pendingBytes - MAX_UTF8_CODE_POINT_BYTES;
+        pendingWhitespace += carryBudget > 0 ? takeIrcWhitespacePrefix(chunk, carryBudget) : "";
         remaining = remaining.slice(chunk.length);
       }
     }
@@ -276,7 +286,7 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     closed = true;
     removeAbortListener?.();
     removeAbortListener = null;
-    const safeReason = sanitizeIrcOutboundText(reason != null ? reason : "bye");
+    const safeReason = sanitizeIrcOutboundText(reason ?? "bye");
     try {
       if (safeReason) {
         sendRaw(`QUIT :${safeReason}`);
@@ -311,9 +321,7 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       if (!rawLine) {
         continue;
       }
-      if (options.onLine) {
-        options.onLine(rawLine);
-      }
+      options.onLine?.(rawLine);
 
       const line = parseIrcLine(rawLine);
       if (!line) {
@@ -321,42 +329,32 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       }
 
       if (line.command === "PING") {
-        const payload =
-          line.trailing != null ? line.trailing : line.params[0] != null ? line.params[0] : "";
+        const payload = line.trailing ?? line.params[0] ?? "";
         sendRaw(`PONG :${payload}`);
         continue;
       }
 
       if (line.command === "NICK") {
         const prefix = parseIrcPrefix(line.prefix);
-        if (prefix.nick && normalizeIrcNick(prefix.nick) === normalizeIrcNick(currentNick)) {
-          const next =
-            line.trailing != null
-              ? line.trailing
-              : line.params[0] != null
-                ? line.params[0]
-                : currentNick;
-          currentNick = next.trim();
+        if (
+          prefix.nick &&
+          normalizeLowercaseStringOrEmpty(prefix.nick) ===
+            normalizeLowercaseStringOrEmpty(currentNick)
+        ) {
+          currentNick = (line.trailing ?? line.params[0] ?? currentNick).trim();
         }
         continue;
       }
 
-      if (!ready && IRC_NICK_COLLISION_CODES.has(line.command)) {
-        if (tryRecoverNickCollision()) {
+      const nickCollision = IRC_NICK_COLLISION_CODES.has(line.command);
+      if (!ready && (nickCollision || IRC_ERROR_CODES.has(line.command))) {
+        if (nickCollision && tryRecoverNickCollision()) {
           continue;
         }
         const detail =
-          line.trailing != null ? line.trailing : line.params.join(" ") || "nickname in use";
-        fail(new Error(`IRC login failed (${line.command}): ${detail}`));
-        close();
-        return;
-      }
-
-      if (!ready && IRC_ERROR_CODES.has(line.command)) {
-        const detail =
-          line.trailing != null ? line.trailing : line.params.join(" ") || "login rejected";
-        fail(new Error(`IRC login failed (${line.command}): ${detail}`));
-        close();
+          line.trailing ??
+          (line.params.join(" ") || (nickCollision ? "nickname in use" : "login rejected"));
+        failAndClose(new Error(`IRC login failed (${line.command}): ${detail}`));
         return;
       }
 
@@ -385,27 +383,21 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
             fail(err);
           }
         }
-        if (resolveReady) {
-          resolveReady();
-        }
-        resolveReady = null;
-        rejectReady = null;
+        readyDeferred.resolve();
         continue;
       }
 
       if (line.command === "NOTICE") {
-        if (options.onNotice) {
-          options.onNotice(line.trailing != null ? line.trailing : "", line.params[0]);
-        }
+        options.onNotice?.(line.trailing ?? "", line.params[0]);
         continue;
       }
 
       if (line.command === "PRIVMSG") {
         const targetParam = line.params[0];
-        const target = targetParam ? targetParam.trim() : "";
+        const target = targetParam?.trim() ?? "";
         const text = line.trailing ?? line.params[1] ?? "";
         const prefix = parseIrcPrefix(line.prefix);
-        const senderNick = prefix.nick ? prefix.nick.trim() : "";
+        const senderNick = prefix.nick?.trim() ?? "";
         if (!target || !senderNick || !text.trim()) {
           continue;
         }
@@ -436,8 +428,7 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
       sendRaw(`NICK ${options.nick.trim()}`);
       sendRaw(`USER ${options.username.trim()} 0 * :${sanitizeIrcOutboundText(options.realname)}`);
     } catch (err) {
-      fail(err);
-      close();
+      failAndClose(err);
     }
   });
 
@@ -475,7 +466,7 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
   }
 
   try {
-    await withTimeout(readyPromise, timeoutMs, "IRC connect");
+    await withTimeout(readyDeferred.promise, timeoutMs, "IRC connect");
   } catch (error) {
     close();
     throw error;

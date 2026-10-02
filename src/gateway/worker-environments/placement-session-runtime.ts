@@ -30,10 +30,11 @@ export function resolveWorkerPlacementSessionRuntime(params: {
     ...params,
     source: {
       entry: params.entry,
-      loadSessionEntry: (key) => {
+      readSourceEntry: (key) => {
         const target = resolveGatewaySessionStoreTargetWithStore({
           ...params,
           key: params.sessionKey,
+          preserveQualifiedAddress: true,
           clone: false,
           readOnly: true,
           exactRead: true,
