@@ -128,18 +128,17 @@ async function startReadyThenDropIrcServer(): Promise<
   DisconnectingIrcServer & {
     dropReadyReplacement(): void;
     readyReplacementClosed: Promise<void>;
+    latestSocket(): net.Socket | undefined;
   }
 > {
   const lines: string[] = [];
   let connectionCount = 0;
-  let firstSocket: net.Socket;
+  const sockets: net.Socket[] = [];
   let readyReplacementSocket: net.Socket | undefined;
   const readyReplacementClosed = createDeferred<void>();
   const server = await startIrcTestServer((socket) => {
     const connectionNumber = ++connectionCount;
-    if (connectionNumber === 1) {
-      firstSocket = socket;
-    }
+    sockets.push(socket);
     if (connectionNumber === 2) {
       readyReplacementSocket = socket;
       socket.on("close", () => readyReplacementClosed.resolve());
@@ -156,9 +155,10 @@ async function startReadyThenDropIrcServer(): Promise<
   return {
     ...server,
     lines,
-    disconnectFirst: () => firstSocket.destroy(),
+    disconnectFirst: () => sockets[0]?.destroy(),
     dropReadyReplacement: () => readyReplacementSocket?.destroy(),
     readyReplacementClosed: readyReplacementClosed.promise,
+    latestSocket: () => sockets[sockets.length - 1],
     get connectionCount() {
       return connectionCount;
     },
@@ -384,6 +384,7 @@ describe("irc monitor reconnect", () => {
         stateDir,
       });
       const sockets = new Map<string, net.Socket>();
+      const displacedSocketClosed = createDeferred<void>();
       let connections = 0;
       const server = await startIrcTestServer((socket) => {
         connections += 1;
@@ -392,6 +393,9 @@ describe("irc monitor reconnect", () => {
           if (line.startsWith("NICK ")) {
             nick = line.slice(5);
             sockets.set(nick, socket);
+            if (nick === "qa-alpha") {
+              socket.on("close", () => displacedSocketClosed.resolve());
+            }
           }
           if (line.startsWith("USER ")) {
             socket.write(`:server 001 ${nick} :welcome\r\n`);
@@ -451,6 +455,11 @@ describe("irc monitor reconnect", () => {
         releaseAdmission.resolve();
         await stopping;
         alphaQueue.enqueue = enqueue;
+        // The stopped account's displaced socket closed while the active sibling
+        // socket stayed usable (same live socket, not destroyed).
+        await withTimeout(displacedSocketClosed.promise, 3_000, "displaced alpha socket closed");
+        expect(sockets.get("qa-beta")).toBe(betaSocket);
+        expect(betaSocket?.destroyed).toBe(false);
         const pending = await alphaQueue.listPending({ limit: "all" });
         expect(pending).toHaveLength(1);
         const recovered = observeIngressCompletion(alphaQueue);
@@ -462,8 +471,6 @@ describe("irc monitor reconnect", () => {
           target: "#alpha",
         });
         expect(await alphaQueue.listPending({ limit: "all" })).toEqual([]);
-        expect(sockets.get("qa-beta")).toBe(betaSocket);
-        expect(betaSocket?.destroyed).toBe(false);
         expect(connections).toBe(3);
       } finally {
         releaseAdmission.resolve();
@@ -548,6 +555,11 @@ describe("irc monitor reconnect", () => {
         await withTimeout(server.readyReplacementClosed, 3000, "ready replacement socket closed");
         await withTimeout(recovered.promise, 3000, "IRC recovery after a ready connection dropped");
         expect(server.connectionCount).toBeGreaterThanOrEqual(3);
+        // The displaced sockets were closed; only the active connection remains and
+        // is usable (not destroyed).
+        expect(server.openSocketCount()).toBe(1);
+        const activeSocket = server.latestSocket();
+        expect(activeSocket?.destroyed).toBe(false);
         const lifecycles = statusSink.mock.calls.flatMap(([patch]) =>
           patch.lifecycle ? [patch.lifecycle as string] : [],
         );

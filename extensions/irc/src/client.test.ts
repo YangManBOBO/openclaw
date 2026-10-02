@@ -1,4 +1,5 @@
 // Irc tests cover client plugin behavior.
+import net from "node:net";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { withTimeout } from "openclaw/plugin-sdk/security-runtime";
 import { describe, expect, it } from "vitest";
@@ -47,6 +48,60 @@ async function startLoopbackIrcServer(options?: {
     });
   });
   return { ...server, lines, quitReceived: quitReceived.promise };
+}
+
+type RelayingIrcServer = {
+  port: number;
+  lines: string[];
+  quitReceived: Promise<void>;
+  connectRecipient(): Promise<net.Socket>;
+  close(): Promise<void>;
+};
+
+// A real relay: the server forwards each bot PRIVMSG to a receiving IRC client,
+// prefixing it with the sender's nick!user@host the way a real server does. The
+// prefix uses the longest user@host IRC allows so the 512-byte relayed-line
+// budget is proven for the worst case at the recipient, not just in a budget
+// calculation.
+async function startRelayingIrcServer(): Promise<RelayingIrcServer> {
+  const lines: string[] = [];
+  const quitReceived = createDeferred<void>();
+  const recipientConnected = createDeferred<void>();
+  let recipient: net.Socket | undefined;
+  const server = await startIrcTestServer((socket) => {
+    if (!recipient) {
+      recipient = socket;
+      recipientConnected.resolve();
+      return;
+    }
+    onIrcTestLine(socket, (line) => {
+      lines.push(line);
+      if (line.startsWith("QUIT :")) {
+        quitReceived.resolve();
+      }
+      if (line.startsWith("USER ")) {
+        socket.write(":server 001 bot :welcome\r\n");
+      } else if (line.startsWith("PRIVMSG #general :") && recipient) {
+        const body = line.slice("PRIVMSG #general :".length);
+        recipient.write(`${RELAY_PREFIX}PRIVMSG #general :${body}\r\n`);
+      }
+    });
+  });
+  return {
+    ...server,
+    lines,
+    quitReceived: quitReceived.promise,
+    connectRecipient: async () => {
+      const socket = net.createConnection({ host: "127.0.0.1", port: server.port });
+      socket.setEncoding("utf8");
+      await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      await recipientConnected.promise;
+      return socket;
+    },
+  };
 }
 
 async function connectAndCollectRegistration(params: {
@@ -242,11 +297,60 @@ async function collectPrivmsgBodies(
   }
 }
 
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+async function collectRelayedBodies(
+  text: string,
+  messageChunkMaxChars?: number,
+): Promise<{ bodies: string[]; wireLines: string[] }> {
+  const server = await startRelayingIrcServer();
+  const recipient = await server.connectRecipient();
+  const recipientLines: string[] = [];
+  const settled = createDeferred<void>();
+  let expected = 0;
+  onIrcTestLine(recipient, (line) => {
+    recipientLines.push(line);
+    if (expected > 0 && recipientLines.length >= expected) {
+      settled.resolve();
+    }
+  });
+  const client = await connectIrcClient({
+    host: "127.0.0.1",
+    port: server.port,
+    tls: false,
+    nick: "bot",
+    username: "bot",
+    realname: "OpenClaw Bot",
+    connectTimeoutMs: 5000,
+    messageChunkMaxChars,
+  });
+  try {
+    client.sendPrivmsg("#general", text);
+    client.quit("test complete");
+    await withTimeout(server.quitReceived, 5000, "IRC PRIVMSG output");
+    expected = server.lines.filter((line) => line.startsWith("PRIVMSG #general :")).length;
+    if (recipientLines.length >= expected) {
+      settled.resolve();
+    }
+    await withTimeout(settled.promise, 3000, "recipient received relayed lines");
+    const relayed = recipientLines.filter((line) =>
+      line.startsWith(`${RELAY_PREFIX}PRIVMSG #general :`),
+    );
+    return {
+      bodies: relayed.map((line) => line.slice(`${RELAY_PREFIX}PRIVMSG #general :`.length)),
+      // The relay wrote exactly these bytes; onIrcTestLine only strips the CRLF.
+      wireLines: relayed.map((line) => `${line}\r\n`),
+    };
+  } finally {
+    client.close();
+    recipient.destroy();
+    await server.close();
+  }
+}
 
 // The line recipients get: the server puts our `:nick!user@host ` in front, and 512 bytes bounds
 // that relayed line too, so measure it with the longest user@host a server can give us.
 const RELAY_PREFIX = `:bot!${"u".repeat(11)}@${"h".repeat(63)} `;
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 function maxRelayedLineBytes(bodies: string[]): number {
   return Math.max(
@@ -375,4 +479,23 @@ describe("irc client PRIVMSG chunking on the wire", () => {
       await server.close();
     }
   });
+});
+
+describe("irc client PRIVMSG recipient-side relay", () => {
+  it.each<{ name: string; text: string; limit?: number; separator?: string }>([
+    { name: "a space run longer than one chunk", text: `a${" ".repeat(600)}b` },
+    { name: "mixed whitespace overflow", text: `a\u00a0${" ".repeat(600)}b` },
+    { name: "multibyte text", text: "漢".repeat(900) },
+  ])(
+    "delivers $name to a receiving IRC client byte-for-byte within 512-byte relayed lines",
+    async ({ text, limit, separator = "" }) => {
+      const { bodies, wireLines } = await collectRelayedBodies(text, limit);
+      expect(bodies.length).toBeGreaterThan(1);
+      for (const wireLine of wireLines) {
+        expect(Buffer.byteLength(wireLine, "utf8")).toBeLessThanOrEqual(512);
+      }
+      expect(bodies.some((body) => LONE_SURROGATE.test(body))).toBe(false);
+      expect(bodies.join(separator)).toBe(text);
+    },
+  );
 });
