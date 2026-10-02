@@ -124,6 +124,38 @@ async function startDisconnectingIrcServer(): Promise<DisconnectingIrcServer> {
   };
 }
 
+async function startReadyThenDropIrcServer(): Promise<DisconnectingIrcServer> {
+  const lines: string[] = [];
+  let connectionCount = 0;
+  let firstSocket: net.Socket;
+  const server = await startIrcTestServer((socket) => {
+    const connectionNumber = ++connectionCount;
+    if (connectionNumber === 1) {
+      firstSocket = socket;
+    }
+    onIrcTestLine(socket, (line) => {
+      lines.push(line);
+      if (line.startsWith("USER ")) {
+        // Every connection registers fully; the second one drops right after
+        // readiness so the monitor must recover when an activated socket closes
+        // during the replacement's activation window.
+        socket.write(":server 001 bot :welcome\r\n");
+        if (connectionNumber === 2) {
+          setTimeout(() => socket.destroy(), 25);
+        }
+      }
+    });
+  });
+  return {
+    ...server,
+    lines,
+    disconnectFirst: () => firstSocket.destroy(),
+    get connectionCount() {
+      return connectionCount;
+    },
+  };
+}
+
 async function startInboundIrcServer(welcomeNick = "bot"): Promise<InboundIrcServer> {
   let clientSocket: net.Socket;
   const lines: string[] = [];
@@ -454,6 +486,45 @@ describe("irc monitor reconnect", () => {
             patch.lifecycle ? [patch.lifecycle as string] : [],
           ),
         ).toEqual(["ready", "recovering", "recovering", "ready"]);
+        for (const [readyPatch] of statusSink.mock.calls.filter(
+          ([statusPatch]) => statusPatch.lifecycle === "ready",
+        )) {
+          expect(readyPatch).toMatchObject({
+            running: true,
+            connected: true,
+            lastConnectedAt: expect.any(Number),
+            lastError: null,
+            terminalDisconnect: undefined,
+          });
+        }
+      } finally {
+        if (monitor) {
+          await monitor.stop();
+        }
+        await server.close();
+      }
+    });
+  });
+
+  it("recovers when a ready replacement connection drops during activation", async () => {
+    await withIngressQueue(async (ingressQueue) => {
+      installMonitorRuntime();
+      const { statusSink, reconnected } = observeReconnect();
+      const server = await startReadyThenDropIrcServer();
+      const config = monitorConfig(server.port, "bot", { channels: ["#openclaw"] });
+      let monitor: { stop: () => Promise<void> } | undefined;
+
+      try {
+        monitor = await monitorIrcProvider({ config, ingressQueue, statusSink });
+        server.disconnectFirst();
+        await withTimeout(reconnected, 3000, "IRC recovery after a ready connection dropped");
+        expect(server.connectionCount).toBeGreaterThanOrEqual(3);
+        const lifecycles = statusSink.mock.calls.flatMap(([patch]) =>
+          patch.lifecycle ? [patch.lifecycle as string] : [],
+        );
+        expect(lifecycles[0]).toBe("ready");
+        expect(lifecycles[lifecycles.length - 1]).toBe("ready");
+        expect(lifecycles).toContain("recovering");
         for (const [readyPatch] of statusSink.mock.calls.filter(
           ([statusPatch]) => statusPatch.lifecycle === "ready",
         )) {
