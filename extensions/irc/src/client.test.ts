@@ -356,4 +356,17 @@ describe("irc client PRIVMSG chunking on the wire", () => {
       await server.close();
     }
   });
+
+  it("keeps mixed whitespace in its original order when overflow is chunked", async () => {
+    const server = await startLoopbackIrcServer();
+    try {
+      const text = `a\u00a0${" ".repeat(600)}b`;
+      const bodies = await collectPrivmsgBodies(server, text);
+      expect(bodies.length).toBeGreaterThan(1);
+      expect(maxLineBytes(bodies)).toBeLessThanOrEqual(512);
+      expect(bodies.join("")).toBe(text);
+    } finally {
+      await server.close();
+    }
+  });
 });

@@ -290,6 +290,13 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
         pendingWhitespace += carried;
         remaining = remaining.slice(chunk.length);
         let overflow = chunk.slice(carried.length);
+        if (overflow.length > 0) {
+          // Flush the buffered prefix before its overflow so a mixed-whitespace
+          // run (e.g. nonbreaking spaces plus ASCII spaces) keeps its original
+          // order across the byte-bounded wire lines.
+          overflow = pendingWhitespace + overflow;
+          pendingWhitespace = "";
+        }
         while (overflow.length > 0) {
           const wsChunk = takeIrcPrivmsgChunk(overflow, messageChunkMaxChars, maxChunkBytes);
           sendRawPreservingWhitespace(`PRIVMSG ${normalizedTarget} :${wsChunk}`);
