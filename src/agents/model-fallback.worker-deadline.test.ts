@@ -47,7 +47,7 @@ async function runPoolTaskWithDeadline(
   // the task genuinely reached a worker before the controlled clock advances, so
   // the deadline can never fire on host-side preparation however the host is
   // scheduled.
-  const started = createDeferredCore<void>();
+  const started = createDeferredCore();
   const pending = pool.run(
     () => ({ label: "hang-until-deadline", wait: true, counters, notifications: 1 }),
     {

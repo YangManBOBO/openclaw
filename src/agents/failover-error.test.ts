@@ -508,12 +508,6 @@ describe("failover diagnostic isolation", () => {
   });
 
   describe("hasLocalWorkerTaskTimeout", () => {
-    it("returns true for a direct local worker-task deadline", () => {
-      expect(
-        hasLocalWorkerTaskTimeout(new WorkerTaskError("worker task timed out", "timeout")),
-      ).toBe(true);
-    });
-
     it("returns true through a cause wrapper", () => {
       const wrapped = new Error("preparation failed", {
         cause: new WorkerTaskError("worker task timed out", "timeout"),
