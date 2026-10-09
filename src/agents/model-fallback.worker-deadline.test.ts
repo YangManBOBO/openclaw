@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { workerTaskPoolEntrypoints } from "../infra/worker-task-pool-runtime.test-support.js";
 import { WorkerTaskPool } from "../infra/worker-task-pool.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { hasLocalWorkerTaskTimeout, resolveModelFallbackError } from "./failover-error.js";
 import { runWithModelFallback } from "./model-fallback-runner.js";
 
@@ -41,18 +42,20 @@ async function runPoolTaskWithDeadline(
   const counters = new SharedArrayBuffer(8);
   const view = new Int32Array(counters);
   const release = () => Atomics.store(view, 1, 1);
-  const pending = pool.run(() => ({ label: "hang-until-deadline", wait: true, counters }), {
-    timeoutMs: 50,
-  });
-  // The worker increments counters[0] as soon as it starts the dispatched task.
-  // Yield to the real event loop (setImmediate is not faked) until it does, so
-  // the deadline fires on a genuinely dispatched task that reached a worker over
-  // IPC, not on host-side preparation.
-  for (let i = 0; i < 20_000 && view[0] === 0; i++) {
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-  }
+  // The worker notifies the host before it blocks on the fake deadline; awaiting
+  // that signal (a real IPC notification, not a bounded setImmediate poll) proves
+  // the task genuinely reached a worker before the controlled clock advances, so
+  // the deadline can never fire on host-side preparation however the host is
+  // scheduled.
+  const started = createDeferredCore<void>();
+  const pending = pool.run(
+    () => ({ label: "hang-until-deadline", wait: true, counters, notifications: 1 }),
+    {
+      timeoutMs: 50,
+      onNotification: () => started.resolve(),
+    },
+  );
+  await started.promise;
   try {
     await vi.advanceTimersByTimeAsync(50);
     return {
