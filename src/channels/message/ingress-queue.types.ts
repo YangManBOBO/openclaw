@@ -261,12 +261,21 @@ export type ChannelIngressClaimRequest = {
    * before the cursor invalidates the resume.
    */
   expectedPendingBeforeCursor?: number;
+  /**
+   * Fingerprint of the scan-visible pending rows before claimAfter expected by a
+   * retained direct-scan resume cursor. Combined with expectedPendingBeforeCursor
+   * it detects offsetting writes that preserve the count (one row removed and
+   * another inserted before the cursor), which count alone cannot observe.
+   */
+  expectedPendingBeforeCursorFingerprint?: string;
 };
 export type ChannelIngressClaimSnapshot = {
   pending: ChannelIngressRow[];
   claimed: ChannelIngressRow[];
   /** Authoritative count of scan-visible pending rows strictly before claimAfter. */
   pendingBeforeCursor?: number;
+  /** Fingerprint of the scan-visible pending rows strictly before claimAfter. */
+  pendingBeforeCursorFingerprint?: string;
 };
 
 /** Keyset cursor matching the pending ordering; the row after it opens the next claim page. */

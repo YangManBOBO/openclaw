@@ -290,6 +290,83 @@ describe("channel ingress queue resume", () => {
     });
   });
 
+  it("resumes past a blocked prefix that spans multiple resumed pages", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // The first bounded pass retains a cursor past blockedPrefixRows. One more
+      // page of blocked rows fills the first resumed page, so the free row only
+      // appears in the SECOND resumed page. The resumed walk must keep counting
+      // the cursor row (inclusive accounting), or the authoritative revalidation
+      // falsely drops the keyset and rescans from the front forever without ever
+      // reaching the free row.
+      const resumedPageRows = scanLimit + CHANNEL_INGRESS_CORRUPT_REPAIR_LIMIT;
+      const blockedRows = blockedPrefixRows + resumedPageRows;
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedRows + 1 }, (_, row) => ({
+          eventId: row < blockedRows ? `blocked-${row}` : "free",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedRows ? "blocked" : "free",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("free");
+    });
+  });
+
+  it("revalidates the resume cursor when another handle replaces an earlier row without changing the count", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+      const other = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows }, (_, row) => ({
+          eventId: `blocked-${row}`,
+          receivedAt: row,
+          laneKey: null,
+          lane: "blocked",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // A second handle removes one blocked row before the cursor and inserts a
+      // free row with an earlier receivedAt. The scan-visible count before the
+      // cursor is preserved, so count-only revalidation accepts the stale resume
+      // and skips the earlier free row; the prefix fingerprint must detect the swap.
+      await other.delete("blocked-100");
+      await other.enqueue("replacement-free", { lane: "free" }, { receivedAt: -1 });
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("replacement-free");
+    });
+  });
+
   it("revalidates the in-flight page cursor when another handle writes during paging", async () => {
     await withTempState(async (stateDir) => {
       let clock = 0;

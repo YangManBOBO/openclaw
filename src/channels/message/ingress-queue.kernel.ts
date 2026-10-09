@@ -6,8 +6,8 @@ import {
   getNodeSqliteKysely,
   sqliteStringSet,
 } from "../../infra/kysely-sync.js";
-import { normalizeSqliteNumber } from "../../infra/sqlite-number.js";
 import type { DB } from "../../state/openclaw-state-db.generated.js";
+import { readChannelIngressPrefixInDatabase } from "./ingress-queue.claim-prefix.kernel.js";
 import {
   baseRecord,
   CHANNEL_INGRESS_CORRUPT_REPAIR_LIMIT,
@@ -109,39 +109,23 @@ export function readChannelIngressClaimSnapshotInDatabase(
   }
   // Repair can expose up to 100 later rows without changing the caller's scan window.
   let pendingBeforeCursor: number | undefined;
+  let pendingBeforeCursorFingerprint: string | undefined;
   if (input.expectedPendingBeforeCursor !== undefined && input.claimAfter) {
     // A retained direct-scan cursor is only valid while the scan-visible pending
-    // rows before it are unchanged. Count them in this same read so a write from
-    // any handle that inserted or removed a row before the cursor is observed
-    // atomically with the paged snapshot; the caller drops the resume otherwise.
-    const cursor = input.claimAfter;
-    let before = getQueue(db)
-      .selectFrom("channel_ingress_events")
-      .select((expression) => expression.fn.countAll<number>().as("count"))
-      .where("queue_name", "=", input.queueName)
-      .where("status", "=", "pending");
-    if (input.candidateIds) {
-      before = before.where("event_id", "in", input.candidateIds);
-    }
-    if (!input.reconcileStoredLaneKey && blocked.length) {
-      before = before.where((eb) =>
-        eb.or([eb("lane_key", "is", null), eb("lane_key", "not in", sqliteStringSet(blocked))]),
-      );
-    }
-    before =
-      input.orderBy === "id"
-        ? before.where("event_id", "<", cursor.eventId)
-        : before.where((eb) =>
-            eb.or([
-              eb("received_at", "<", cursor.receivedAt),
-              eb.and([
-                eb("received_at", "=", cursor.receivedAt),
-                eb("event_id", "<", cursor.eventId),
-              ]),
-            ]),
-          );
-    const counted = executeSqliteQueryTakeFirstSync(db, before);
-    pendingBeforeCursor = normalizeSqliteNumber(counted?.count ?? null) ?? 0;
+    // rows before it are unchanged. Read their count and fingerprint in this same
+    // pinned read so a write from any handle that inserted, removed, or replaced
+    // a row before the cursor is observed atomically with the paged snapshot; the
+    // caller drops the resume otherwise.
+    const prefix = readChannelIngressPrefixInDatabase(db, {
+      queueName: input.queueName,
+      candidateIds: input.candidateIds,
+      blockedLaneKeys: blocked,
+      reconcileStoredLaneKey: input.reconcileStoredLaneKey,
+      orderBy: input.orderBy,
+      claimAfter: input.claimAfter,
+    });
+    pendingBeforeCursor = prefix.count;
+    pendingBeforeCursorFingerprint = prefix.fingerprint;
   }
   return {
     claimed,
@@ -150,6 +134,7 @@ export function readChannelIngressClaimSnapshotInDatabase(
       paged.limit(normalizeLimit(input.scanLimit) + CHANNEL_INGRESS_CORRUPT_REPAIR_LIMIT),
     ).rows,
     ...(pendingBeforeCursor === undefined ? {} : { pendingBeforeCursor }),
+    ...(pendingBeforeCursorFingerprint === undefined ? {} : { pendingBeforeCursorFingerprint }),
   };
 }
 

@@ -9,12 +9,14 @@ import { resolveChannelIngressStateEnv } from "./ingress-queue-client.js";
 import {
   baseRecord,
   CHANNEL_INGRESS_CLAIM_SCAN_PAGE_BUDGET,
+  channelIngressPrefixRowFingerprint,
   claimedRecord,
   completedRecord,
   corruptClaimRecord,
   decodeClaimColumns,
   failedRecord,
   selectChannelIngressClaim,
+  xorChannelIngressPrefixFingerprints,
 } from "./ingress-queue.codec.js";
 import type {
   ChannelIngressClaimCursor,
@@ -263,6 +265,15 @@ export function createChannelIngressQueue<
         ) => string | undefined;
         blockedLaneKeys: string[];
         pendingBeforeCursor: number;
+        /**
+         * Fingerprint of the scan-visible pending rows strictly before the cursor
+         * at retention. Revalidated against the queue on resume (with the count)
+         * so offsetting writes from other handles that preserve the count still
+         * invalidate the cursor.
+         */
+        prefixFingerprint: string;
+        /** Fingerprint of the cursor row, so a resumed walk can extend the prefix. */
+        cursorRowFingerprint: string;
       }
     | undefined;
 
@@ -350,6 +361,13 @@ export function createChannelIngressQueue<
     // cursor; a mismatch means a write from any handle changed those rows, so the
     // keyset is dropped and the scan restarts from the front.
     let expectedPendingBeforeCursor: number | undefined;
+    // The authoritative fingerprint of the same prefix; a mismatch means a write
+    // replaced rows before the cursor while preserving the count, so the keyset
+    // is dropped too.
+    let expectedPendingBeforeCursorFingerprint: string | undefined;
+    // Fingerprint of the row that became claimAfter, needed to extend the prefix
+    // fingerprint across pages (the next prefix includes the cursor row).
+    let lastCursorRowFingerprint: string | undefined;
     if (directScan && directScanResume) {
       const resume = directScanResume;
       const inputsMatch =
@@ -361,35 +379,71 @@ export function createChannelIngressQueue<
       if (inputsMatch) {
         claimAfter = resume.cursor;
         expectedPendingBeforeCursor = resume.pendingBeforeCursor;
+        expectedPendingBeforeCursorFingerprint = resume.prefixFingerprint;
+        lastCursorRowFingerprint = resume.cursorRowFingerprint;
         // The resume page skips rows before the cursor; seed the walk with the
-        // validated count so a re-retained cursor still records rows before it.
-        scannedPendingRows = resume.pendingBeforeCursor;
+        // count including the cursor row so a re-retained cursor still records the
+        // rows strictly before it (scannedPendingRows - 1) without double-subtracting.
+        scannedPendingRows = resume.pendingBeforeCursor + 1;
       }
       directScanResume = undefined;
     }
     while (true) {
       const request: ChannelIngressClaimRequest =
         claimAfter && expectedPendingBeforeCursor !== undefined
-          ? { ...requestBase, claimAfter, expectedPendingBeforeCursor }
+          ? {
+              ...requestBase,
+              claimAfter,
+              expectedPendingBeforeCursor,
+              ...(expectedPendingBeforeCursorFingerprint === undefined
+                ? {}
+                : { expectedPendingBeforeCursorFingerprint }),
+            }
           : claimAfter
             ? { ...requestBase, claimAfter }
             : requestBase;
       const snapshot = await execute("channelIngress.claimSnapshot", request, context);
       if (expectedPendingBeforeCursor !== undefined) {
-        // Authoritative revalidation: the queue counts the scan-visible pending
-        // rows before the cursor in this same read. A mismatch means a write from
-        // any handle inserted or removed a row before the cursor, so the retained
-        // or in-flight progress is stale and the keyset must be dropped to rescan
-        // from the front instead of skipping that earlier row.
-        if (snapshot.pendingBeforeCursor !== expectedPendingBeforeCursor) {
+        // Authoritative revalidation: the queue counts and fingerprints the
+        // scan-visible pending rows before the cursor in this same read. A
+        // mismatch means a write from any handle inserted, removed, or replaced a
+        // row before the cursor, so the retained or in-flight progress is stale
+        // and the keyset must be dropped to rescan from the front instead of
+        // skipping that earlier row.
+        if (
+          snapshot.pendingBeforeCursor !== expectedPendingBeforeCursor ||
+          (expectedPendingBeforeCursorFingerprint !== undefined &&
+            snapshot.pendingBeforeCursorFingerprint !== expectedPendingBeforeCursorFingerprint)
+        ) {
           claimAfter = undefined;
           expectedPendingBeforeCursor = undefined;
+          expectedPendingBeforeCursorFingerprint = undefined;
           scannedPendingRows = 0;
           continue;
         }
         expectedPendingBeforeCursor = undefined;
+        expectedPendingBeforeCursorFingerprint = undefined;
       }
       scannedPendingRows += snapshot.pending.length;
+      // Fingerprint of the scan-visible pending rows strictly before the page's
+      // last row: the validated current prefix, the previous cursor row, and this
+      // page's walked rows except the cursor row. XOR-composed so the next page or
+      // a retained resume can be revalidated against the authoritative queue state.
+      const prefixFingerprintAfterPage = (
+        page: ChannelIngressRow[],
+        previousCursorFingerprint: string | undefined,
+      ): string => {
+        const pageFingerprint = xorChannelIngressPrefixFingerprints(
+          ...page.slice(0, -1).map((row) => channelIngressPrefixRowFingerprint(row)),
+        );
+        return snapshot.pendingBeforeCursorFingerprint === undefined
+          ? pageFingerprint
+          : xorChannelIngressPrefixFingerprints(
+              snapshot.pendingBeforeCursorFingerprint,
+              previousCursorFingerprint ?? "",
+              pageFingerprint,
+            );
+      };
       // Native fingerprinting owns row freshness; retain only the lane observations to recheck.
       const preparedLanes: Array<{ row: ChannelIngressRow; laneKey: string | undefined }> = [];
       const selection = selectChannelIngressClaim(
@@ -425,6 +479,7 @@ export function createChannelIngressQueue<
           if (directScan) {
             claimAfter = undefined;
             expectedPendingBeforeCursor = undefined;
+            expectedPendingBeforeCursorFingerprint = undefined;
             scannedPendingRows = 0;
           }
           continue;
@@ -438,13 +493,19 @@ export function createChannelIngressQueue<
           if (!last) {
             return null;
           }
-          claimAfter = { receivedAt: last.received_at, eventId: last.event_id };
-          claimPages += 1;
           if (directScan) {
             // The next page starts after last; it is only valid while the queue
-            // still holds exactly the walked rows (minus the cursor row) before it.
+            // still holds exactly the walked rows (minus the cursor row) before it,
+            // with the same membership fingerprint.
             expectedPendingBeforeCursor = scannedPendingRows - 1;
+            expectedPendingBeforeCursorFingerprint = prefixFingerprintAfterPage(
+              snapshot.pending,
+              lastCursorRowFingerprint,
+            );
           }
+          claimAfter = { receivedAt: last.received_at, eventId: last.event_id };
+          lastCursorRowFingerprint = channelIngressPrefixRowFingerprint(last);
+          claimPages += 1;
           continue;
         }
         if (directScan) {
@@ -452,8 +513,8 @@ export function createChannelIngressQueue<
           if (selection.more && last) {
             // The blocked prefix continues beyond this bounded pass; preserve
             // progress so the next direct call resumes past it. The scanned count
-            // minus the cursor row itself is the authoritative state the resume
-            // revalidates against the queue.
+            // minus the cursor row itself and the prefix fingerprint are the
+            // authoritative state the resume revalidates against the queue.
             directScanResume = {
               cursor: { receivedAt: last.received_at, eventId: last.event_id },
               orderBy: requestBase.orderBy,
@@ -461,6 +522,11 @@ export function createChannelIngressQueue<
               deriveLaneKey,
               blockedLaneKeys: requestBase.blockedLaneKeys,
               pendingBeforeCursor: scannedPendingRows - 1,
+              prefixFingerprint: prefixFingerprintAfterPage(
+                snapshot.pending,
+                lastCursorRowFingerprint,
+              ),
+              cursorRowFingerprint: channelIngressPrefixRowFingerprint(last),
             };
           } else {
             // The scan reached the end of the queue; wrap so lanes that unblock
@@ -478,6 +544,7 @@ export function createChannelIngressQueue<
           if (directScan) {
             claimAfter = undefined;
             expectedPendingBeforeCursor = undefined;
+            expectedPendingBeforeCursorFingerprint = undefined;
             scannedPendingRows = 0;
           }
           continue;

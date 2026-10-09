@@ -155,6 +155,41 @@ export const CHANNEL_INGRESS_CORRUPT_REPAIR_LIMIT = 100;
 /** Bound the number of bounded pages one claim scans past fully blocked lanes. */
 export const CHANNEL_INGRESS_CLAIM_SCAN_PAGE_BUDGET = 10;
 
+/**
+ * 64-bit FNV-1a over a prefix row's FIFO and membership identity. XOR-composable,
+ * so a retained direct-scan cursor can fold walked rows into an expected prefix
+ * fingerprint that detects offsetting writes (one row removed, another inserted)
+ * which a count alone cannot observe.
+ */
+export function channelIngressPrefixRowFingerprint(row: {
+  event_id: string;
+  received_at: number;
+  lane_key: string | null;
+  status: string;
+}): string {
+  let hash = 0xcbf29ce484222325n;
+  const parts = [row.event_id, String(row.received_at), row.lane_key ?? "", row.status];
+  for (const part of parts) {
+    for (let index = 0; index < part.length; index++) {
+      hash ^= BigInt(part.charCodeAt(index));
+      hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+    }
+    // Field separator so concatenations of adjacent parts cannot collide.
+    hash ^= 0xffn;
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16);
+}
+
+/** XOR-combine prefix row fingerprints into a set fingerprint of the ordered prefix. */
+export function xorChannelIngressPrefixFingerprints(...fingerprints: string[]): string {
+  let result = 0n;
+  for (const fingerprint of fingerprints) {
+    result ^= BigInt(`0x${fingerprint || "0"}`);
+  }
+  return result.toString(16);
+}
+
 /** Resolve host policy only for the rows the original bounded scan would visit. */
 export function selectChannelIngressClaim(
   snapshot: ChannelIngressClaimSnapshot,
