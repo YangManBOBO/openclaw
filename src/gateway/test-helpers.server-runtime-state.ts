@@ -40,12 +40,23 @@ export async function createGatewayRuntimeStateForTest(
   };
   const connectionState = createGatewayConnectionState({ ...params, bootId: randomUUID() });
   onTestFinished(async () => {
-    connectionState.mentionInbox.dispose();
+    await connectionState.mentionInbox.dispose();
     await params.scheduler.stop();
   });
   const httpTransport = await createGatewayHttpTransport({
     ...params,
     clients: connectionState.clients,
+  });
+  onTestFinished(async () => {
+    await Promise.all(
+      httpTransport.httpServers.map(
+        (server) =>
+          new Promise<void>((resolve) => {
+            server.close(() => resolve());
+            server.closeAllConnections();
+          }),
+      ),
+    );
   });
   return { ...httpTransport, ...connectionState };
 }

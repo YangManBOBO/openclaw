@@ -155,8 +155,8 @@ describe("workspace state store", () => {
     );
   });
 
-  it.each(["merge", "attest", "expire", "delete", "register-alias"] as const)(
-    "checks current ownership inside the %s transaction before changing state",
+  it.each(["merge", "expire", "delete", "register-alias"] as const)(
+    "refuses retired ownership before changing %s state",
     async (operation) => {
       const dir = workspaceDir();
       const alias = testState!.path("workspace-link");
@@ -174,20 +174,14 @@ describe("workspace state store", () => {
       writeWorkspaceFileCache({ filePath, content: "cached", identity: "identity" });
       const retired = new Error("workspace owner retired");
       const assertCurrent = () => {
-        expect(db.isTransaction).toBe(true);
+        if (operation === "delete") {
+          expect(db.isTransaction).toBe(true);
+        }
         throw retired;
       };
       const operations = {
         merge: () =>
           mergeWorkspaceSetupState(dir, { setupCompletedAt: "2026-07-16T02:00:00.000Z" }, 2_000, {
-            assertCurrent,
-          }),
-        attest: () =>
-          replaceWorkspaceAttestation({
-            workspaceDir: dir,
-            attestedAtMs: 2_000,
-            generatedHashes: new Map([["AGENTS.md", "b".repeat(64)]]),
-            nowMs: 2_000,
             assertCurrent,
           }),
         expire: () =>

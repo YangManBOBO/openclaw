@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,8 +18,19 @@ import {
   prepareCrabboxSourceCapsule,
   type CrabboxSourceCapsule,
 } from "../../scripts/crabbox-source-capsule.mts";
+import { createMirrorStaging } from "../../scripts/crabbox-staging.mts";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { createNestedGitEnv } from "../helpers/temp-repo.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>();
+  return { ...fs, lstatSync: vi.fn(fs.lstatSync) };
+});
+
+vi.mock("../../scripts/crabbox-staging.mts", async (importOriginal) => {
+  const staging = await importOriginal<typeof import("../../scripts/crabbox-staging.mts")>();
+  return { ...staging, createMirrorStaging: vi.fn(staging.createMirrorStaging) };
+});
 
 const temporary = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => {
@@ -126,9 +138,47 @@ function fileIdentity(path: string) {
 }
 
 describe.skipIf(process.platform === "win32")("persistent Crabbox source capsules", () => {
+  it.each(["initial allocation", "cold rebuild"])(
+    "rejects an unrecorded mirror before freezing during %s",
+    async (allocation) => {
+      const f = fixture();
+      if (allocation === "cold rebuild") {
+        const first = f.prepare();
+        first.cleanup();
+        writeFileSync(join(first.directory, "stable.txt"), "corrupted cached bytes\n");
+      }
+      const actual = await vi.importActual<typeof import("../../scripts/crabbox-staging.mts")>(
+        "../../scripts/crabbox-staging.mts",
+      );
+      let unrecordedRoot: string | undefined;
+      const rejectRecording = (...args: Parameters<typeof createMirrorStaging>) => {
+        const mirror = actual.createMirrorStaging(...args);
+        if (!mirror) {
+          throw new Error("fixture requires a mirror allocation");
+        }
+        mirror.staging.recorded = false;
+        unrecordedRoot = mirror.staging.root;
+        return mirror;
+      };
+      const allocate = vi.mocked(createMirrorStaging);
+      if (allocation === "cold rebuild") {
+        allocate.mockImplementationOnce(actual.createMirrorStaging);
+      }
+      allocate.mockImplementationOnce(rejectRecording);
+      const selected = join(f.root, "selected");
+      expect(() =>
+        f.prepare(true, `require("node:fs").writeFileSync(${JSON.stringify(selected)}, "ran");`),
+      ).toThrow("source mirror requires recorded staging");
+      expect(unrecordedRoot).toBeDefined();
+      expect(existsSync(unrecordedRoot!)).toBe(false);
+      expect(existsSync(selected)).toBe(false);
+    },
+  );
+
   it("keeps unchanged files and a warm index while updating eligibility and raw source bytes", () => {
-    const f = fixture();
+    const f = fixture({ "rename.txt": "renamed source\n" });
     writeFileSync(join(f.repository, "future.txt"), "initial untracked bytes\n");
+    writeFileSync(join(f.repository, "promoted.ignored"), "initially ignored bytes\n");
     writeFileSync(join(f.repository, "staged.ignored"), "staged ignored bytes\r\n");
     writeFileSync(join(f.repository, "credentials.secret"), "synthetic secret\n");
     f.git(f.repository, "add", "--force", "staged.ignored");
@@ -141,11 +191,16 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
     first.cleanup();
 
     const arrivingSecret = join(f.repository, "arriving.secret");
+    vi.mocked(lstatSync).mockClear();
     const unchanged = f.prepare(
       true,
       `require("node:fs").writeFileSync(${JSON.stringify(arrivingSecret)},"synthetic secret");`,
     );
     try {
+      // One pre-Git integrity check and one shared final seal per retained file.
+      expect(
+        vi.mocked(lstatSync).mock.calls.filter(([path]) => path === join(directory, "stable.txt")),
+      ).toHaveLength(2);
       expect(unchanged.directory).toBe(directory);
       for (const [path, identity] of before) {
         expect(fileIdentity(join(directory, path)), path).toEqual(identity);
@@ -161,6 +216,8 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
     writeFileSync(join(f.repository, "change.txt"), "updated raw bytes\r\n");
     writeFileSync(join(f.repository, ".gitignore"), "*.secret\n*.ignored\nfuture.txt\n");
     writeFileSync(join(f.repository, "new.txt"), "new untracked bytes\n");
+    renameSync(join(f.repository, "rename.txt"), join(f.repository, "renamed.txt"));
+    f.git(f.repository, "add", "--force", "promoted.ignored");
     rmSync(join(f.repository, "deleted.txt"));
     const warm = f.prepare();
     try {
@@ -176,10 +233,12 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
         ".gitignore",
         "change.txt",
         "new.txt",
+        "promoted.ignored",
+        "renamed.txt",
         "stable.txt",
         "staged.ignored",
       ]);
-      for (const path of ["credentials.secret", "deleted.txt", "future.txt"]) {
+      for (const path of ["credentials.secret", "deleted.txt", "future.txt", "rename.txt"]) {
         expect(existsSync(join(directory, path)), path).toBe(false);
       }
       f.expectColdEquivalent(warm);
@@ -188,35 +247,53 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
     }
   });
 
-  it("retains original tracking when an ignored staged source is deleted and later restored", () => {
-    const f = fixture();
-    const path = "staged.ignored";
-    const source = join(f.repository, path);
-    writeFileSync(source, "initial ignored source\n");
-    f.git(f.repository, "add", "--force", path);
-    const first = f.prepare();
-    first.cleanup();
-    rmSync(source);
-    const deleted = f.prepare();
-    try {
-      expect(deleted.directory).toBe(first.directory);
-      expect(f.paths(deleted)).not.toContain(path);
-    } finally {
-      deleted.cleanup();
-    }
-    writeFileSync(source, "restored ignored source\r\n");
-    const restored = f.prepare();
-    try {
-      expect(restored.directory).toBe(first.directory);
-      expect(f.paths(restored)).toContain(path);
-      expect(readFileSync(join(restored.directory, path), "utf8")).toBe(
-        "restored ignored source\r\n",
-      );
-      f.expectColdEquivalent(restored);
-    } finally {
-      restored.cleanup();
-    }
-  });
+  it.each(["commit", "ref", "Git directory"] as const)(
+    "updates the retained source %s with the required mirror identity",
+    (identity) => {
+      const f = fixture();
+      const first = f.prepare();
+      const stable = fileIdentity(join(first.directory, "stable.txt"));
+      first.cleanup();
+      if (identity === "commit") {
+        writeFileSync(join(f.repository, "change.txt"), "committed newer bytes\r\n");
+        f.git(f.repository, "add", "change.txt");
+        f.git(f.repository, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "next head");
+      } else if (identity === "ref") {
+        f.git(f.repository, "branch", "-m", "another-ref");
+      } else {
+        const gitDir = join(f.root, "relocated-git");
+        renameSync(join(f.repository, ".git"), gitDir);
+        writeFileSync(join(f.repository, ".git"), `gitdir: ${gitDir}\n`);
+      }
+      const head = f.git(f.repository, "rev-parse", "HEAD");
+      const next = f.prepare();
+      try {
+        if (identity === "commit") {
+          expect(head).not.toBe(first.sourceSha);
+          expect(next.directory).toBe(first.directory);
+          expect(fileIdentity(join(next.directory, "stable.txt"))).toEqual(stable);
+          expect(next.sourceSha).toBe(head);
+          expect(readFileSync(join(next.directory, "change.txt"), "utf8")).toBe(
+            "committed newer bytes\r\n",
+          );
+          const receipt: unknown = JSON.parse(
+            readFileSync(join(next.staging.root, "staging.json"), "utf8"),
+          );
+          expect(receipt).toHaveProperty("witness", {
+            gitDir: f.git(f.repository, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            ref: "refs/heads/main",
+            commit: head,
+          });
+        } else {
+          expect(next.directory).not.toBe(first.directory);
+          expect(next.sourceSha).toBe(first.sourceSha);
+        }
+        f.expectColdEquivalent(next);
+      } finally {
+        next.cleanup();
+      }
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "preserves symlink bytes, executable mode, and missing sparse entries across reuse",
@@ -248,39 +325,49 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
     },
   );
 
-  it.skipIf(process.platform === "win32").each(["file", "symlink"])(
-    "replaces a deleted source directory with a %s on the next warm run",
+  it.each(["ignored file", "file", "symlink"] as const)(
+    "restores deleted source as a %s while retaining its original tracking",
     (kind) => {
-      const f = fixture({ "ancestor/file.txt": "nested source\n" });
+      const ignored = kind === "ignored file";
+      const f = fixture(ignored ? {} : { "ancestor/file.txt": "nested source\n" });
+      const path = ignored ? "staged.ignored" : "ancestor";
+      const removedPath = ignored ? path : "ancestor/file.txt";
+      const source = join(f.repository, path);
+      const bytes = ignored ? "restored ignored source\r\n" : "replacement source\n";
+      if (ignored) {
+        writeFileSync(source, "initial ignored source\n");
+        f.git(f.repository, "add", "--force", path);
+      }
       const first = f.prepare();
       first.cleanup();
-      const ancestor = join(f.repository, "ancestor");
-      rmSync(ancestor, { recursive: true });
+      rmSync(source, { recursive: true });
       const deleted = f.prepare();
       try {
         expect(deleted.directory).toBe(first.directory);
-        expect(f.paths(deleted)).not.toContain("ancestor/file.txt");
+        expect(f.paths(deleted)).not.toContain(removedPath);
       } finally {
         deleted.cleanup();
       }
-      if (kind === "file") {
-        writeFileSync(ancestor, "replacement source\n");
+      if (kind !== "symlink") {
+        writeFileSync(source, bytes);
       } else {
-        symlinkSync("stable.txt", ancestor);
+        symlinkSync("stable.txt", source);
       }
       const replacement = f.prepare();
       try {
         expect(replacement.directory).toBe(first.directory);
-        const mirrored = join(replacement.directory, "ancestor");
-        if (kind === "file") {
-          expect(readFileSync(mirrored, "utf8")).toBe("replacement source\n");
+        const mirrored = join(replacement.directory, path);
+        if (kind !== "symlink") {
+          expect(readFileSync(mirrored, "utf8")).toBe(bytes);
           expect(lstatSync(mirrored).isFile()).toBe(true);
         } else {
           expect(readlinkSync(mirrored)).toBe("stable.txt");
         }
         const paths = f.paths(replacement);
-        expect(paths).toContain("ancestor");
-        expect(paths).not.toContain("ancestor/file.txt");
+        expect(paths).toContain(path);
+        if (!ignored) {
+          expect(paths).not.toContain(removedPath);
+        }
         f.expectColdEquivalent(replacement);
       } finally {
         replacement.cleanup();
@@ -291,6 +378,9 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
   it.each([
     "missing file",
     "corrupt file",
+    "extra file",
+    "corrupt Git config",
+    "corrupt Git object",
     "corrupt metadata",
     "missing metadata",
     "hardlink metadata",
@@ -308,6 +398,22 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
       rmSync(join(first.directory, "stable.txt"));
     } else if (damage === "corrupt file") {
       writeFileSync(join(first.directory, "stable.txt"), "corrupted cached bytes\n");
+    } else if (damage === "extra file") {
+      writeFileSync(join(first.directory, "unexpected.txt"), "outside-owner bytes\n");
+    } else if (damage === "corrupt Git config") {
+      writeFileSync(join(first.directory, ".git", "config"), "invalid Git configuration\n");
+    } else if (damage === "corrupt Git object") {
+      const object = join(
+        first.directory,
+        ".git",
+        "objects",
+        first.carrier.slice(0, 2),
+        first.carrier.slice(2),
+      );
+      const mode = lstatSync(object).mode & 0o777;
+      chmodSync(object, 0o600);
+      writeFileSync(object, "corrupted private Git object\n");
+      chmodSync(object, mode);
     } else if (damage === "missing index") {
       rmSync(join(first.directory, ".git", "mirror-candidate-index"));
     } else if (damage === "symlink index" || damage === "hardlink index") {
@@ -388,12 +494,36 @@ describe.skipIf(process.platform === "win32")("persistent Crabbox source capsule
     }
   });
 
-  it.each(["stable.txt", "new.txt", "frozen mirror"])(
+  it.each(["stable.txt", "new.txt", "frozen mirror", "commit"])(
     "rejects source or frozen bytes changed during warm freezing: %s",
     (path) => {
       const f = fixture();
       const first = f.prepare();
       first.cleanup();
+      if (path === "commit") {
+        const commit = [
+          "-C",
+          f.repository,
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--quiet",
+          "--allow-empty",
+          "-m",
+          "changed during freeze",
+        ];
+        expect(() =>
+          f.prepare(
+            true,
+            `require("node:child_process").execFileSync("git", ${JSON.stringify(commit)}, {stdio:"ignore"});`,
+          ),
+        ).toThrow("source revision, index, or eligibility changed while freezing");
+        return;
+      }
       const source = path === "frozen mirror" ? "stable.txt" : join(f.repository, path);
       expect(() =>
         f.prepare(
