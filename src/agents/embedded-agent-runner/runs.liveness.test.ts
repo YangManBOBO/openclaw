@@ -8,6 +8,7 @@ import {
 import { isReplyRunEvidenceStale } from "../../auto-reply/reply/reply-run-registry.state.js";
 import { testing as replyTesting } from "../../auto-reply/reply/reply-run-registry.test-support.js";
 import { admitReplyTurn } from "../../auto-reply/reply/reply-turn-admission.js";
+import { emitAgentEvent } from "../../infra/agent-events.js";
 import {
   onDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -28,6 +29,7 @@ import {
   withGatewayToolCallerIdentity,
 } from "../tools/gateway-caller-context.js";
 import { resolveActiveEmbeddedRunRecoveryBlocker } from "./run-state.js";
+import { prepareEmbeddedAttemptTimeout } from "./run/attempt-timeout-prepare.js";
 import {
   clearActiveEmbeddedRun,
   queueEmbeddedAgentMessageWithOutcomeAsync,
@@ -183,6 +185,100 @@ describe("runtime-owned embedded liveness", () => {
       if (result.status === "owned") {
         result.operation.complete();
       }
+    }
+  });
+
+  it("keeps the lane while an operator approval is pending", async () => {
+    // Distinct identities: this file's other tests share the module-level
+    // session key, and an in-flight recovery under that key would short-circuit
+    // this direct recovery call as already_in_flight.
+    const approvalSessionId = "approval-wait-session";
+    const approvalSessionKey = "agent:main:approval-wait";
+    const approvalRunId = "approval-wait-run";
+    const approvalAdmission = prepareSystemAgentRunAdmission(
+      {},
+      approvalRunId,
+      "main",
+      "approval-wait-test",
+    );
+    const approvalAbort = vi.fn();
+    try {
+      const admitted = await approvalAdmission.admit("embedded");
+      const approvalOperation = createReplyOperation({
+        sessionId: approvalSessionId,
+        sessionKey: approvalSessionKey,
+        resetTriggered: false,
+      });
+      const backend = {
+        kind: "embedded" as const,
+        runId: approvalRunId,
+        queueMessage,
+        isStreaming: () => true,
+        isCompacting: () => false,
+        ownsLiveness: () => false,
+        abort: approvalAbort,
+        cancel: approvalAbort,
+      };
+      approvalOperation.attachBackend(backend);
+      approvalOperation.setPhase("running");
+      await withGatewayToolCallerIdentity(
+        createAdmittedGatewayToolCallerIdentity({
+          admittedRunContext: admitted,
+          agentId: "main",
+          sessionKey: approvalSessionKey,
+        }),
+        () => setActiveEmbeddedRun(approvalSessionId, backend, approvalSessionKey),
+      );
+      const timeout = prepareEmbeddedAttemptTimeout({
+        attempt: { runId: approvalRunId, sessionId: approvalSessionId, timeoutMs: 60_000 },
+        runAbortSignal: new AbortController().signal,
+        activeSession: { isCompacting: false, isStreaming: false },
+        compactionState: { isCompacting: () => false },
+        compactionTimeoutMs: 30_000,
+        isProbeSession: true,
+        abortRun: vi.fn(),
+        markTimedOutDuringCompaction: vi.fn(),
+        markTimedOutByRunBudget: vi.fn(),
+      });
+      const emitApproval = (phase: "waiting-approval" | "approval-resolved") =>
+        emitAgentEvent({
+          runId: approvalRunId,
+          sessionId: approvalSessionId,
+          stream: "lifecycle",
+          data: { phase, approvalId: "approval-1" },
+        });
+      try {
+        emitApproval("waiting-approval");
+
+        await vi.advanceTimersByTimeAsync(RUN_STALE_TAKEOVER_MS + 1);
+        expect(isReplyRunEvidenceStale(approvalOperation)).toBe(false);
+        await expect(
+          recoverStuckDiagnosticSession({
+            sessionId: approvalSessionId,
+            sessionKey: approvalSessionKey,
+            ageMs: RUN_STALE_TAKEOVER_MS + 1,
+            queueDepth: 1,
+            allowActiveAbort: true,
+          }),
+        ).resolves.toMatchObject({ status: "skipped", reason: "human_input_wait" });
+        expect(approvalAbort).not.toHaveBeenCalled();
+
+        // The final approval settling restores ordinary stale recovery.
+        emitApproval("approval-resolved");
+        expect(resolveActiveEmbeddedRunRecoveryBlocker(approvalSessionId)).toBeUndefined();
+
+        // Closing the attempt releases the wait even while the approval event
+        // stream still reports it pending.
+        emitApproval("waiting-approval");
+        expect(resolveActiveEmbeddedRunRecoveryBlocker(approvalSessionId)).toBe("human_input_wait");
+        timeout.clearTimers();
+        expect(resolveActiveEmbeddedRunRecoveryBlocker(approvalSessionId)).toBeUndefined();
+        approvalOperation.complete();
+      } finally {
+        timeout.clearTimers();
+      }
+    } finally {
+      approvalAdmission.close();
     }
   });
 

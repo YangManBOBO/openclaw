@@ -3,6 +3,7 @@ import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coerci
 import { observeAgentRunApprovalWait } from "../../agent-run-approval-wait.js";
 import type { AgentSession } from "../../sessions/index.js";
 import { log } from "../logger.js";
+import { registerActiveEmbeddedRunHumanInputWaitForRun } from "../run-state.js";
 import {
   resolveRunTimeoutDuringCompaction,
   shouldFlagCompactionTimeout,
@@ -36,8 +37,13 @@ export function prepareEmbeddedAttemptTimeout(input: {
   let abortTimer: NodeJS.Timeout | undefined;
   let abortWarnTimer: NodeJS.Timeout | undefined;
   const approvalWait = observeAgentRunApprovalWait(attempt);
+  let approvalWaitClosed = false;
+  let releaseApprovalRecoveryBlock: ((resolved: boolean) => void) | undefined;
   const clearTimers = () => {
     deadline = { kind: "closed" };
+    approvalWaitClosed = true;
+    releaseApprovalRecoveryBlock?.(false);
+    releaseApprovalRecoveryBlock = undefined;
     approvalWait.dispose();
     runAbortSignal.removeEventListener("abort", clearTimers);
     clearTimeout(abortTimer);
@@ -115,6 +121,19 @@ export function prepareEmbeddedAttemptTimeout(input: {
   };
 
   approvalWait.onChange = (pending) => {
+    if (pending && !releaseApprovalRecoveryBlock) {
+      // A pending operator approval is the run's human-input wait: project the
+      // aggregate approval state into the recovery blocker so stuck-session
+      // recovery cannot reclaim a turn whose approval is still answerable.
+      // The predicate reads live state, so recovery resumes once the final
+      // approval settles; clearTimers releases it on close.
+      releaseApprovalRecoveryBlock = attempt.runId
+        ? registerActiveEmbeddedRunHumanInputWaitForRun(
+            attempt.runId,
+            () => !approvalWaitClosed && approvalWait.pending,
+          )
+        : undefined;
+    }
     if (pending && deadline.kind === "bounded") {
       // Human review preserves the unused execution or compaction-grace budget;
       // the lane and async-task waiter must not retain its old wall-clock deadline.
