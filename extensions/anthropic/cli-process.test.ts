@@ -1,4 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
+import fs from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -164,6 +166,39 @@ async function waitForDescendantExit(pid: number, signal: AbortSignal): Promise<
 }
 
 describe("Claude subprocess diagnostics through the direct CLI transport", () => {
+  it.runIf(process.platform === "linux")(
+    "raises the CLI child OOM score without changing its shim identity or the parent score",
+    async () => {
+      const context = await contextForChild(`
+        import { readFileSync } from "node:fs";
+        process.stdin.once("data", () => process.stdout.end(JSON.stringify({
+          argv0: process.argv0, score: readFileSync("/proc/self/oom_score_adj", "utf8").trim(),
+        })));
+      `);
+      context.argv0 = "/opt/shims/claude";
+      context.env.OPENCLAW_CHILD_OOM_SCORE_ADJ = "1";
+      const parentScore = await readFile("/proc/self/oom_score_adj", "utf8");
+      const writes = vi.spyOn(fs, "writeFileSync");
+      using owner = cliProcess.createClaudeCliProcessOwner(() => context);
+      const child = owner.spawn(context);
+      const closed = once(child, "close");
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk;
+      });
+      try {
+        expect(writes).toHaveBeenCalledWith(`/proc/${child.pid}/oom_score_adj`, "1000");
+        child.stdin.end("ready");
+        expect(await closed).toEqual([0, null]);
+        expect(JSON.parse(output)).toEqual({ argv0: context.argv0, score: "1000" });
+        expect(await readFile("/proc/self/oom_score_adj", "utf8")).toBe(parentScore);
+      } finally {
+        child.kill("SIGKILL");
+        await closed;
+      }
+    },
+  );
+
   it("drains pipe-sized stderr and reports a bounded redacted fatal diagnostic", async () => {
     const secret = "sk-ant-api03-synthetic-diagnostic-credential-123456789";
     const context = await contextForChild(`
@@ -581,7 +616,7 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
   );
 });
 
-it("discovers deduplicated native model IDs through initialize without a turn", async () => {
+async function discoverFromNativeMenu(models: unknown[]) {
   const context = await contextForChild(`
     import { createInterface } from "node:readline";
     createInterface({ input: process.stdin }).on("line", (line) => {
@@ -590,14 +625,8 @@ it("discovers deduplicated native model IDs through initialize without a turn", 
         process.exit(7);
       }
       process.stdout.write(JSON.stringify({ type: "control_response", response: {
-        subtype: "success", request_id: message.request_id, response: { models: [
-          { value: "default", resolvedModel: "claude-future[1m]", displayName: "Default",
-            supportedEffortLevels: ["low", "max"] },
-          { value: "future", resolvedModel: "claude-future[1m]", displayName: "Future",
-            supportedEffortLevels: ["low", "max"] },
-          { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus",
-            supportedEffortLevels: ["low", "max"] },
-        ] },
+        subtype: "success", request_id: message.request_id,
+        response: { models: ${JSON.stringify(models)} },
       } }) + "\\n");
     });
   `);
@@ -612,9 +641,35 @@ it("discovers deduplicated native model IDs through initialize without a turn", 
     });
     return owner;
   });
-  expect(await discoverClaudeCliModels({ env: context.env })).toEqual([
+  return discoverClaudeCliModels({ env: context.env });
+}
+
+it("discovers deduplicated native model IDs through initialize without a turn", async () => {
+  expect(
+    await discoverFromNativeMenu([
+      {
+        value: "default",
+        resolvedModel: "claude-future[1m]",
+        displayName: "Default (recommended)",
+        supportedEffortLevels: ["low", "max"],
+      },
+      {
+        value: "future",
+        resolvedModel: "claude-future[1m]",
+        displayName: "Future",
+        supportedEffortLevels: ["low", "max"],
+      },
+      {
+        value: "opus",
+        resolvedModel: "claude-opus-5-5",
+        displayName: "Opus",
+        supportedEffortLevels: ["low", "max"],
+      },
+    ]),
+  ).toEqual([
     expect.objectContaining({
       id: "claude-future[1m]",
+      name: "Future",
       thinkingLevelMap: {
         off: "off",
         minimal: null,
@@ -627,7 +682,20 @@ it("discovers deduplicated native model IDs through initialize without a turn", 
     }),
     expect.objectContaining({
       id: "claude-opus-5-5",
+      name: "Opus",
       thinkingLevelMap: expect.objectContaining({ off: null, low: "low", max: "max" }),
     }),
+  ]);
+});
+
+it("keeps the default label when no explicit option names its model", async () => {
+  expect(
+    await discoverFromNativeMenu([
+      { value: "default", resolvedModel: "claude-hidden", displayName: "Default (recommended)" },
+      { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" },
+    ]),
+  ).toEqual([
+    expect.objectContaining({ id: "claude-hidden", name: "Default (recommended)" }),
+    expect.objectContaining({ id: "claude-opus-5-5", name: "Opus" }),
   ]);
 });
