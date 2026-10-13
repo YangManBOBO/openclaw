@@ -77,10 +77,11 @@ it("suppresses rich-post transport twins and retained legacy records without blo
     await closeOpenClawStateDatabaseAsync();
     feishuDedupeState.reset();
     expect(await hasProcessedFeishuMessage("om-legacy", "test")).toBe(true);
+    const monitorRuntime = createNonExitingRuntimeEnv();
     const monitor = monitorSingleAccount({
       cfg,
       account: resolveFeishuAccount({ cfg, accountId: "test" }),
-      runtime: createNonExitingRuntimeEnv(),
+      runtime: monitorRuntime,
       abortSignal: controller.signal,
       fireAndForget: false,
       botOpenIdSource: { kind: "prefetched", botOpenId: "ou-bot", source: "provider" },
@@ -89,7 +90,11 @@ it("suppresses rich-post transport twins and retained legacy records without blo
     try {
       const dispatcher = await ready.promise;
       let sequence = 0;
-      const send = async (messageId: string, createTime = "1758000000000", imageKey?: string) => {
+      const send = async (
+        messageId: string,
+        createTime = "1758000000000",
+        media: { imageKey?: string; fileKey?: string } = {},
+      ) => {
         sequence += 1;
         await dispatcher.invoke({
           schema: "2.0",
@@ -108,10 +113,13 @@ it("suppresses rich-post transport twins and retained legacy records without blo
                   content: [
                     [
                       { tag: "text", text: "Hello rich post", style: ["bold"] },
-                      ...(imageKey ? [{ tag: "img", image_key: imageKey }] : []),
+                      ...(media.imageKey ? [{ tag: "img", image_key: media.imageKey }] : []),
                     ],
                   ],
                 },
+                ...(media.fileKey
+                  ? { files: [{ file_key: media.fileKey, file_name: "report.csv" }] }
+                  : {}),
               }),
             },
           },
@@ -129,6 +137,8 @@ it("suppresses rich-post transport twins and retained legacy records without blo
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
       await send("om-legacy", "1758000000001");
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
+      await send("om-legacy", "1758000000001", { fileKey: "file_report" });
+      expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(1);
       await send("om-different", "1758000000002");
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(2);
       expect(
@@ -137,12 +147,18 @@ it("suppresses rich-post transport twins and retained legacy records without blo
         ),
       ).toEqual([1, 1]);
       // A legacy raw-ID hit must not suppress an attachment-bearing revision.
-      await send("om-legacy", "1758000000001", "img_fixture");
+      await send("om-legacy", "1758000000001", { imageKey: "img_fixture" });
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(3);
-      await send("om-legacy", "1758000000001", "img_fixture");
+      await send("om-legacy", "1758000000001", { imageKey: "img_fixture" });
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(3);
-      await send("om-media-fresh-id", "1758000000001", "img_fixture");
+      await send("om-media-fresh-id", "1758000000001", { imageKey: "img_fixture" });
       expect(mocks.dispatchReplyFromConfigMock).toHaveBeenCalledTimes(4);
+    } catch (error) {
+      console.error("Feishu post-replay lifecycle diagnostics", {
+        logs: vi.mocked(monitorRuntime.log).mock.calls,
+        errors: vi.mocked(monitorRuntime.error).mock.calls,
+      });
+      throw error;
     } finally {
       controller.abort();
       await monitor;

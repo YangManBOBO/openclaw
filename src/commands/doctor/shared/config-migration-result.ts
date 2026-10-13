@@ -12,13 +12,15 @@ import type { PluginMetadataSnapshot } from "../../../plugins/plugin-metadata-sn
 import type { CronCodexRuntimePolicyTarget } from "../cron/store-migration.js";
 
 export type DoctorConfigPreflightOptions = {
+  /** The full Doctor flow admits retired sources before entering maintenance. */
+  retiredStateAdmitted?: boolean;
+  stateSchemaPreparation?: LegacyStateMigrationStepReceipt;
   agentDatabaseMigrationDiscovery?: PreparedAgentDatabaseMigrationDiscovery;
   migrateState?: boolean;
   /** Select Doctor normalization without enabling repair-only migrations. */
   invocationPurpose?: LegacyStateMigrationInvocationPurpose;
   migrateLegacyConfig?: boolean;
   repairPrefixedConfig?: boolean;
-  recoverCorruptTargetStore?: boolean;
   invalidConfigNote?: string | false;
   observe?: boolean;
   measure?: ConfigSnapshotReadMeasure;
@@ -32,6 +34,9 @@ export type DoctorConfigPreflightOptions = {
 export type DoctorConfigPreflightResult = {
   snapshot: ConfigFileSnapshot;
   baseConfig: OpenClawConfig;
+  /** Original resolved roster retained until its config and data migrations finish. */
+  rosterMigrationSource?: OpenClawConfig;
+  rosterMigrationOwnerId?: string;
   deferredPluginMigrations?: readonly DeferredPluginMigration[];
   modelBillingRouteMigrationSource?: OpenClawConfig;
   pluginMetadataSnapshot?: PluginMetadataSnapshot;
