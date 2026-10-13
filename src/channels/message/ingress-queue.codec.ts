@@ -150,19 +150,29 @@ export const CHANNEL_INGRESS_CORRUPT_REPAIR_LIMIT = 100;
 export const CHANNEL_INGRESS_CLAIM_SCAN_PAGE_BUDGET = 10;
 
 /**
- * 64-bit FNV-1a over a prefix row's FIFO and membership identity. XOR-composable,
- * so a retained direct-scan cursor can fold walked rows into an expected prefix
- * fingerprint that detects offsetting writes (one row removed, another inserted)
- * which a count alone cannot observe.
+ * 64-bit FNV-1a over a prefix row's FIFO, membership, and lane-policy identity.
+ * XOR-composable, so a retained direct-scan cursor can fold walked rows into an
+ * expected prefix fingerprint that detects offsetting writes (one row removed,
+ * another inserted) which a count alone cannot observe. The persisted payload is
+ * hashed too because derived lanes are a function of it: replacing a row with the
+ * same id, timestamps, lane_key, and status but a different payload must invalidate
+ * a retained cursor that derived a blocked lane from the old payload.
  */
 export function channelIngressPrefixRowFingerprint(row: {
   event_id: string;
   received_at: number;
   lane_key: string | null;
   status: string;
+  payload_json: string;
 }): string {
   let hash = 0xcbf29ce484222325n;
-  const parts = [row.event_id, String(row.received_at), row.lane_key ?? "", row.status];
+  const parts = [
+    row.event_id,
+    String(row.received_at),
+    row.lane_key ?? "",
+    row.status,
+    row.payload_json,
+  ];
   for (const part of parts) {
     for (let index = 0; index < part.length; index++) {
       hash ^= BigInt(part.charCodeAt(index));
@@ -180,6 +190,24 @@ export function xorChannelIngressPrefixFingerprints(...fingerprints: string[]): 
   let result = 0n;
   for (const fingerprint of fingerprints) {
     result ^= BigInt(`0x${fingerprint || "0"}`);
+  }
+  return result.toString(16);
+}
+
+/** Fold prefix row fingerprints in a bounded loop, avoiding a variadic spread
+ * that would exceed V8's function-argument limit on a very large prefix. */
+export function foldChannelIngressPrefixFingerprints(
+  rows: ReadonlyArray<{
+    event_id: string;
+    received_at: number;
+    lane_key: string | null;
+    status: string;
+    payload_json: string;
+  }>,
+): string {
+  let result = 0n;
+  for (const row of rows) {
+    result ^= BigInt(`0x${channelIngressPrefixRowFingerprint(row) || "0"}`);
   }
   return result.toString(16);
 }

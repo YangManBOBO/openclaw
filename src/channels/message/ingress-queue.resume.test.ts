@@ -367,6 +367,47 @@ describe("channel ingress queue resume", () => {
     });
   });
 
+  it("revalidates the resume cursor when another handle swaps an earlier row's payload without changing its identity", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+      const other = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows }, (_, row) => ({
+          eventId: `blocked-${row}`,
+          receivedAt: row,
+          laneKey: null,
+          lane: "blocked",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // A second handle deletes one blocked row before the cursor and re-enqueues
+      // the SAME id with the SAME receivedAt and no stored lane, but a different
+      // payload whose derived lane is free. Count, event id, received time,
+      // lane_key, and status all stay identical, so a fingerprint over only those
+      // fields would accept the stale cursor and skip the now-eligible row; the
+      // persisted lane-policy input (the payload) must be part of the fingerprint.
+      await other.delete("blocked-100");
+      await other.enqueue("blocked-100", { lane: "free" }, { receivedAt: 100 });
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("blocked-100");
+    });
+  });
+
   it("revalidates the in-flight page cursor when another handle writes during paging", async () => {
     await withTempState(async (stateDir) => {
       let clock = 0;
@@ -406,6 +447,131 @@ describe("channel ingress queue resume", () => {
       });
       await injected;
       expect(claimed?.id).toBe("paging-earlier");
+    });
+  });
+
+  it.each([
+    {
+      name: "claims past a full window of stored blocked-lane rows (SQL filter)",
+      // Rows have a stored lane_key; the first scan-window rows are all blocked.
+      // The SQL filter must exclude them so the free lane beyond the window is reachable.
+      laneKeyByRow: (row: number) => (row < 100 ? "blocked" : "free"),
+      blockedLaneKeys: ["blocked"],
+      expectedId: "row-100",
+    },
+    {
+      name: "claims past a full window of derived blocked-lane rows (keyset cursor)",
+      // Rows lack stored lane_key; deriveLaneKey assigns it. The first 100 rows
+      // all derive to "blocked" — the keyset cursor must advance past the window.
+      laneKeyByRow: undefined,
+      blockedLaneKeys: ["blocked"],
+      expectedId: "row-100",
+    },
+  ] as const)("$name", async ({ laneKeyByRow, blockedLaneKeys, expectedId }) => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // Enqueue 100 blocked-lane rows, then 1 free-lane row.
+      for (let idx = 0; idx < 100; idx += 1) {
+        await queue.enqueue(
+          `row-${idx}`,
+          { lane: "blocked" },
+          { receivedAt: idx, laneKey: laneKeyByRow?.(idx) },
+        );
+      }
+      await queue.enqueue(
+        expectedId,
+        { lane: "free" },
+        { receivedAt: 100, laneKey: laneKeyByRow?.(100) },
+      );
+
+      // Production drains always pass deriveLaneKey alongside stored lane_keys.
+      // The SQL filter must not be skipped when deriveLaneKey is present.
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+
+      const claimed = await queue.claimNext({
+        ownerId: "worker",
+        blockedLaneKeys,
+        scanLimit,
+        deriveLaneKey,
+      });
+
+      expect(claimed?.id).toBe(expectedId);
+    });
+  });
+
+  it.each([
+    {
+      name: "pages past a full snapshot of stored blocked-lane rows (SQL filter)",
+      // Rows have a stored lane_key; the snapshot caps at scanLimit + 100 rows,
+      // so a free lane beyond the cap needs another bounded fetch.
+      laneKeyByRow: (row: number) => (row < 201 ? "blocked" : "free"),
+      blockedLaneKeys: ["blocked"],
+      expectedId: "row-201",
+    },
+    {
+      name: "pages past a full snapshot of derived blocked-lane rows (bounded keyset)",
+      // Rows lack stored lane_key; deriveLaneKey assigns it. The first 201 rows
+      // fill the bounded snapshot with blocked lanes — the keyset cursor must
+      // fetch another page to reach the free row beyond it.
+      laneKeyByRow: undefined,
+      blockedLaneKeys: ["blocked"],
+      expectedId: "row-201",
+    },
+  ] as const)("$name", async ({ laneKeyByRow, blockedLaneKeys, expectedId }) => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // 201 blocked rows exceed the bounded snapshot (scanLimit + 100 repair rows);
+      // the free row beyond it must be reached by paging, not just array traversal.
+      for (let idx = 0; idx < 201; idx += 1) {
+        await queue.enqueue(
+          `row-${idx}`,
+          { lane: "blocked" },
+          { receivedAt: idx, laneKey: laneKeyByRow?.(idx) },
+        );
+      }
+      await queue.enqueue(
+        expectedId,
+        { lane: "free" },
+        { receivedAt: 201, laneKey: laneKeyByRow?.(201) },
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+
+      const claimed = await queue.claimNext({
+        ownerId: "worker",
+        blockedLaneKeys,
+        scanLimit,
+        deriveLaneKey,
+      });
+
+      expect(claimed?.id).toBe(expectedId);
+    });
+  });
+
+  it("claims a free lane when the blocked set exceeds SQLite's bind budget", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // A retry-heavy account can pass more blocked lanes than SQLite binds per
+      // query (default 32766). The SQL predicate must stay bounded, not throw.
+      const blockedLaneKeys = Array.from({ length: 40000 }, (_, i) => `blocked-${i}`);
+      await queue.enqueue("blocked", { lane: "blocked" }, { receivedAt: 1, laneKey: "blocked-0" });
+      await queue.enqueue("free", { lane: "free" }, { receivedAt: 2, laneKey: "free" });
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+
+      const claimed = await queue.claimNext({
+        ownerId: "worker",
+        blockedLaneKeys,
+        deriveLaneKey,
+      });
+
+      expect(claimed?.id).toBe("free");
     });
   });
 });

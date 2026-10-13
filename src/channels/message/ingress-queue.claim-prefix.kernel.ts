@@ -5,10 +5,7 @@ import {
   sqliteStringSet,
 } from "../../infra/kysely-sync.js";
 import type { DB } from "../../state/openclaw-state-db.generated.js";
-import {
-  channelIngressPrefixRowFingerprint,
-  xorChannelIngressPrefixFingerprints,
-} from "./ingress-queue.codec.js";
+import { foldChannelIngressPrefixFingerprints } from "./ingress-queue.codec.js";
 import type { ChannelIngressClaimCursor } from "./ingress-queue.types.js";
 
 const getQueue = (db: DatabaseSync) => getNodeSqliteKysely<Pick<DB, "channel_ingress_events">>(db);
@@ -35,7 +32,7 @@ export function readChannelIngressPrefixInDatabase(
   const cursor = input.claimAfter;
   let before = getQueue(db)
     .selectFrom("channel_ingress_events")
-    .select(["event_id", "received_at", "lane_key", "status"])
+    .select(["event_id", "received_at", "lane_key", "status", "payload_json"])
     .where("queue_name", "=", input.queueName)
     .where("status", "=", "pending");
   if (input.candidateIds) {
@@ -64,8 +61,9 @@ export function readChannelIngressPrefixInDatabase(
   const prefixRows = executeSqliteQuerySync(db, before).rows;
   return {
     count: prefixRows.length,
-    fingerprint: xorChannelIngressPrefixFingerprints(
-      ...prefixRows.map((row) => channelIngressPrefixRowFingerprint(row)),
-    ),
+    // Fold in a bounded loop: the retained cursor can advance across arbitrarily
+    // many calls, and spreading one argument per row would exceed V8's
+    // function-argument limit on a sufficiently large derived blocked backlog.
+    fingerprint: foldChannelIngressPrefixFingerprints(prefixRows),
   };
 }
