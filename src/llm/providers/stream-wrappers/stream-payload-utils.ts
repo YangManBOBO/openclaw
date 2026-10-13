@@ -1,4 +1,3 @@
-// Stream payload utilities normalize provider stream payload fields for wrappers.
 import type { StreamFn } from "@openclaw/llm-core";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 

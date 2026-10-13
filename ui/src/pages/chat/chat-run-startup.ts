@@ -9,10 +9,21 @@ export type { ChatRunStartupPhase } from "../../../../packages/gateway-protocol/
 
 export type ChatRunStartupState =
   | { state: "status"; runId: string; phase: ChatRunStartupPhase; seq?: number }
-  | { state: "status"; runId: string; phase: "retrying"; message: string; seq: number }
+  | {
+      state: "status";
+      runId: string;
+      phase: "retrying" | "fallback";
+      message: string;
+      retryAt?: number;
+      seq: number;
+    }
   | { state: "activity"; runId: string; seq?: number };
 
 export type ChatRunStartupStatus = Extract<ChatRunStartupState, { state: "status" }>;
+
+export function isChatRunRecoveryStatus(status: ChatRunStartupState | null | undefined): boolean {
+  return status?.state === "status" && (status.phase === "retrying" || status.phase === "fallback");
+}
 
 /** Live status and history retain the same agent sequence; chat deltas have a separate counter. */
 export function reconcileChatRunStartup(
@@ -25,7 +36,7 @@ export function reconcileChatRunStartup(
   const current = host.chatRunStartup;
   if (current?.runId === next.runId) {
     if (
-      (next.state === "status" && next.phase !== "retrying" && current.state === "activity") ||
+      (next.state === "status" && !isChatRunRecoveryStatus(next) && current.state === "activity") ||
       (current.seq !== undefined &&
         (next.seq === undefined ? next.state === "status" : next.seq <= current.seq))
     ) {
@@ -53,12 +64,22 @@ const STARTUP_LABEL_KEYS = {
   starting_model: "chat.startupStatus.startingModel",
 } as const satisfies Record<ChatRunStartupPhase, Parameters<typeof t>[0]>;
 
+export function isChatRunStartupPhase(value: unknown): value is ChatRunStartupPhase {
+  return typeof value === "string" && Object.hasOwn(STARTUP_LABEL_KEYS, value);
+}
+
 export function chatStartupStatusLabel(
   run: ChatRunStartupStatus | null | undefined,
   placement: ApplicationPlacementStartupStatus | null | undefined,
 ): string | undefined {
   if (run) {
-    return run.phase === "retrying" ? run.message : t(STARTUP_LABEL_KEYS[run.phase]);
+    if (run.phase === "retrying") {
+      return t("chat.recovery.retrying");
+    }
+    if (run.phase === "fallback") {
+      return t("chat.recovery.tryingFallback");
+    }
+    return t(STARTUP_LABEL_KEYS[run.phase]);
   }
   switch (placement?.phase) {
     case "reconnecting":
