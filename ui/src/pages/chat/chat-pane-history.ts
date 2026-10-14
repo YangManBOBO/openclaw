@@ -79,6 +79,7 @@ import { maybeResetToolStream } from "./stream-reconciliation.ts";
 export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
   private activeCatalogContinuation: symbol | null = null;
   private activeOlderLoad: Promise<boolean> | null = null;
+  private historyObserverBootstrap = false;
   // Staged prefetch: after a consumed older page, the next page is fetched in
   // the background and parked here, so the following boundary crossing
   // prepends without a visible round trip. One slot per pane; the claim is
@@ -100,22 +101,17 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
     }
     const cacheKey = resolveChatSnapshotKey(state, { sessionKey });
     const requests = chatHistoryRequests(state);
-    let startedBeforeReady = this.context.gateway.snapshot.phase !== "connected";
-    let readyAt: number | undefined;
-    const reading = store.read(cacheKey, (prewarmReadyAt) => {
-      startedBeforeReady = true;
-      readyAt = prewarmReadyAt;
-    });
+    const reading = store.read(cacheKey);
     const hydration: InitialChatSnapshotHydration = {
       sessionKey,
-      startedBeforeReady,
-      readyAt,
+      connected: this.context.gateway.snapshot.phase === "connected",
       promise: reading
         .then((storedSnapshot) => {
           if (
             requests.initialSnapshotHydration !== hydration ||
             requests.acceptedHistory ||
             this.state !== state ||
+            !this.ownsChatSnapshot({ sessionKey }) ||
             !areUiSessionKeysEquivalent(state.sessionKey, sessionKey) ||
             resolveChatSnapshotKey(state, { sessionKey }) !== cacheKey
           ) {
@@ -131,7 +127,13 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
           applyChatCacheSnapshot(state, snapshot);
           const mergedSnapshot = { ...snapshot, messages: state.chatMessages };
           cacheChatSessionSnapshot(cache, state, { sessionKey }, mergedSnapshot);
-          // Release startup with the adopted cursor before Lit queues the snapshot render.
+          if (snapshot.progressCard !== undefined) {
+            const target = this.resolveChatReadTarget();
+            if (target) {
+              this.progressCard.hydrate(target, snapshot.progressCard);
+            }
+          }
+          // Release the history response before Lit queues the cached transcript render.
           hydration.complete?.();
           state.requestUpdate?.();
         })
@@ -219,8 +221,12 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
     if (
       typeof IntersectionObserver !== "function" ||
       !this.presented ||
+      !this.visuallyPresented ||
       !this.state?.connected ||
+      !this.transcript.isPositionSettled ||
+      this.transcript.isProgrammaticScroll ||
       this.loadingOlder ||
+      this.historyAutoLoadBlocked ||
       !this.hasOlderMessages()
     ) {
       this.clearHistoryObserver();
@@ -234,10 +240,6 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
     }
     this.transcriptScrollTop ??= root.scrollTop;
     const bootstrap = !this.historyObserverArmed;
-    if (this.historyAutoLoadBlocked) {
-      this.clearHistoryObserver();
-      return;
-    }
     if (
       this.historyObserver &&
       this.historyObserver.root === root &&
@@ -251,13 +253,21 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
       (entries, observer) => {
         // Disconnecting does not cancel queued notifications. Only the current
         // observer may consume this pane's history intent.
-        if (this.historyObserver !== observer || !entries.some((entry) => entry.isIntersecting)) {
+        if (
+          this.historyObserver !== observer ||
+          !this.presented ||
+          !this.visuallyPresented ||
+          !this.transcript.isPositionSettled ||
+          this.transcript.isProgrammaticScroll ||
+          !entries.some((entry) => entry.isIntersecting)
+        ) {
           return;
         }
         this.clearHistoryObserver();
-        // Bootstrap geometry matters only at the visible history boundary.
-        // Measuring here avoids forcing layout during every pane update.
-        if (bootstrap && root.scrollHeight > root.clientHeight) {
+        // Fill a visible short tail without a gesture, but never page a full
+        // transcript merely because its boundary is within the prefetch margin.
+        // Measure only at the observed boundary, after placement has settled.
+        if (bootstrap && (root.clientHeight === 0 || root.scrollHeight > root.clientHeight)) {
           return;
         }
         this.historyObserverArmed = false;
@@ -301,7 +311,11 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
     // A shrinking scroll range can move the native offset to its new end.
     // Only movement away from that edge can imply reader intent without input.
     const hasUpwardIntent =
+      this.presented &&
+      this.visuallyPresented &&
       !this.loadingOlder &&
+      this.transcript.isPositionSettled &&
+      !this.transcript.isProgrammaticScroll &&
       !this.transcript.isMaintenanceScroll &&
       viewport !== null &&
       previousScrollTop !== null &&
@@ -309,7 +323,7 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
       viewport.scrollTop < viewport.scrollHeight - viewport.clientHeight &&
       viewport.scrollTop <= CHAT_HISTORY_PREFETCH_EDGE_PX;
     const newHistoryIntent = hasUpwardIntent && this.consumeHistoryIntent();
-    // A failed request or exhausted bootstrap stays disarmed until renewed
+    // A failed request stays disarmed until renewed
     // upward intent, preventing request loops without stranding older history.
     if (newHistoryIntent && (this.historyAutoLoadBlocked || !this.historyObserverArmed)) {
       this.historyAutoLoadBlocked = false;
@@ -359,6 +373,10 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
     }
     if (
       !root ||
+      !this.presented ||
+      !this.visuallyPresented ||
+      !this.transcript.isPositionSettled ||
+      this.transcript.isProgrammaticScroll ||
       !upward ||
       root.scrollTop > CHAT_HISTORY_PREFETCH_EDGE_PX ||
       this.loadingOlder ||
@@ -736,7 +754,7 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
         bubbles: true,
         composed: true,
         detail: {
-          owner: this,
+          owner: this.element,
           onSlashCommand,
         },
       }),
