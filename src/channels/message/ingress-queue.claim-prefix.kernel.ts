@@ -1,14 +1,15 @@
-import type { DatabaseSync } from "node:sqlite";
 import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
   sqliteStringSet,
 } from "../../infra/kysely-sync.js";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import type { DB } from "../../state/openclaw-state-db.generated.js";
 import { foldChannelIngressPrefixFingerprints } from "./ingress-queue.codec.js";
 import type { ChannelIngressClaimCursor } from "./ingress-queue.types.js";
 
-const getQueue = (db: DatabaseSync) => getNodeSqliteKysely<Pick<DB, "channel_ingress_events">>(db);
+const getQueue = (db: EngineConnection) =>
+  getNodeSqliteKysely<Pick<DB, "channel_ingress_events">>(db);
 
 /**
  * Authoritative count and membership fingerprint of the scan-visible pending rows
@@ -19,7 +20,7 @@ const getQueue = (db: DatabaseSync) => getNodeSqliteKysely<Pick<DB, "channel_ing
  * that preserve the count, which count alone cannot observe.
  */
 export function readChannelIngressPrefixInDatabase(
-  db: DatabaseSync,
+  db: EngineConnection,
   input: {
     queueName: string;
     candidateIds?: string[];
