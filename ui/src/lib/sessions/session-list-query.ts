@@ -386,6 +386,7 @@ export function coalesceSessionRefresh(
 
 export type ManagedSessionListRefresh = {
   append: boolean;
+  immediate?: boolean;
   offset?: number;
   invalidated?: true;
   background?: true;
@@ -409,6 +410,7 @@ export type ManagedSessionList = ObservedSessionList & {
   startupRetryAttempt: number;
   /** Invalidation retires remaining pages without cancelling the correlated RPC. */
   readGeneration: number;
+  readRevision: number;
   coordinator: ReturnType<typeof createSessionEventRefreshCoordinator>;
   pending: Promise<void> | null;
   queued: ManagedSessionListRefresh | null;

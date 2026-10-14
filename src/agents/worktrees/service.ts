@@ -66,6 +66,11 @@ import {
 import { assertExactStateOwner } from "./removal-git.js";
 import { removeSettledManagedWorktree, type RemoveWorktreeParams } from "./removal.js";
 import {
+  resolveRepository,
+  resolveRepositoryIdentity,
+  type ResolvedRepository,
+} from "./repository-paths.js";
+import {
   completeRepositoryWorktreeSetup,
   type MaterializedRepositoryWorktree,
 } from "./repository-setup.js";
@@ -79,13 +84,11 @@ import {
   createWithWorktreeAllocation,
   createOwnedWorktree,
   prepareWorktreeDestination,
+  readWorktreeGitInventory,
   findWorktreeByName,
-  resolveRepository,
   rebindLiveWorktreeRepository,
-  resolveRepositoryIdentity,
   withWorktreeSource,
   withWorktreeSources,
-  type ResolvedRepository,
   type WorktreeSourceCustody,
 } from "./service-preparation.js";
 import {
@@ -141,7 +144,10 @@ type ManagedWorktreeGcParams = WorktreeCleanupOwnerPolicy &
 
 type RepositoryCreationParams = CreateManagedWorktreeParams &
   WorktreeAllocationGuard &
-  WorktreeSourceCustody & { prepareBase?: WorktreeBasePreparation };
+  WorktreeSourceCustody & {
+    prepareBase?: WorktreeBasePreparation;
+    gitInventory: Awaited<ReturnType<typeof readWorktreeGitInventory>>;
+  };
 
 type WorktreeCreation =
   | ManagedWorktreeCreationOutcome
@@ -176,13 +182,16 @@ export class ManagedWorktreeService {
   private readonly getConfig: ServiceOptions["getConfig"];
   private readonly capacity: ReturnType<typeof createWorktreeCapacityOwner>;
   private readonly cleanupDeferrals: WorktreeCleanupDeferrals = new Map();
+  private readonly orphanCleanupFailures: Parameters<
+    typeof collectRetiredWorktreeArtifacts
+  >[0]["orphanFailures"] = new Map();
   private readonly maintainGit: ReturnType<typeof createWorktreeGitMaintenance>;
 
   constructor(options: ServiceOptions = {}) {
     this.env = options.env ?? process.env;
     this.now = options.now ?? Date.now;
     this.getConfig = options.getConfig;
-    this.maintainGit = createWorktreeGitMaintenance(this.env);
+    this.maintainGit = createWorktreeGitMaintenance(this.env, this.now);
     this.capacity = createWorktreeCapacityOwner({
       env: this.env,
       now: this.now,
@@ -207,7 +216,11 @@ export class ManagedWorktreeService {
             async (guard, publication) =>
               await withWorktreeSources(this.env, async (retainRepository) => {
                 const retainSources = await retainRepository({ ...params, ...guard, repository });
-                const owned = { ...params, ...guard, retainSources, prepareBase };
+                const gitInventory = await readWorktreeGitInventory(
+                  repository.repoRoot,
+                  params.name,
+                );
+                const owned = { ...params, ...guard, retainSources, prepareBase, gitInventory };
                 const creation = await this.withAllocationLease(owned, (allocation) =>
                   this.reserveForOwner(owned, allocation, repository, publication),
                 );
@@ -246,12 +259,14 @@ export class ManagedWorktreeService {
                     });
                     sourceRoot = repoRoot;
                     const repository = await resolveRepository(repoRoot);
+                    const gitInventory = await readWorktreeGitInventory(repoRoot, params.name);
                     const prepared = {
                       ...params,
                       ...guard,
                       repoRoot,
                       baseRef: "main",
                       runSetupScript: false,
+                      gitInventory,
                     };
                     const retainSources = await retainRepository({ ...prepared, repository });
                     return await this.reserveForOwner(
@@ -458,6 +473,7 @@ export class ManagedWorktreeService {
       env: this.env,
       configuredRoot: this.getConfig?.().worktreeRoot,
       repository,
+      gitInventory: params.gitInventory,
       owner: params,
       suppliedName,
       suggestedName: params.suggestedName ?? inferredName,
@@ -571,7 +587,7 @@ export class ManagedWorktreeService {
   }
 
   private async materializeRepositoryWorktree(
-    params: RepositoryCreationParams,
+    params: Omit<RepositoryCreationParams, "gitInventory">,
     repository: ResolvedRepository,
     destination: Awaited<ReturnType<typeof prepareWorktreeDestination>>,
     worktreeId: string,
@@ -1047,8 +1063,9 @@ export class ManagedWorktreeService {
       assertCurrent();
       if (params.retryDeferred) {
         // Repair before cleanup can defer the repository for those same missing objects.
-        await this.maintainGit(params);
+        await this.maintainGit({ ...params, progress });
         assertCurrent();
+        this.orphanCleanupFailures.clear();
       }
       const { records, leases } = await readWorktreeCleanupState(this.env);
       const classification = { ...params, ...(await params.prepareOwners?.(records)) };
@@ -1078,7 +1095,7 @@ export class ManagedWorktreeService {
           },
           classification,
         );
-      const { collect, repositoryProtection } = createWorktreeGcRemoval({
+      const { collect } = createWorktreeGcRemoval({
         env: this.env,
         records,
         now,
@@ -1118,6 +1135,7 @@ export class ManagedWorktreeService {
         records,
         expiresBefore: now - SNAPSHOT_RETENTION_MS,
         progress,
+        orphanFailures: this.orphanCleanupFailures,
         withAllocationLease: (run) => this.withAllocationLease(params, run),
       });
       try {
@@ -1130,7 +1148,7 @@ export class ManagedWorktreeService {
       assertCurrent();
       if (!params.retryDeferred) {
         // Cleanup has released allocation ownership and retired its refs before maintenance.
-        await this.maintainGit({ ...params, shouldDeferRepository: repositoryProtection });
+        await this.maintainGit({ ...params, progress });
       }
       assertCurrent();
       return progress.result;

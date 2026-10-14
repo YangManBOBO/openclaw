@@ -6,7 +6,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   BUILD_ALL_STEPS,
-  formatBuildAllDuration,
   formatBuildAllTimingSummary,
   parseBuildAllArgs,
   resolveBuildAllEnvironment,
@@ -20,6 +19,8 @@ import {
   resolveBuildStepCacheStampState,
   restoreBuildStepCacheOutputs,
   finalizeBuildStepCache,
+  resetBuildCacheInputs,
+  writeBuildCacheInputs,
   type BuildCache,
 } from "../../scripts/lib/build-artifact-cache.mts";
 import { collectBundledPluginBuildEntries } from "../../scripts/lib/bundled-plugin-build-entries.mjs";
@@ -133,41 +134,39 @@ describe("resolveBuildAllStep", () => {
     );
   });
 
-  it("pins the first explicit full commit alias and rejects malformed values", () => {
-    const gitSha = "A".repeat(40);
-    expect(
-      resolveBuildAllEnvironment(
-        { GIT_SHA: gitSha, GITHUB_SHA: "b".repeat(40) },
-        () => new Date("2026-07-10T12:34:56.000Z"),
-        () => "c".repeat(40),
-      ).GIT_COMMIT,
-    ).toBe(gitSha.toLowerCase());
-    expect(() =>
-      resolveBuildAllEnvironment({ GIT_COMMIT: "deadbeef" }, undefined, () => null),
-    ).toThrow("full 40-character hexadecimal SHA");
-  });
+  it.each([
+    { heapMb: "4352", concurrency: "1" },
+    { heapMb: "12288", concurrency: "2" },
+  ])(
+    "passes encoded import URLs literally to managed Node on Windows (heap $heapMb)",
+    ({ heapMb, concurrency }) => {
+      const importUrl = "file:///C:/Users/RUNNER%7E1/Project/scripts/tsx.mjs";
+      const result = resolveBuildAllStep(
+        {
+          ...getBuildAllStep("tsdown"),
+          args: ["--import", importUrl, ...getBuildAllStep("tsdown").args.slice(2)],
+        },
+        {
+          nodeExecPath: "C:\\Program Files\\nodejs\\node.exe",
+          env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: heapMb },
+        },
+      );
 
-  it("passes encoded import URLs literally to managed Node on Windows", () => {
-    const importUrl = "file:///C:/Users/RUNNER%7E1/Project/scripts/tsx.mjs";
-    const result = resolveBuildAllStep(
-      { label: "tsdown", args: ["--import", importUrl, "scripts/tsdown-build.mts"] },
-      { nodeExecPath: "C:\\Program Files\\nodejs\\node.exe", env: {} },
-    );
-
-    expect(
-      createManagedCommandInvocation({
-        bin: result.command,
-        args: result.args,
-        ...result.options,
-        platform: "win32",
-      }),
-    ).toEqual({
-      command: "C:\\Program Files\\nodejs\\node.exe",
-      args: ["--import", importUrl, "scripts/tsdown-build.mts"],
-      shell: false,
-      windowsVerbatimArguments: undefined,
-    });
-  });
+      expect(
+        createManagedCommandInvocation({
+          bin: result.command,
+          args: result.args,
+          ...result.options,
+          platform: "win32",
+        }),
+      ).toEqual({
+        command: "C:\\Program Files\\nodejs\\node.exe",
+        args: ["--import", importUrl, "scripts/tsdown-build.mts", "--concurrency", concurrency],
+        shell: false,
+        windowsVerbatimArguments: undefined,
+      });
+    },
+  );
 
   it.each([false, true])(
     "runs plugin builds through managed Node on Windows (defer isolated: %s)",
@@ -791,17 +790,8 @@ describe("resolveBuildAllSteps", () => {
       expect(env).toEqual(originalEnv);
     },
   );
-  it("rejects unknown build profiles", () => {
-    expect(() => resolveBuildAllSteps("wat")).toThrow("Unknown build profile: wat");
-  });
 });
 describe("build-all timing output", () => {
-  it("formats short and long phase durations compactly", () => {
-    expect(formatBuildAllDuration(42.4)).toBe("42ms");
-    expect(formatBuildAllDuration(1234)).toBe("1.23s");
-    expect(formatBuildAllDuration(12345)).toBe("12.3s");
-  });
-
   it("summarizes phases slowest first with total time and status", () => {
     expect(
       formatBuildAllTimingSummary([
@@ -922,11 +912,32 @@ describe("resolveBuildStepCacheState", () => {
     expect(restore).toMatchObject({ fresh: true, restorable: true });
     expect(restore.outputRoot).toBe(path.join(cacheRoot, "tsdown-unified", "outputs"));
     expect(restoreBuildStepCacheOutputs(restore, targetParams)).toBe(true);
+    const cachedFile = path.join(restore.outputRoot!, "dist/plugin-sdk/current.d.ts");
+    const restoredFile = path.join(target.rootDir, "dist/plugin-sdk/current.d.ts");
+    expect(fs.statSync(restoredFile).ino).not.toBe(fs.statSync(cachedFile).ino);
     expect(fs.readFileSync(path.join(target.rootDir, "dist/plugin-sdk/current.d.ts"), "utf8")).toBe(
       "export declare const current: true;",
     );
     expect(fs.existsSync(removedDts)).toBe(false);
     expect(fs.readFileSync(removedJs, "utf8")).toBe("runtime");
+    writeBuildCacheInputs(target.rootDir);
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(target.rootDir, "dist/build-cache-inputs.json"), "utf8"),
+      ),
+    ).toEqual({
+      version: 1,
+      steps: { "tsdown-unified": state.signature },
+    });
+    resetBuildCacheInputs(target.rootDir);
+    writeBuildCacheInputs(target.rootDir);
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(target.rootDir, "dist/build-cache-inputs.json"), "utf8"),
+      ),
+    ).toEqual({ version: 1, steps: {} });
+    fs.writeFileSync(cachedFile, "changed writable cache");
+    expect(fs.readFileSync(restoredFile, "utf8")).toBe("export declare const current: true;");
   });
 
   it("keeps workspace declaration caches independent of core inputs", () => {

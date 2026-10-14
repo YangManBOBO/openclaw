@@ -1,9 +1,12 @@
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { getSqliteRuntimeCapabilities } from "../infra/bun-sqlite-library.js";
+import { requireNativeDatabaseFile } from "../infra/database-engine/physical-facts.js";
 import { enableNodeSqliteKyselyStatementCache } from "../infra/kysely-sync-cache-state.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
+import type { EngineConnection } from "../infra/sql-connection.js";
+import { isPostgresSqlConnection } from "../infra/sql-connection.js";
+import { resolveSqliteDatabaseFilePath } from "../infra/sqlite-database-admission.js";
 import { isSqliteCorruptionError } from "../infra/sqlite-error-diagnostics.js";
 import { SQLITE_IDLE_HANDLE_TTL_MS } from "../infra/sqlite-handle-lifecycle.js";
 import {
@@ -29,9 +32,13 @@ import { observeOpenClawDatabaseMaintenanceResource } from "./openclaw-state-db-
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import {
   OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
-  type OpenClawStateDatabase,
   type OpenClawStateSchemaReadAdmission,
 } from "./openclaw-state-db-contract.js";
+import {
+  assertStateFileSnapshotAllowed,
+  isStatePostgres,
+  openStatePostgresReadConnection,
+} from "./openclaw-state-db-engine.js";
 import { openTrackedStateDatabaseResult } from "./openclaw-state-db-handle.js";
 import {
   invalidateOpenClawStateRuntimeIntegrity,
@@ -46,7 +53,7 @@ import {
 import type { OpenClawStateReadOnlyDatabase } from "./openclaw-state-read.types.js";
 
 export type OpenClawStateReadConnection = {
-  database: Pick<OpenClawStateDatabase, "db" | "path">;
+  database: { db: EngineConnection; path: string };
   snapshotSource?: {
     retain(): {
       location: string;
@@ -66,7 +73,7 @@ type RetainedReader = {
   idleTimer?: ReturnType<typeof setTimeout>;
 };
 const retainedReaders = new Map<string, RetainedReader>();
-const corruptedReaders = new WeakSet<DatabaseSync>();
+const corruptedReaders = new WeakSet<EngineConnection>();
 let unregisterExitClose: (() => void) | undefined;
 
 function retireReader(reader: RetainedReader): void {
@@ -124,6 +131,9 @@ function borrowStateReadConnection(
   pathname: string,
   expectedIdentity?: string,
 ): OpenClawStateSettledRead<OpenClawStateReadConnection> {
+  if (isStatePostgres()) {
+    return openStateReadConnectionResult(pathname, pathname, expectedIdentity, undefined, true);
+  }
   isExistingOpenClawStateSchema(pathname);
   const identity = readDatabasePathIdentitySync(pathname);
   if (expectedIdentity !== undefined) {
@@ -190,7 +200,7 @@ export type OpenClawStateSettledRead<T> =
   | { status: "unavailable"; error: unknown };
 
 export function assertStateReadSchema(
-  database: DatabaseSync,
+  database: EngineConnection,
   pathname: string,
   integrityPolicy?: OpenClawStateIntegrityPolicy,
 ): void {
@@ -251,13 +261,17 @@ export function readOpenClawStateReadOnlyLocation<T>(
   let closeAdmission: (() => void) | undefined;
   let result!: OpenClawStateSettledRead<T>;
   try {
-    closeAdmission = openStateSchemaReadAdmission?.(opened.database.db);
+    if (openStateSchemaReadAdmission) {
+      if (isPostgresSqlConnection(opened.database.db)) {
+        requireNativeDatabaseFile("postgres", "repair");
+      }
+      closeAdmission = openStateSchemaReadAdmission(opened.database.db);
+    }
     // Scope and path policy are authority, not ordinary schema SQL failure.
     const existingSchema = isExistingOpenClawStateSchema(pathname, opened.database.db);
     try {
-      result = {
-        status: "available",
-        value: runSqliteReadOperationSync(opened.database.db, () => {
+      const read = () =>
+        runSqliteReadOperationSync(opened.database.db, () => {
           admitStateSchemaFacts(opened.database.db, pathname);
           assertStateReadSchemaForPolicy(
             opened.database.db,
@@ -267,10 +281,15 @@ export function readOpenClawStateReadOnlyLocation<T>(
             readContentVersionRow,
           );
           return operation(opened.database);
-        }),
+        });
+      result = {
+        status: "available",
+        value: isPostgresSqlConnection(opened.database.db)
+          ? opened.database.db.runTransaction(read, undefined, true)
+          : read(),
       };
     } catch (error) {
-      if (isSqliteCorruptionError(error)) {
+      if (!isPostgresSqlConnection(opened.database.db) && isSqliteCorruptionError(error)) {
         invalidateOpenClawStateRuntimeIntegrity(opened.database.db);
         corruptedReaders.add(opened.database.db);
       }
@@ -367,6 +386,7 @@ function openStateReadConnectionResult(
 ): OpenClawStateSettledRead<OpenClawStateReadConnection> {
   const snapshot = typeof source === "string" ? undefined : source;
   const location = typeof source === "string" ? source : source.location;
+  const physicalLocation = resolveSqliteDatabaseFilePath(location);
   // The first catalog read needs the busy handler; installing a later PRAGMA is too late.
   const options = { readOnly: true, timeout: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS };
   let releaseToken: (() => void) | undefined;
@@ -396,8 +416,20 @@ function openStateReadConnectionResult(
   };
   let native: ReturnType<typeof openTrackedStateDatabaseResult>;
   try {
+    if (isStatePostgres()) {
+      if (source !== pathname || snapshotRoot) {
+        assertStateFileSnapshotAllowed();
+      }
+      if (checkSchemaPolicy) {
+        isExistingOpenClawStateSchema(pathname);
+      }
+      const postgres = openStatePostgresReadConnection(pathname, expectedIdentity);
+      if (postgres) {
+        return { status: "available", value: postgres };
+      }
+    }
     if (expectedIdentity !== undefined) {
-      assertExistingDatabaseIdentity(location, expectedIdentity);
+      assertExistingDatabaseIdentity(physicalLocation, expectedIdentity);
     }
     releaseToken = snapshotRoot ? acquireSqliteSnapshotReadToken(snapshotRoot) : undefined;
     if (checkSchemaPolicy) {
@@ -474,7 +506,7 @@ function openStateReadConnectionResult(
   try {
     enableNodeSqliteKyselyStatementCache(db);
     if (expectedIdentity !== undefined) {
-      assertExistingDatabaseIdentity(location, expectedIdentity);
+      assertExistingDatabaseIdentity(physicalLocation, expectedIdentity);
     }
   } catch (error) {
     try {

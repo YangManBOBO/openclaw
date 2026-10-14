@@ -1445,6 +1445,7 @@ function testCrabboxConfigDir(home: string): string {
 }
 
 function testHomeEnv(home: string): Record<string, string> {
+  mkdirSync(home, { recursive: true });
   return {
     APPDATA: path.join(home, "AppData", "Roaming"),
     HOME: home,
@@ -4081,17 +4082,28 @@ esac
     ).toBe(false);
   });
 
-  it.each([[], ["--blacksmith-ref=old-workflow", "-blacksmith-ref", "main"]])(
+  it.each(
+    [
+      "ci-check-focused-testbox.yml",
+      "ci-check-routine-testbox.yml",
+      "ci-check-high-memory-testbox.yml",
+    ].flatMap((workflow) =>
+      [[], ["--blacksmith-ref=old-workflow", "-blacksmith-ref", "main"]].map((refs) => ({
+        workflow,
+        refs,
+      })),
+    ),
+  )(
     "pins Testbox policy independently of configured refs and payload arguments: %j",
-    (...refs) => {
-      const { output } = runSuccessfulDefaultWrapper(
+    ({ workflow, refs }) => {
+      const { output, result } = runSuccessfulDefaultWrapper(
         [
           "run",
           "--provider",
           "blacksmith-testbox",
           ...refs,
           "--blacksmith-workflow",
-          ".github/workflows/ci-check-high-memory-testbox.yml",
+          `.github/workflows/${workflow}`,
           "--blacksmith-job",
           "check",
           "--",
@@ -4109,12 +4121,14 @@ esac
       expect(output.args.slice(0, optionEnd)).toEqual(
         expect.arrayContaining([
           "--blacksmith-workflow",
-          ".github/workflows/ci-check-high-memory-testbox.yml",
+          `.github/workflows/${workflow}`,
           "--blacksmith-job",
           "check",
         ]),
       );
       expect(output.args.at(-1)).toContain("historical-source");
+      expect(result.stderr).toContain("use PR CI or a safe local scope");
+      expect(result.stderr).not.toContain("pass another --provider");
     },
   );
 

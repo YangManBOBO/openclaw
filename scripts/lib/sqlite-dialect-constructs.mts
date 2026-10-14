@@ -1,5 +1,13 @@
 export const DIALECT_GROUPS = ["mechanical", "design", "engine-maintenance"] as const;
 export type DialectGroup = (typeof DIALECT_GROUPS)[number];
+export const SQLITE_PRIMITIVE_OWNERS: readonly string[] = [
+  // Canonical owner of SQLite FK/sequence primitives that ports and migrations call instead of raw sites.
+  "src/infra/sqlite-strict.ts",
+  // Canonical owner of SQLite user_version read/write.
+  "src/infra/sqlite-user-version.ts",
+  // SQLite archive-format owner: catalog capture and offline restoration of migration table scopes.
+  "src/infra/sqlite-migration-scoped-snapshot.ts",
+];
 export type DialectMatch = {
   construct: string;
   group: DialectGroup;

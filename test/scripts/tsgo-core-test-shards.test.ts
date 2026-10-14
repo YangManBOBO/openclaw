@@ -401,7 +401,12 @@ export async function runPreparedTsgoCommand(args, options) {
 }
 `,
       );
-      for (const exitCode of [0, 2, 137]) {
+      for (const [exitCode, ci] of [
+        [0, true],
+        [2, true],
+        [137, true],
+        [2, false],
+      ] as const) {
         fs.writeFileSync(path.join(root, "calls.jsonl"), "");
         const result = await lifetime.track(
           runNodeScript(
@@ -415,6 +420,8 @@ export async function runPreparedTsgoCommand(args, options) {
             ],
             {
               ...process.env,
+              CI: ci ? "true" : "false",
+              GITHUB_ACTIONS: "false",
               OPENCLAW_LOCAL_CHECK: "0",
               OPENCLAW_CI_STATIC_EVIDENCE: "1",
               FIXTURE_EXIT: String(exitCode),
@@ -432,14 +439,15 @@ export async function runPreparedTsgoCommand(args, options) {
           .trim()
           .split("\n")
           .map((line) => JSON.parse(line));
+        const stops = fails && (!ci || exitCode >= 128);
         expect(calls).toEqual([
           ...(_label === "mixed CI" ? ["tsconfig.scripts.json"] : []),
-          ...selected.slice(0, fails ? failureIndex + 1 : undefined).map((graph) => graph.config),
+          ...selected.slice(0, stops ? failureIndex + 1 : undefined).map((graph) => graph.config),
         ]);
         const completion = result.stdout
           .split("\n")
           .find((line) => line.startsWith("[ci-static:tsgo:completion] "));
-        if (!fails && process.platform !== "win32") {
+        if (!stops && process.platform !== "win32") {
           expect(completion).toBeDefined();
           const evidence = JSON.parse(completion!.slice("[ci-static:tsgo:completion] ".length)) as {
             planned: number;
@@ -551,7 +559,7 @@ exec ${JSON.stringify(native)} "$@"
           const prepared = resolveRuntimeWorkerUrl(entry);
           return [source, prepared.pathname.endsWith(".mts") ? source : prepared];
         }),
-        { ...process.env, OPENCLAW_LOCAL_CHECK: "0" },
+        { ...process.env, CI: "true", GITHUB_ACTIONS: "false", OPENCLAW_LOCAL_CHECK: "0" },
         [
           [
             new URL("./lib/tsdown-declaration-boundary.mts", preparedDriver),
@@ -621,16 +629,21 @@ exec ${JSON.stringify(native)} "$@"
         `import { createChangedCiTypeCheckPlan } from "./run-tsgo-core-test-shards.mts";
 import { checkCoreTsgoGraphBoundary } from "./check-tsgo-core-boundary.mts";
 if (process.argv[2] === "boundary") {
-  await checkCoreTsgoGraphBoundary();
+  const graphs = await checkCoreTsgoGraphBoundary();
+  console.log(JSON.stringify(Object.fromEntries(graphs.map(({ name, files }) => [name, files]))));
 } else {
-  const plan = await createChangedCiTypeCheckPlan([process.argv[2] === "core-plan" ? ${JSON.stringify(helper)} : ${JSON.stringify(extension)}], {
+  const plan = await createChangedCiTypeCheckPlan([process.argv[2] === "core-plan" ? ${JSON.stringify(helper)} : ${JSON.stringify(extension)}, ...JSON.parse(process.argv[3])], {
     cwd: process.cwd(), coreBoundaryOwner: "additional-checks",
   });
   console.log(JSON.stringify({ mode: plan.mode, names: plan.graphs.map(({ name }) => name) }));
 }
 `,
       );
-      const inspectExtension = async (mode: "plan" | "core-plan" | "boundary", serial = "") => {
+      const inspectExtension = async (
+        mode: "plan" | "core-plan" | "boundary",
+        serial = "",
+        extraPaths: string[] = [],
+      ) => {
         write("compiler-events.tsv", "");
         return await lifetime.track(
           runNodeScript(
@@ -639,6 +652,7 @@ if (process.argv[2] === "boundary") {
               pathToFileURL(path.join(sourceRoot, "scripts/tsx.mjs")).href,
               plannerDriver,
               mode,
+              JSON.stringify(extraPaths),
             ],
             { ...env, OPENCLAW_CI_TYPE_PLAN_SERIAL: serial },
             undefined,
@@ -646,8 +660,66 @@ if (process.argv[2] === "boundary") {
           ),
         );
       };
+      const deletedNonCompilerPaths = ["docs/removed.md", "docs/removed.mdx", "ui/src/removed.css"];
+      const presentationPaths = [
+        "extensions/active-memory/control-ui.presentation.json",
+        "extensions/memory-wiki/control-ui.presentation.json",
+      ];
+      for (const file of presentationPaths) {
+        write(file, '{"label":"Memory add-on"}\n');
+      }
+      const uiConsumer = "ui/src/presentation.ts";
+      const presentationImports = presentationPaths
+        .map(
+          (file, index) =>
+            `import presentation${index} from '../../${file}' with { type: 'json' };`,
+        )
+        .join("\n");
+      write(uiConsumer, `${presentationImports}\n`);
+      const uiGraphs = TSGO_CORE_GRAPHS.filter(
+        ({ name }) => name === "ui" || name.startsWith("core-test-"),
+      );
+      const coreConfig = TSGO_CORE_GRAPHS.find(({ name }) => name === "core")!.config;
+      const originalConfigs = new Map(
+        [...uiGraphs.map(({ config }) => config), coreConfig].map((config) => [
+          config,
+          fs.readFileSync(path.join(root, config), "utf8"),
+        ]),
+      );
+      const addGraphFiles = (config: string, files: string[]) => {
+        const value = JSON.parse(originalConfigs.get(config)!);
+        value.compilerOptions.resolveJsonModule = true;
+        value.files.push(...files.map((file) => path.join(root, file)));
+        write(config, JSON.stringify(value));
+      };
+      for (const { config } of uiGraphs) {
+        addGraphFiles(config, [uiConsumer]);
+      }
+      const presentationBoundary = await inspectExtension("boundary");
+      expect(presentationBoundary.status, presentationBoundary.stderr).toBe(0);
+      const presentationGraphFiles = JSON.parse(presentationBoundary.stdout.trim());
+      for (const { name } of uiGraphs) {
+        expect(presentationGraphFiles[name]).toEqual(expect.arrayContaining(presentationPaths));
+      }
+      const unrelatedJson = "extensions/example/other.json";
+      write(unrelatedJson, "{}\n");
+      write(
+        uiConsumer,
+        `${presentationImports}\nimport '../../${extension}';\nimport other from '../../${unrelatedJson}' with { type: 'json' };\n`,
+      );
+      addGraphFiles(coreConfig, [presentationPaths[0]!]);
+      const rejectedExtensionInputs = await inspectExtension("boundary");
+      expect(rejectedExtensionInputs.status).not.toBe(0);
+      for (const { name } of uiGraphs) {
+        expect(rejectedExtensionInputs.stderr).toContain(`${name}: ${extension}`);
+        expect(rejectedExtensionInputs.stderr).toContain(`${name}: ${unrelatedJson}`);
+      }
+      expect(rejectedExtensionInputs.stderr).toContain(`core: ${presentationPaths[0]}`);
+      for (const [config, original] of originalConfigs) {
+        write(config, original);
+      }
       for (const serial of ["", "1"]) {
-        const extensionPlan = await inspectExtension("plan", serial);
+        const extensionPlan = await inspectExtension("plan", serial, deletedNonCompilerPaths);
         expect(extensionPlan.status, extensionPlan.stderr).toBe(0);
         expect(JSON.parse(extensionPlan.stdout.trim())).toEqual({
           mode: "changed",
@@ -658,13 +730,19 @@ if (process.argv[2] === "boundary") {
         expect(discovery.every((args) => args.includes(serial ? "--listFilesOnly" : "--api"))).toBe(
           true,
         );
-        const corePlan = await inspectExtension("core-plan", serial);
+        const corePlan = await inspectExtension("core-plan", serial, deletedNonCompilerPaths);
         expect(corePlan.status, corePlan.stderr).toBe(0);
         expect(JSON.parse(corePlan.stdout.trim())).toEqual({
           mode: "changed",
           names: ["core-test-agents-other"],
         });
       }
+      const deletedCompilerPlan = await inspectExtension("plan", "", [
+        "extensions/example/removed.ts",
+      ]);
+      expect(deletedCompilerPlan.status, deletedCompilerPlan.stderr).toBe(0);
+      expect(JSON.parse(deletedCompilerPlan.stdout.trim()).mode).toBe("full");
+      expect(compilerEvents()).toEqual([]);
       // Its parallel owner must still reject a type-only edge into an extension.
       write(
         consumer,
@@ -763,7 +841,7 @@ if (process.argv[2] === "boundary") {
         );
         expect(result.status, result.stderr).toBe(2);
         expect(result.stdout).toContain("leaf.test.ts(1,14): error TS2322");
-        expect(compilerEvents()).toHaveLength(mode === "evidence" ? 2 : 1);
+        expect(compilerEvents()).toHaveLength(2);
         const receipts = result.stdout
           .split("\n")
           .filter((line) => line.startsWith("[ci-static:tsgo:"));

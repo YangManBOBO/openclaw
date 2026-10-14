@@ -19,9 +19,9 @@ Cancellation during natural drainage forwards its signal immediately; its grace
 ends no later than the original halfway point, preserving the recovery allowance
 and total cleanup deadline.
 
-The complete channels test lane prepares its native worker artifacts before
-starting the test process. Cold compilation therefore does not consume the
-test-output watchdog's deadline. Focused channel selections retain lazy
+The complete channels and gateway-methods test projects prepare their native worker
+artifacts before starting the test process. Cold compilation therefore does not
+consume the test-output watchdog's deadline. Focused selections retain lazy
 preparation; the watchdog and compiler cleanup rules remain unchanged.
 
 The lint wrapper owns Go resource limits for current CI. It applies them on
@@ -98,8 +98,8 @@ contexts instead of process-global evaluation.
 
 ```bash
 pnpm changed:lanes                            # inspect the local changed-lane classifier for origin/main...HEAD
-pnpm check:changed                            # smart local check gate: changed formatting/typecheck/lint/guards by boundary lane
-pnpm check                                    # fast local gate: prod tsgo + sharded lint + parallel fast guards
+pnpm check:changed                            # optional smart local check: changed formatting/typecheck/lint/guards by boundary lane
+pnpm check                                    # optional broad local check: prod tsgo + sharded lint + parallel fast guards
 pnpm check:test-types
 pnpm check:timed                              # same gate with per-stage timings
 pnpm build:strict-smoke
