@@ -108,6 +108,9 @@ export function registerVideoCapabilityCommands(capability: Command): void {
         if (opts.duration !== undefined && durationSeconds === undefined) {
           throw new Error("--duration must be a finite number");
         }
+        if (durationSeconds !== undefined && durationSeconds <= 0) {
+          throw new Error("--duration must be a positive number of seconds");
+        }
         const timeoutMs = parseOptionalTimeoutMs(opts.timeoutMs);
         const { getModelsCommandSecretTargetIds } = await import("../command-secret-targets.js");
         const { generateVideo } = await import("../../video-generation/runtime.js");

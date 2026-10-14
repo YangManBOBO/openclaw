@@ -1737,6 +1737,20 @@ describe("capability cli", () => {
     },
   );
 
+  it.each([
+    ["capability", ["video", "generate", "--prompt", "clip", "--duration", "0"]],
+    ["capability", ["video", "generate", "--prompt", "clip", "--duration", "-5"]],
+  ] as const)(
+    "rejects non-positive video duration before %s %j dispatch",
+    async (command, argv) => {
+      await expect(runCap(command, ...argv)).rejects.toThrow("exit 1");
+
+      expectRuntimeErrorContains("--duration must be a positive number of seconds");
+      expect(mocks.resolveCommandConfigWithSecrets).not.toHaveBeenCalled();
+      expect(mocks.generateVideo).not.toHaveBeenCalled();
+    },
+  );
+
   it("reports actual audio attribution and forwards request hints", async () => {
     mocks.transcribeAudioFile.mockResolvedValueOnce({
       text: "meeting notes",
