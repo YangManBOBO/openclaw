@@ -22,14 +22,18 @@ vi.mock("../nodes-screen.js", async () => {
   };
 });
 
-vi.mock("../../runtime.js", () => ({
-  defaultRuntime: {
-    log: vi.fn(),
-    error: vi.fn(),
-    writeJson: vi.fn(),
-    exit: vi.fn(),
-  },
-}));
+vi.mock("../../runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("../../runtime.js")>("../../runtime.js");
+  return {
+    ...actual,
+    defaultRuntime: {
+      log: vi.fn(),
+      error: vi.fn(),
+      writeJson: vi.fn(),
+      exit: vi.fn(),
+    },
+  };
+});
 
 vi.mock("./rpc.js", async () => {
   const actual = await vi.importActual<typeof import("./rpc.js")>("./rpc.js");
