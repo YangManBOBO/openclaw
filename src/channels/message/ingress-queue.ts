@@ -122,9 +122,11 @@ export function createChannelIngressQueue<
     context = capture(),
     signal?: AbortSignal,
     isClaimSelectionCurrent?: () => boolean,
+    assertOperationCurrent?: () => void,
   ) => {
     const assertActive = () => {
       assertQueueCurrent(context);
+      assertOperationCurrent?.();
       signal?.throwIfAborted();
     };
     const claimClock =
@@ -585,11 +587,20 @@ export function createChannelIngressQueue<
     }
   };
 
-  return {
-    async enqueue(id, payload, enqueueOptions) {
-      const eventId = idFrom(id);
-      const receivedAt = enqueueOptions?.receivedAt ?? now();
-      const result = await execute("channelIngress.enqueue", {
+  const enqueue = async (
+    id: string,
+    payload: TPayload,
+    enqueueOptions?: Parameters<
+      ChannelIngressQueue<TPayload, TMetadata, TCompletedMetadata>["enqueue"]
+    >[2],
+    assertOperationCurrent?: () => void,
+  ): ReturnType<ChannelIngressQueue<TPayload, TMetadata, TCompletedMetadata>["enqueue"]> => {
+    assertOperationCurrent?.();
+    const eventId = idFrom(id);
+    const receivedAt = enqueueOptions?.receivedAt ?? now();
+    const result = await execute(
+      "channelIngress.enqueue",
+      {
         ...scope,
         id: eventId,
         payloadJson: JSON.stringify(payload),
@@ -598,36 +609,52 @@ export function createChannelIngressQueue<
         receivedAt,
         now: now(),
         laneKey: enqueueOptions?.laneKey,
-      });
-      const row = result.row;
-      if (result.accepted) {
-        // A new pending row before the retained cursor would be skipped by the
-        // keyset resume; drop the cursor so the earlier row stays reachable.
-        invalidateResumeBefore(receivedAt, eventId);
-        return {
-          kind: "accepted",
-          duplicate: false,
-          record: requiredRecord<TPayload, TMetadata>(row),
-        };
+      },
+      capture(),
+      undefined,
+      undefined,
+      assertOperationCurrent,
+    );
+    const row = result.row;
+    if (result.accepted) {
+      // A new pending row before the retained cursor would be skipped by the
+      // keyset resume; drop the cursor so the earlier row stays reachable.
+      invalidateResumeBefore(receivedAt, eventId);
+      return {
+        kind: "accepted",
+        duplicate: false,
+        record: requiredRecord<TPayload, TMetadata>(row),
+      };
+    }
+    if (row.status === "completed") {
+      return {
+        kind: "completed",
+        duplicate: true,
+        record: completedRecord<TCompletedMetadata>(row),
+      };
+    }
+    if (row.status === "failed") {
+      return { kind: "failed", duplicate: true, record: failedRecord<TPayload, TMetadata>(row) };
+    }
+    if (row.status === "claimed") {
+      const record = claimedRecord<TPayload, TMetadata>(row);
+      if (!record) {
+        throw new Error(`Corrupt claimed channel ingress event ${queueName}/${eventId}`);
       }
-      if (row.status === "completed") {
-        return {
-          kind: "completed",
-          duplicate: true,
-          record: completedRecord<TCompletedMetadata>(row),
-        };
+      return { kind: "claimed", duplicate: true, record };
+    }
+    return { kind: "pending", duplicate: true, record: requiredRecord<TPayload, TMetadata>(row) };
+  };
+  return {
+    enqueue,
+    enqueueAuthorized: (id, payload, authorizedOptions) => {
+      if (typeof authorizedOptions.assertCurrent !== "function") {
+        return Promise.reject(
+          new TypeError("Authorized ingress requires a current-owner assertion"),
+        );
       }
-      if (row.status === "failed") {
-        return { kind: "failed", duplicate: true, record: failedRecord<TPayload, TMetadata>(row) };
-      }
-      if (row.status === "claimed") {
-        const record = claimedRecord<TPayload, TMetadata>(row);
-        if (!record) {
-          throw new Error(`Corrupt claimed channel ingress event ${queueName}/${eventId}`);
-        }
-        return { kind: "claimed", duplicate: true, record };
-      }
-      return { kind: "pending", duplicate: true, record: requiredRecord<TPayload, TMetadata>(row) };
+      const { assertCurrent: assertOperationCurrent, ...enqueueOptions } = authorizedOptions;
+      return enqueue(id, payload, enqueueOptions, assertOperationCurrent);
     },
     async listPending(listOptions) {
       return (await readRows({ status: "pending", ...listOptions })).map((row) =>
