@@ -123,12 +123,15 @@ export function readChannelIngressClaimSnapshotInDatabase(
   // Repair can expose up to 100 later rows without changing the caller's scan window.
   let pendingBeforeCursor: number | undefined;
   let pendingBeforeCursorFingerprint: string | undefined;
+  let cursorRowFingerprint: string | undefined;
+  let prefixRows: ChannelIngressRow[] | undefined;
   if (input.expectedPendingBeforeCursor !== undefined && input.claimAfter) {
     // A retained direct-scan cursor is only valid while the scan-visible pending
     // rows before it are unchanged. Read their count and fingerprint in this same
     // pinned read so a write from any handle that inserted, removed, or replaced
     // a row before the cursor is observed atomically with the paged snapshot; the
-    // caller drops the resume otherwise.
+    // caller drops the resume otherwise. The cursor row itself is validated too,
+    // since the strict-before prefix cannot observe its equal-position replacement.
     const prefix = readChannelIngressPrefixInDatabase(db, {
       queueName: input.queueName,
       candidateIds: input.candidateIds,
@@ -136,9 +139,12 @@ export function readChannelIngressClaimSnapshotInDatabase(
       reconcileStoredLaneKey: input.reconcileStoredLaneKey,
       orderBy: input.orderBy,
       claimAfter: input.claimAfter,
+      includeRows: input.includePrefixRows,
     });
     pendingBeforeCursor = prefix.count;
     pendingBeforeCursorFingerprint = prefix.fingerprint;
+    cursorRowFingerprint = prefix.cursorRowFingerprint;
+    prefixRows = prefix.rows;
   }
   return {
     claimed,
@@ -148,6 +154,8 @@ export function readChannelIngressClaimSnapshotInDatabase(
     ).rows,
     ...(pendingBeforeCursor === undefined ? {} : { pendingBeforeCursor }),
     ...(pendingBeforeCursorFingerprint === undefined ? {} : { pendingBeforeCursorFingerprint }),
+    ...(cursorRowFingerprint === undefined ? {} : { cursorRowFingerprint }),
+    ...(prefixRows === undefined ? {} : { prefixRows }),
   };
 }
 

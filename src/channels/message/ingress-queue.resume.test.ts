@@ -574,4 +574,87 @@ describe("channel ingress queue resume", () => {
       expect(claimed?.id).toBe("free");
     });
   });
+
+  it("revalidates the cursor row itself when another handle replaces it at the same position", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+      const other = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // One bounded pass scans exactly blockedPrefixRows rows ((budget + 1) pages
+      // of scanLimit + repair rows), so the retained cursor sits on the LAST
+      // blocked row of the prefix.
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row < blockedPrefixRows ? `blocked-${row}` : "free-tail",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedPrefixRows ? "blocked" : "free",
+        })),
+      );
+
+      const deriveLaneKey = (record: { payload: { lane: string } }) => record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // A second handle deletes the cursor row and re-enqueues the same id with
+      // the same receivedAt but a free-lane payload. Rows strictly before the
+      // cursor are unchanged, so count and prefix fingerprint still match; a
+      // strict-> resume would skip the now-eligible row and claim the tail.
+      const cursorId = `blocked-${blockedPrefixRows - 1}`;
+      await other.delete(cursorId);
+      await other.enqueue(cursorId, { lane: "free" }, { receivedAt: blockedPrefixRows - 1 });
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe(cursorId);
+    });
+  });
+
+  it("invalidates the resume cursor when a stable callback changes its captured policy", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // row-0 sits before the retained cursor. The SAME callback (stable identity)
+      // reads a captured policy: first "blocked" everywhere, then "free" for row-0.
+      // Callback identity cannot prove the policy is unchanged, so the resume must
+      // re-evaluate skipped rows under the current policy instead of skipping row-0.
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row === 0 ? "row-0" : row < blockedPrefixRows ? `blocked-${row}` : "free",
+          receivedAt: row,
+          laneKey: null,
+          lane: row === 0 || row >= blockedPrefixRows ? "free" : "blocked",
+        })),
+      );
+
+      let row0Lane = "blocked";
+      const stableCallback = (record: { id: string; payload: { lane: string } }) =>
+        record.id === "row-0" ? row0Lane : record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey: stableCallback,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // The captured policy flips behind the same callback identity.
+      row0Lane = "free";
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe("row-0");
+    });
+  });
 });

@@ -261,6 +261,13 @@ export type ChannelIngressClaimRequest = {
    * another inserted before the cursor), which count alone cannot observe.
    */
   expectedPendingBeforeCursorFingerprint?: string;
+  /**
+   * Return the materialized scan-visible prefix rows with the snapshot. Set only
+   * on a resumed direct scan whose lane policy is derived: the host re-evaluates
+   * each skipped row under the current callback policy, because callback identity
+   * cannot prove a captured policy is unchanged.
+   */
+  includePrefixRows?: boolean;
 };
 export type ChannelIngressClaimSnapshot = {
   pending: ChannelIngressRow[];
@@ -269,6 +276,14 @@ export type ChannelIngressClaimSnapshot = {
   pendingBeforeCursor?: number;
   /** Fingerprint of the scan-visible pending rows strictly before claimAfter. */
   pendingBeforeCursorFingerprint?: string;
+  /**
+   * Fingerprint of the pending cursor row itself, read in the same pinned read.
+   * The strict-before prefix cannot observe an equal-position replacement of the
+   * cursor row, so resuming validates it separately.
+   */
+  cursorRowFingerprint?: string;
+  /** Materialized prefix rows, present only when the request set includePrefixRows. */
+  prefixRows?: ChannelIngressRow[];
 };
 
 /** Keyset cursor matching the pending ordering; the row after it opens the next claim page. */

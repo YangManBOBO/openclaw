@@ -375,6 +375,11 @@ export function createChannelIngressQueue<
     // Fingerprint of the row that became claimAfter, needed to extend the prefix
     // fingerprint across pages (the next prefix includes the cursor row).
     let lastCursorRowFingerprint: string | undefined;
+    // Set on a resumed derived-lane scan: the first paged request returns the
+    // materialized prefix rows so their lanes can be re-evaluated under the
+    // current callback policy (identity alone cannot prove it unchanged).
+    let revalidatePrefixPolicy = false;
+    const blockedLaneKeySet = new Set(requestBase.blockedLaneKeys);
     if (directScan && directScanResume) {
       const resume = directScanResume;
       const inputsMatch =
@@ -388,6 +393,7 @@ export function createChannelIngressQueue<
         expectedPendingBeforeCursor = resume.pendingBeforeCursor;
         expectedPendingBeforeCursorFingerprint = resume.prefixFingerprint;
         lastCursorRowFingerprint = resume.cursorRowFingerprint;
+        revalidatePrefixPolicy = Boolean(deriveLaneKey);
         // The resume page skips rows before the cursor; seed the walk with the
         // count including the cursor row so a re-retained cursor still records the
         // rows strictly before it (scannedPendingRows - 1) without double-subtracting.
@@ -405,6 +411,7 @@ export function createChannelIngressQueue<
               ...(expectedPendingBeforeCursorFingerprint === undefined
                 ? {}
                 : { expectedPendingBeforeCursorFingerprint }),
+              ...(revalidatePrefixPolicy ? { includePrefixRows: true } : {}),
             }
           : claimAfter
             ? { ...requestBase, claimAfter }
@@ -416,12 +423,29 @@ export function createChannelIngressQueue<
         // mismatch means a write from any handle inserted, removed, or replaced a
         // row before the cursor, so the retained or in-flight progress is stale
         // and the keyset must be dropped to rescan from the front instead of
-        // skipping that earlier row.
-        if (
+        // skipping that earlier row. The cursor row itself is checked too: the
+        // strict-before prefix cannot observe an equal-position replacement of it.
+        const prefixStale =
           snapshot.pendingBeforeCursor !== expectedPendingBeforeCursor ||
           (expectedPendingBeforeCursorFingerprint !== undefined &&
-            snapshot.pendingBeforeCursorFingerprint !== expectedPendingBeforeCursorFingerprint)
-        ) {
+            snapshot.pendingBeforeCursorFingerprint !== expectedPendingBeforeCursorFingerprint) ||
+          snapshot.cursorRowFingerprint !== lastCursorRowFingerprint;
+        // Callback identity cannot prove an unchanged captured policy, so a
+        // resumed derived-lane scan re-evaluates every skipped prefix row under
+        // the current callback. A row that now resolves outside the blocked set
+        // was made eligible by the policy change; the keyset must not skip it.
+        const policyShifted =
+          !prefixStale &&
+          revalidatePrefixPolicy &&
+          (snapshot.prefixRows ?? []).some((row) => {
+            if (!baseRecord(row)) {
+              return false;
+            }
+            const lane = resolveLane(row);
+            return lane === undefined || !blockedLaneKeySet.has(lane);
+          });
+        revalidatePrefixPolicy = false;
+        if (prefixStale || policyShifted) {
           claimAfter = undefined;
           expectedPendingBeforeCursor = undefined;
           expectedPendingBeforeCursorFingerprint = undefined;

@@ -5,11 +5,22 @@ import {
 } from "../../infra/kysely-sync.js";
 import type { EngineConnection } from "../../infra/sql-connection.js";
 import type { DB } from "../../state/openclaw-state-db.generated.js";
-import { foldChannelIngressPrefixFingerprints } from "./ingress-queue.codec.js";
-import type { ChannelIngressClaimCursor } from "./ingress-queue.types.js";
+import {
+  channelIngressPrefixRowFingerprint,
+  foldChannelIngressPrefixFingerprints,
+} from "./ingress-queue.codec.js";
+import type { ChannelIngressClaimCursor, ChannelIngressRow } from "./ingress-queue.types.js";
 
 const getQueue = (db: EngineConnection) =>
   getNodeSqliteKysely<Pick<DB, "channel_ingress_events">>(db);
+
+const FINGERPRINT_COLUMNS = [
+  "event_id",
+  "received_at",
+  "lane_key",
+  "status",
+  "payload_json",
+] as const;
 
 /**
  * Authoritative count and membership fingerprint of the scan-visible pending rows
@@ -17,7 +28,12 @@ const getQueue = (db: EngineConnection) =>
  * resume cursor is only valid while these are unchanged; a write from any handle
  * that inserted, removed, or replaced a row before the cursor changes one of them.
  * The fingerprint detects offsetting writes (one row removed, another inserted)
- * that preserve the count, which count alone cannot observe.
+ * that preserve the count, which count alone cannot observe. The cursor row itself
+ * is validated separately: the strict-before prefix cannot observe an
+ * equal-position replacement of it (same id and received time, different
+ * lane-policy inputs). When includeRows is set the materialized prefix rows are
+ * returned so the host can re-evaluate their lanes under the current callback
+ * policy, which callback identity alone cannot prove unchanged.
  */
 export function readChannelIngressPrefixInDatabase(
   db: EngineConnection,
@@ -28,29 +44,34 @@ export function readChannelIngressPrefixInDatabase(
     reconcileStoredLaneKey?: boolean;
     orderBy?: "received" | "id";
     claimAfter: ChannelIngressClaimCursor;
+    includeRows?: boolean;
   },
-): { count: number; fingerprint: string } {
+): {
+  count: number;
+  fingerprint: string;
+  cursorRowFingerprint?: string;
+  rows?: ChannelIngressRow[];
+} {
   const cursor = input.claimAfter;
-  let before = getQueue(db)
+  let filtered = getQueue(db)
     .selectFrom("channel_ingress_events")
-    .select(["event_id", "received_at", "lane_key", "status", "payload_json"])
     .where("queue_name", "=", input.queueName)
     .where("status", "=", "pending");
   if (input.candidateIds) {
-    before = before.where("event_id", "in", input.candidateIds);
+    filtered = filtered.where("event_id", "in", input.candidateIds);
   }
   if (!input.reconcileStoredLaneKey && input.blockedLaneKeys.length) {
-    before = before.where((eb) =>
+    filtered = filtered.where((eb) =>
       eb.or([
         eb("lane_key", "is", null),
         eb("lane_key", "not in", sqliteStringSet(input.blockedLaneKeys)),
       ]),
     );
   }
-  before =
+  filtered =
     input.orderBy === "id"
-      ? before.where("event_id", "<", cursor.eventId)
-      : before.where((eb) =>
+      ? filtered.where("event_id", "<", cursor.eventId)
+      : filtered.where((eb) =>
           eb.or([
             eb("received_at", "<", cursor.receivedAt),
             eb.and([
@@ -59,12 +80,34 @@ export function readChannelIngressPrefixInDatabase(
             ]),
           ]),
         );
-  const prefixRows = executeSqliteQuerySync(db, before).rows;
+  const cursorRow = executeSqliteQuerySync(
+    db,
+    getQueue(db)
+      .selectFrom("channel_ingress_events")
+      .select(FINGERPRINT_COLUMNS)
+      .where("queue_name", "=", input.queueName)
+      .where("event_id", "=", cursor.eventId)
+      .where("status", "=", "pending"),
+  ).rows[0];
+  const cursorPart = cursorRow
+    ? { cursorRowFingerprint: channelIngressPrefixRowFingerprint(cursorRow) }
+    : {};
+  if (input.includeRows) {
+    const rows = executeSqliteQuerySync(db, filtered.selectAll()).rows;
+    return {
+      count: rows.length,
+      fingerprint: foldChannelIngressPrefixFingerprints(rows),
+      ...cursorPart,
+      rows,
+    };
+  }
+  const prefixRows = executeSqliteQuerySync(db, filtered.select(FINGERPRINT_COLUMNS)).rows;
   return {
     count: prefixRows.length,
     // Fold in a bounded loop: the retained cursor can advance across arbitrarily
     // many calls, and spreading one argument per row would exceed V8's
     // function-argument limit on a sufficiently large derived blocked backlog.
     fingerprint: foldChannelIngressPrefixFingerprints(prefixRows),
+    ...cursorPart,
   };
 }
