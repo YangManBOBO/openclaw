@@ -38,6 +38,9 @@ export function registerNodesScreenCommands(nodes: Command) {
       .action(async (opts: NodesRpcOpts & { out?: string }) => {
         await runNodesCommand("screen record", async () => {
           const durationMs = parseDurationMs(opts.duration ?? "");
+          if (durationMs <= 0) {
+            throw new Error("--duration must be a positive duration");
+          }
           const screenIndex = parseOptionalNodeInteger(
             opts.screen ?? "0",
             "--screen",

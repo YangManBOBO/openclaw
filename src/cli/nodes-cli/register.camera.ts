@@ -219,6 +219,9 @@ export function registerNodesCameraCommands(nodes: Command) {
         await runNodesCommand("camera clip", async () => {
           const facing = parseFacing(opts.facing ?? "front");
           const durationMs = parseDurationMs(opts.duration ?? "3000");
+          if (durationMs <= 0) {
+            throw new Error("--duration must be a positive duration");
+          }
           const includeAudio = opts.audio !== false;
           const timeoutMs = parseOptionalNodeInteger(opts.invokeTimeout, "--invoke-timeout");
           const deviceId = normalizeOptionalString(opts.deviceId);
