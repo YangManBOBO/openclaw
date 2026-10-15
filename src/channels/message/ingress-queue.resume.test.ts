@@ -657,4 +657,45 @@ describe("channel ingress queue resume", () => {
       expect(claimed?.id).toBe("row-0");
     });
   });
+
+  it("invalidates the resume cursor when a stable callback frees the cursor row itself", async () => {
+    await withTempState(async (stateDir) => {
+      let clock = 1;
+      const queue = createTestIngressQueue<{ lane: string }>(stateDir, { now: () => clock++ });
+
+      // The retained cursor sits on the LAST blocked row of the prefix. The SAME
+      // callback (stable identity) flips only that row's lane to free; no persisted
+      // row changes, so the persisted cursor fingerprint still matches. The resume
+      // must re-evaluate the cursor row under current policy, not skip it.
+      insertPendingIngressRows(
+        stateDir,
+        Array.from({ length: blockedPrefixRows + 1 }, (_, row) => ({
+          eventId: row < blockedPrefixRows ? `blocked-${row}` : "free-tail",
+          receivedAt: row,
+          laneKey: null,
+          lane: row < blockedPrefixRows ? "blocked" : "free",
+        })),
+      );
+
+      const cursorId = `blocked-${blockedPrefixRows - 1}`;
+      let cursorLane = "blocked";
+      const stableCallback = (record: { id: string; payload: { lane: string } }) =>
+        record.id === cursorId ? cursorLane : record.payload.lane;
+      const claimOptions = {
+        ownerId: "worker",
+        blockedLaneKeys: ["blocked"],
+        scanLimit,
+        deriveLaneKey: stableCallback,
+      };
+
+      // First call exhausts the budget over the blocked prefix and retains a cursor.
+      await expect(queue.claimNext(claimOptions)).resolves.toBeNull();
+
+      // The captured policy flips behind the same callback identity.
+      cursorLane = "free";
+
+      const claimed = await queue.claimNext(claimOptions);
+      expect(claimed?.id).toBe(cursorId);
+    });
+  });
 });

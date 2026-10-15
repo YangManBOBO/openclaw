@@ -433,13 +433,17 @@ export function createChannelIngressQueue<
             snapshot.pendingBeforeCursorFingerprint !== expectedPendingBeforeCursorFingerprint) ||
           snapshot.cursorRowFingerprint !== lastCursorRowFingerprint;
         // Callback identity cannot prove an unchanged captured policy, so a
-        // resumed derived-lane scan re-evaluates every skipped prefix row under
-        // the current callback. A row that now resolves outside the blocked set
+        // resumed derived-lane scan re-evaluates every skipped row — the
+        // strict-before prefix rows and the cursor row itself — under the
+        // current callback. A row that now resolves outside the blocked set
         // was made eligible by the policy change; the keyset must not skip it.
         const policyShifted =
           !prefixStale &&
           revalidatePrefixPolicy &&
-          (snapshot.prefixRows ?? []).some((row) => {
+          [
+            ...(snapshot.prefixRows ?? []),
+            ...(snapshot.cursorRow ? [snapshot.cursorRow] : []),
+          ].some((row) => {
             if (!baseRecord(row)) {
               return false;
             }

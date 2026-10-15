@@ -124,6 +124,7 @@ export function readChannelIngressClaimSnapshotInDatabase(
   let pendingBeforeCursor: number | undefined;
   let pendingBeforeCursorFingerprint: string | undefined;
   let cursorRowFingerprint: string | undefined;
+  let cursorRow: ChannelIngressRow | undefined;
   let prefixRows: ChannelIngressRow[] | undefined;
   if (input.expectedPendingBeforeCursor !== undefined && input.claimAfter) {
     // A retained direct-scan cursor is only valid while the scan-visible pending
@@ -144,6 +145,7 @@ export function readChannelIngressClaimSnapshotInDatabase(
     pendingBeforeCursor = prefix.count;
     pendingBeforeCursorFingerprint = prefix.fingerprint;
     cursorRowFingerprint = prefix.cursorRowFingerprint;
+    cursorRow = prefix.cursorRow;
     prefixRows = prefix.rows;
   }
   return {
@@ -155,6 +157,7 @@ export function readChannelIngressClaimSnapshotInDatabase(
     ...(pendingBeforeCursor === undefined ? {} : { pendingBeforeCursor }),
     ...(pendingBeforeCursorFingerprint === undefined ? {} : { pendingBeforeCursorFingerprint }),
     ...(cursorRowFingerprint === undefined ? {} : { cursorRowFingerprint }),
+    ...(cursorRow === undefined ? {} : { cursorRow }),
     ...(prefixRows === undefined ? {} : { prefixRows }),
   };
 }

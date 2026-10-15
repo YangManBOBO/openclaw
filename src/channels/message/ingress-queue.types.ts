@@ -293,6 +293,11 @@ export type ChannelIngressClaimSnapshot = {
    * cursor row, so resuming validates it separately.
    */
   cursorRowFingerprint?: string;
+  /**
+   * The materialized pending cursor row, present only when the request set
+   * includePrefixRows so the host can re-evaluate its lane under current policy.
+   */
+  cursorRow?: ChannelIngressRow;
   /** Materialized prefix rows, present only when the request set includePrefixRows. */
   prefixRows?: ChannelIngressRow[];
 };

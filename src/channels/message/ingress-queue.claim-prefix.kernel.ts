@@ -50,6 +50,7 @@ export function readChannelIngressPrefixInDatabase(
   count: number;
   fingerprint: string;
   cursorRowFingerprint?: string;
+  cursorRow?: ChannelIngressRow;
   rows?: ChannelIngressRow[];
 } {
   const cursor = input.claimAfter;
@@ -80,27 +81,31 @@ export function readChannelIngressPrefixInDatabase(
             ]),
           ]),
         );
-  const cursorRow = executeSqliteQuerySync(
-    db,
+  const cursorRowQuery = () =>
     getQueue(db)
       .selectFrom("channel_ingress_events")
-      .select(FINGERPRINT_COLUMNS)
       .where("queue_name", "=", input.queueName)
       .where("event_id", "=", cursor.eventId)
-      .where("status", "=", "pending"),
-  ).rows[0];
-  const cursorPart = cursorRow
-    ? { cursorRowFingerprint: channelIngressPrefixRowFingerprint(cursorRow) }
-    : {};
+      .where("status", "=", "pending");
   if (input.includeRows) {
     const rows = executeSqliteQuerySync(db, filtered.selectAll()).rows;
+    // The cursor row rides along so the host can re-evaluate its lane under the
+    // current callback policy too; the strict-before prefix excludes it.
+    const cursorRow = executeSqliteQuerySync(db, cursorRowQuery().selectAll()).rows[0];
     return {
       count: rows.length,
       fingerprint: foldChannelIngressPrefixFingerprints(rows),
-      ...cursorPart,
+      ...(cursorRow
+        ? { cursorRowFingerprint: channelIngressPrefixRowFingerprint(cursorRow), cursorRow }
+        : {}),
       rows,
     };
   }
+  const cursorRow = executeSqliteQuerySync(db, cursorRowQuery().select(FINGERPRINT_COLUMNS))
+    .rows[0];
+  const cursorPart = cursorRow
+    ? { cursorRowFingerprint: channelIngressPrefixRowFingerprint(cursorRow) }
+    : {};
   const prefixRows = executeSqliteQuerySync(db, filtered.select(FINGERPRINT_COLUMNS)).rows;
   return {
     count: prefixRows.length,
