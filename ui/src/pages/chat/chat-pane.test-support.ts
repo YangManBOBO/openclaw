@@ -32,11 +32,11 @@ import { loadSettings } from "../../app/settings.ts";
 import type { MarkdownRenderOptions } from "../../components/markdown-render-options.ts";
 import { createAgentIdentityCapability } from "../../lib/agents/identity.ts";
 import { createAgentCapability } from "../../lib/agents/index.ts";
+import type { SolidControllerHost } from "../../lib/reactive/solid-controller-host.ts";
 import type { CatalogSessionKey } from "../../lib/sessions/catalog-key.ts";
 import { createSessionCapability, type SessionCapability } from "../../lib/sessions/index.ts";
 import { createSessionArchiveState } from "../../lib/sessions/session-archive-state.ts";
 import { createSessionRowProvenance } from "../../lib/sessions/session-row-provenance.ts";
-import type { SolidControllerHost } from "../../lit/solid-controller-host.ts";
 import { ControlUiPluginRuntime } from "../../plugins/control-ui-runtime.ts";
 import { createNavigationPreferencesFixture } from "../../test-helpers/application-context.ts";
 import {
@@ -74,7 +74,7 @@ import type {
   ChatTaskSuggestionTrayProps,
   TaskSuggestionStartMode,
 } from "./components/chat-task-suggestions.tsx";
-import type { ChatTranscriptController } from "./components/chat-transcript-controller.ts";
+import type { ChatTranscript } from "./components/chat-transcript-controller.ts";
 import type { ChatMessageCache } from "./session-message-cache.ts";
 import type { SessionSnapshotStore } from "./session-snapshot-store.ts";
 
@@ -129,7 +129,7 @@ export function mountBoardPanel(
 export interface TestChatPane extends HTMLElement, SolidControllerHost {
   readonly element: HTMLElement;
   render: ChatPaneRuntime["render"];
-  readonly transcript: ChatTranscriptController;
+  readonly transcript: ChatTranscript;
   catalogMessages: unknown[];
   active: boolean;
   presented: boolean;
