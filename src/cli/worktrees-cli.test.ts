@@ -192,6 +192,13 @@ describe("worktrees cli", () => {
     expect(retire).not.toHaveBeenCalled();
   });
 
+  it("rejects an empty cleanup job selector before cleanup", async () => {
+    setRuntimeConfigSnapshot({}, {});
+    const gc = vi.spyOn(owner, "gc").mockRejectedValue(new Error("Unexpected cleanup execution"));
+    await expect(run(["gc", "--job", "", "--json"])).rejects.toThrow("--job must not be empty");
+    expect(gc).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("reports cleanup and signals partial failure: %s", async (partial) => {
     setRuntimeConfigSnapshot({}, {});
     const result = {
