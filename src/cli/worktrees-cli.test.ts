@@ -169,28 +169,25 @@ describe("worktrees cli", () => {
   });
 
   it("rejects an invalid --removed-at before retiring a snapshot", async () => {
-    const retire = vi.spyOn(ManagedWorktreeService.prototype, "retireSnapshot");
-    const program = new Command().exitOverride().configureOutput({ writeErr: () => undefined });
-    registerWorktreesCli(program);
+    setRuntimeConfigSnapshot({}, {});
+    const retire = vi
+      .spyOn(owner, "retireSnapshot")
+      .mockRejectedValue(new Error("Unexpected snapshot retirement"));
     await expect(
-      program.parseAsync(
-        [
-          "worktrees",
-          "retire-snapshot",
-          "worktree-id",
-          "--expected-ref",
-          "refs/openclaw/snapshots/worktree-id",
-          "--expected-oid",
-          "a".repeat(40),
-          "--removed-at",
-          "1700000000100ms",
-          "--retained-ref",
-          "refs/heads/main",
-          "--retained-oid",
-          "b".repeat(40),
-        ],
-        { from: "user" },
-      ),
+      run([
+        "retire-snapshot",
+        "worktree-id",
+        "--expected-ref",
+        "refs/openclaw/snapshots/worktree-id",
+        "--expected-oid",
+        "a".repeat(40),
+        "--removed-at",
+        "1700000000100ms",
+        "--retained-ref",
+        "refs/heads/main",
+        "--retained-oid",
+        "b".repeat(40),
+      ]),
     ).rejects.toThrow("--removed-at must be a non-negative integer (epoch milliseconds).");
     expect(retire).not.toHaveBeenCalled();
   });
