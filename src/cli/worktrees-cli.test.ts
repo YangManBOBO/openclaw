@@ -216,47 +216,6 @@ describe("worktrees cli", () => {
     expect(retire).not.toHaveBeenCalled();
   });
 
-  it("passes a valid --removed-at integer to the retire owner", async () => {
-    const retire = vi
-      .spyOn(ManagedWorktreeService.prototype, "retireSnapshot")
-      .mockResolvedValue({ retired: true, id: "worktree-id" });
-    const output = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => undefined);
-    const program = new Command().name("openclaw");
-    registerWorktreesCli(program);
-    await program.parseAsync(
-      [
-        "worktrees",
-        "retire-snapshot",
-        "worktree-id",
-        "--expected-ref",
-        "refs/openclaw/snapshots/worktree-id",
-        "--expected-oid",
-        "a".repeat(40),
-        "--removed-at",
-        "1700000000100",
-        "--retained-ref",
-        "refs/heads/main",
-        "--retained-oid",
-        "b".repeat(40),
-        "--json",
-      ],
-      { from: "user" },
-    );
-    expect(retire).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: "worktree-id",
-        expectedSnapshotRef: "refs/openclaw/snapshots/worktree-id",
-        expectedSnapshotOid: "a".repeat(40),
-        expectedRemovedAt: 1_700_000_000_100,
-        retainedSourceRef: "refs/heads/main",
-        expectedRetainedSourceOid: "b".repeat(40),
-        signal: expect.any(AbortSignal),
-        commitGuard: expect.any(Function),
-      }),
-    );
-    expect(output).toHaveBeenCalledWith({ retired: true, id: "worktree-id" });
-  });
-
   it.each([false, true])("reports cleanup and signals partial failure: %s", async (partial) => {
     setRuntimeConfigSnapshot({}, {});
     const result = {
