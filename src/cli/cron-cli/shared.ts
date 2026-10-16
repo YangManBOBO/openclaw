@@ -344,7 +344,7 @@ export function createCronAmbiguousNameError(jobs: readonly CronJob[]): CronCliE
         name: job.name,
         // Event command text is unnecessary for choosing a job and can contain credentials.
         schedule:
-          job.schedule.kind === "on-exit" || job.schedule.kind === "stream"
+          job.schedule?.kind === "on-exit" || job.schedule?.kind === "stream"
             ? job.schedule.kind
             : formatSchedule(job.schedule, job.trigger !== undefined),
         enabled: job.enabled,
@@ -661,8 +661,8 @@ export function printCronShow(
   opts?: { deliveryPreview?: CronDeliveryPreview },
 ) {
   const preview = opts?.deliveryPreview ?? { label: "-", detail: "unavailable" };
-  // Malformed or version-skewed rows can omit state; keep show tolerant like printCronList.
   const state = job.state ?? {};
+  const model = job.payload?.kind === "agentTurn" ? job.payload.model : undefined;
   const showValue = (value: unknown) => sanitizeTerminalText(stringifyCell(value));
   runtime.log(`id: ${showValue(job.id)}`);
   runtime.log(`declaration: ${showValue(job.declarationKey)}`);
@@ -681,9 +681,7 @@ export function printCronShow(
   );
   runtime.log(`session: ${showValue(job.sessionTarget)}`);
   runtime.log(`agent: ${showValue(job.agentId)}`);
-  runtime.log(
-    `model: ${showValue(job.payload?.kind === "agentTurn" ? job.payload.model : undefined)}`,
-  );
+  runtime.log(`model: ${showValue(model)}`);
   runtime.log(`delivery: ${showValue(preview.label)} (${showValue(preview.detail)})`);
   runtime.log(`next: ${formatRelative(state.nextRunAtMs, Date.now())}`);
   runtime.log(`last: ${formatRelative(state.lastRunAtMs, Date.now())}`);

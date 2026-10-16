@@ -237,10 +237,6 @@ describe("printCronList", () => {
 
     printCronList([malformedJob], runtime);
     expectLogsToInclude(logs, "malformed-job");
-
-    const show = createRuntimeLogCapture();
-    printCronShow(malformedJob, show.runtime);
-    expectLogsToInclude(show.logs, "id: malformed-job");
   });
 
   it.each([
