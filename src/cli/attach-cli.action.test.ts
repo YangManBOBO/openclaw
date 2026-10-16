@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
+import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionsResolveResult } from "../../packages/gateway-protocol/src/index.js";
@@ -499,5 +500,18 @@ describe("openclaw attach (action)", () => {
     } as never);
     await runAttach("--print-config");
     expect(exitCode).toBe(1);
+  });
+
+  it("errors on a grant with an out-of-range finite expiresAtMs instead of crashing on toISOString", async () => {
+    vi.mocked(callGateway).mockResolvedValueOnce({
+      sessionKey: "agent:main:x",
+      token: "tok-123",
+      expiresAtMs: MAX_DATE_TIMESTAMP_MS + 1,
+      mcpConfig: { mcpServers: { openclaw: {} } },
+      env: {},
+    } as never);
+    await runAttach("--print-config");
+    expect(exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("attach.grant returned an unexpected response");
   });
 });

@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
+import {
+  MAX_DATE_TIMESTAMP_MS,
+  parseStrictPositiveInteger,
+} from "@openclaw/normalization-core/number-coercion";
 import type { Command } from "commander";
 import { captureRuntimeConfigAsyncReader } from "../config/io.js";
 import { defaultRuntime } from "../runtime.js";
@@ -117,6 +120,7 @@ export async function registerAttachCli(program: Command) {
           typeof granted.sessionKey !== "string" ||
           typeof granted.expiresAtMs !== "number" ||
           !Number.isFinite(granted.expiresAtMs) ||
+          Math.abs(granted.expiresAtMs) > MAX_DATE_TIMESTAMP_MS ||
           !granted.mcpConfig?.mcpServers ||
           typeof granted.env !== "object" ||
           granted.env === null
