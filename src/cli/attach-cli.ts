@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  MAX_DATE_TIMESTAMP_MS,
+  asDateTimestampMs,
   parseStrictPositiveInteger,
 } from "@openclaw/normalization-core/number-coercion";
 import type { Command } from "commander";
@@ -120,7 +120,6 @@ export async function registerAttachCli(program: Command) {
           typeof granted.sessionKey !== "string" ||
           typeof granted.expiresAtMs !== "number" ||
           !Number.isFinite(granted.expiresAtMs) ||
-          Math.abs(granted.expiresAtMs) > MAX_DATE_TIMESTAMP_MS ||
           !granted.mcpConfig?.mcpServers ||
           typeof granted.env !== "object" ||
           granted.env === null
@@ -140,6 +139,14 @@ export async function registerAttachCli(program: Command) {
           // A grant response can arrive after CLI cancellation. Its custody is
           // already ours, so unwind through revocation before creating anything.
           signal?.throwIfAborted();
+          // An out-of-range expiry is an unexpected response. Reject it inside
+          // the cleanup scope so the minted grant is still revoked, matching
+          // the revocation the previous toISOString() crash path performed.
+          if (asDateTimestampMs(grant.expiresAtMs) === undefined) {
+            defaultRuntime.error("attach.grant returned an unexpected response from the gateway.");
+            defaultRuntime.exit(1);
+            return;
+          }
           expiresAt = new Date(grant.expiresAtMs).toISOString();
           const config = writeClaudeMcpConfig(grant.mcpConfig);
           cleanupConfig = config.cleanup;

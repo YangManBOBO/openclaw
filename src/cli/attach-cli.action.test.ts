@@ -502,7 +502,7 @@ describe("openclaw attach (action)", () => {
     expect(exitCode).toBe(1);
   });
 
-  it("errors on a grant with an out-of-range finite expiresAtMs instead of crashing on toISOString", async () => {
+  it("rejects an out-of-range finite expiresAtMs while revoking the minted grant", async () => {
     vi.mocked(callGateway).mockResolvedValueOnce({
       sessionKey: "agent:main:x",
       token: "tok-123",
@@ -513,5 +513,8 @@ describe("openclaw attach (action)", () => {
     await runAttach("--print-config");
     expect(exitCode).toBe(1);
     expect(logs.join("\n")).toContain("attach.grant returned an unexpected response");
+    const revocations = gatewayCalls.filter((call) => call.method === "attach.revoke");
+    expect(revocations).toHaveLength(1);
+    expect(revocations[0]?.params).toEqual({ token: "tok-123" });
   });
 });
