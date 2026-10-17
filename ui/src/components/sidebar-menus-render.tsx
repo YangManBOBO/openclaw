@@ -9,6 +9,7 @@ import { openEditor } from "../lib/editor-links.ts";
 import { isGatewayMethodAdvertised } from "../lib/gateway-methods.ts";
 import type { IdentityAvatars } from "../lib/identity-avatar-loader.ts";
 import { openExternalUrlSafe } from "../lib/open-external-url.ts";
+import { projectOverlays } from "../lib/reactive/application.ts";
 import { t } from "../lib/reactive/i18n.ts";
 import { categoryClearReturnsToGroups } from "../lib/sessions/grouping.ts";
 import {
@@ -34,7 +35,7 @@ import { findActiveSidebarLineageRow } from "./app-sidebar-session-lookup.ts";
 import { canRetryGatewayStatus } from "./gateway-status.ts";
 import "../styles/sidebar-menus.css";
 import { sessionMenuReasons } from "./session-menu-access.ts";
-import { SessionMenu, type SessionMenuAction } from "./session-menu.ts";
+import { SessionMenu, type SessionMenuAction } from "./session-menu-solid.tsx";
 import { moveSessionFromMenu, sessionPlacementAction } from "./session-placement-action.ts";
 import { isUpdateAttentionForced } from "./sidebar-attention-dismissals.ts";
 import { isReleaseUpdateAvailable } from "./sidebar-attention-update.ts";
@@ -187,8 +188,11 @@ export function renderSidebarIdentityMenuForController(
     host.sessionDataContext
       ? gatewayPresentationScope(host.sessionDataContext.gateway).displayUser
       : null;
-  const context = () => host.sessionDataContext;
-  const overlaySnapshot = () => context()?.overlays.snapshot;
+  const overlays = createMemo(() => {
+    const source = host.sessionDataContext?.overlays;
+    return source && projectOverlays(source);
+  });
+  const overlaySnapshot = () => overlays()?.read();
   const profileViewer = createMemo(() => {
     const user = selfUser();
     return user ? { ...user, watchedSessions: [] } : undefined;

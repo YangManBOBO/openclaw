@@ -363,6 +363,21 @@ describe("createEmbeddedRunAuthController", () => {
       "refreshed-runtime-api-key",
     );
     expect(harness.runtimeAuthState?.sourceApiKey).toBe("source-api-key");
+
+    mocks.prepareProviderRuntimeAuth.mockResolvedValue({
+      apiKey: "twice-refreshed-runtime-api-key",
+    });
+    await expect(
+      controller.maybeRefreshRuntimeAuthForAuthError("401 invalid api key", false),
+    ).resolves.toBe(true);
+    expectProtectedRuntimeValue(
+      harness.runtimeAuthState?.apiKey,
+      "twice-refreshed-runtime-api-key",
+    );
+    expectProtectedRuntimeValue(
+      setRuntimeApiKey.mock.calls.at(-1)?.[1],
+      "twice-refreshed-runtime-api-key",
+    );
   });
 
   it("does not rotate profiles after an explicit SecretRef owner becomes unavailable", async () => {
@@ -568,7 +583,7 @@ describe("createEmbeddedRunAuthController", () => {
     },
   );
 
-  it("unwraps a sentinel for runtime auth exchange but keeps auth storage opaque", async () => {
+  it("keeps credentials opaque until the runtime auth exchange boundary", async () => {
     const harness = createMutableAuthControllerHarness();
     const setRuntimeApiKey = vi.fn<(provider: string, apiKey: string) => void>();
     const secret = "runtime-exchange-source-secret";
@@ -595,9 +610,7 @@ describe("createEmbeddedRunAuthController", () => {
     expect(mocks.getApiKeyForModelCore).toHaveBeenCalledWith(
       expect.objectContaining({ secretSentinels: true }),
     );
-    expect(mocks.prepareProviderRuntimeAuth).toHaveBeenCalledWith(
-      expect.objectContaining({ context: expect.objectContaining({ apiKey: secret }) }),
-    );
+    expect(mocks.prepareProviderRuntimeAuth.mock.calls[0]?.[0]?.context.apiKey).toBe(sentinel);
     const storedApiKey = setRuntimeApiKey.mock.calls[0]?.[1];
     expect(storedApiKey && looksLikeSecretSentinel(storedApiKey)).toBe(true);
     expect(storedApiKey && resolveSecretSentinel(storedApiKey)).toBe("runtime-exchange-token");
@@ -997,7 +1010,6 @@ describe("createEmbeddedRunAuthController", () => {
         const setRuntimeApiKey = vi.fn<(provider: string, apiKey: string) => void>();
 
         harness.runtimeAuthState = {
-          generation: 1,
           sourceApiKey: "__aws_sdk_auth__",
           apiKey: "__aws_sdk_auth__",
           authMode: "aws-sdk",

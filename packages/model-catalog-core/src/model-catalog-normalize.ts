@@ -2,6 +2,7 @@ import {
   asFiniteNumber as normalizeFiniteNumber,
   asNonNegativeFiniteNumber as normalizeNonNegativeNumber,
   asPositiveFiniteNumber as normalizePositiveNumber,
+  asPositiveInteger as normalizePositiveInteger,
 } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -98,10 +99,6 @@ function normalizeModelCatalogInputs(value: unknown): ModelCatalogInput[] | unde
     MODEL_CATALOG_INPUTS.has(input),
   );
   return inputs.length > 0 ? inputs : undefined;
-}
-
-function normalizePositiveInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 function normalizeModelCatalogTieredCost(value: unknown): ModelCatalogTieredCost[] | undefined {
@@ -462,12 +459,20 @@ function normalizeModelCatalogProvider(value: unknown): ModelCatalogProvider | u
   if (!isRecord(value)) {
     return undefined;
   }
+  if (
+    value.authScope !== undefined &&
+    value.authScope !== "agent" &&
+    value.authScope !== "plugin"
+  ) {
+    throw new Error("Invalid model catalog credential ownership metadata");
+  }
+  const authScope = value.authScope;
   const models = Array.isArray(value.models)
     ? value.models
         .map((entry) => normalizeModelCatalogModel(entry))
         .filter((entry): entry is ModelCatalogModel => Boolean(entry))
     : [];
-  if (models.length === 0) {
+  if (models.length === 0 && authScope === undefined) {
     return undefined;
   }
   const baseUrl = normalizeOptionalString(value.baseUrl) ?? "";
@@ -476,6 +481,7 @@ function normalizeModelCatalogProvider(value: unknown): ModelCatalogProvider | u
   const defaultModel = normalizeOptionalString(value.defaultModel) ?? "";
   const defaultUtilityModel = normalizeOptionalString(value.defaultUtilityModel) ?? "";
   return {
+    ...(authScope ? { authScope } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     ...(api ? { api } : {}),
     ...(headers ? { headers } : {}),
