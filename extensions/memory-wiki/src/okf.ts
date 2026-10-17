@@ -15,6 +15,7 @@ import { forEachMarkdownCodeRange } from "./markdown-links.js";
 import {
   createWikiPageFilename,
   parseWikiMarkdown,
+  preserveHumanNotesBlock,
   renderWikiMarkdown,
   slugifyWikiSegment,
   WIKI_RELATED_END_MARKER,
@@ -25,6 +26,8 @@ import { readWikiPageStat, writeGuardedVaultPage } from "./vault-page-write.js";
 import { initializeMemoryWikiVault } from "./vault.js";
 
 const OKF_RESERVED_FILENAMES = new Set(["index.md", "log.md"]);
+const OKF_HUMAN_START_MARKER = "<!-- openclaw:human:start -->";
+const OKF_HUMAN_END_MARKER = "<!-- openclaw:human:end -->";
 const OKF_MARKDOWN_LINK_PATTERN = /(!?)\[([^\]]*)\]\(([^)]+)\)/g;
 const OKF_RELATED_SECTION_PATTERN = new RegExp(
   `\\n+## Related\\n${WIKI_RELATED_START_MARKER}[\\s\\S]*?${WIKI_RELATED_END_MARKER}\\n?`,
@@ -289,17 +292,22 @@ async function writeOkfConceptPage(params: {
   const vault = await fsRoot(params.vaultRoot);
   const pageStat = await readWikiPageStat(vault, params.pagePath);
   const existing = pageStat ? await vault.readText(params.pagePath).catch(() => "") : "";
+  // Re-import regenerates concept pages; keep any human Notes block (same rule
+  // as source-page sync so re-imports cannot silently erase handwritten notes).
+  const nextRendered = existing
+    ? preserveHumanNotesBlock(params.content, existing)
+    : params.content;
   if (
-    existing === params.content ||
+    existing === nextRendered ||
     normalizeOkfRenderedPageForComparison(existing) ===
-      normalizeOkfRenderedPageForComparison(params.content)
+      normalizeOkfRenderedPageForComparison(nextRendered)
   ) {
     return { changed: false, created: !pageStat };
   }
   await writeGuardedVaultPage({
     vault,
     pagePath: params.pagePath,
-    content: params.content,
+    content: nextRendered,
     pageStat,
     pageLabel: "OKF concept page",
   });
@@ -469,7 +477,7 @@ export async function importMemoryWikiOkfBundle(params: {
       pagePath: concept.pagePath,
       content: renderWikiMarkdown({
         frontmatter,
-        body: rewritten.body,
+        body: `${rewritten.body.trimEnd()}\n\n## Notes\n${OKF_HUMAN_START_MARKER}\n${OKF_HUMAN_END_MARKER}\n`,
       }),
     });
     if (!writeResult.created && writeResult.changed) {
