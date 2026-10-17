@@ -403,6 +403,52 @@ Customer body.
     );
   });
 
+  it("upgrades a pre-Notes OKF concept page to the Notes format on re-import", async () => {
+    const rootDir = await createTempDir("memory-wiki-okf-upgrade-");
+    const bundlePath = path.join(rootDir, "upgrade-okf");
+    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
+    await fs.writeFile(
+      path.join(bundlePath, "tables", "customers.md"),
+      `---
+type: BigQuery Table
+title: Customers
+---
+
+Customer body.
+`,
+      "utf8",
+    );
+    const { config } = await createVault({
+      rootDir: path.join(rootDir, "vault"),
+    });
+    const first = await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
+    });
+    const pagePath = getOnlyPagePath(first.pagePaths);
+    const pageAbsolutePath = path.join(config.vault.path, pagePath);
+    // Simulate a page persisted before the Notes slot existed: same importer
+    // frontmatter and body, no "## Notes" heading and no human markers.
+    const oldFormat = (await fs.readFile(pageAbsolutePath, "utf8")).replace(
+      "\n## Notes\n<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->\n",
+      "\n",
+    );
+    expect(oldFormat).not.toContain("openclaw:human");
+    await fs.writeFile(pageAbsolutePath, `${oldFormat}\n`, "utf8");
+
+    // Re-import must load the existing data and migrate it to the Notes format.
+    await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
+    });
+    const migrated = await fs.readFile(pageAbsolutePath, "utf8");
+    expect(migrated).toContain("Customer body.");
+    expect(migrated).toContain("## Notes\n<!-- openclaw:human:start -->");
+    expect(parseWikiMarkdown(migrated).frontmatter.pageType).toBe("concept");
+  });
+
   it("re-imports legacy OKF pages that carry an unmarked producer Notes section", async () => {
     const rootDir = await createTempDir("memory-wiki-okf-legacy-notes-");
     const bundlePath = path.join(rootDir, "legacy-notes-okf");
