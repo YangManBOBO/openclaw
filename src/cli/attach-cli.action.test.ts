@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
-import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionsResolveResult } from "../../packages/gateway-protocol/src/index.js";
@@ -490,31 +489,34 @@ describe("openclaw attach (action)", () => {
     expect(logs.join("\n")).toContain("failed to revoke attach grant");
   });
 
-  it("errors on a grant with a non-numeric expiresAtMs instead of crashing on toISOString", async () => {
-    vi.mocked(callGateway).mockResolvedValueOnce({
-      sessionKey: "agent:main:x",
-      token: "tok-123",
-      expiresAtMs: "soon",
-      mcpConfig: { mcpServers: { openclaw: {} } },
-      env: {},
-    } as never);
-    await runAttach("--print-config");
-    expect(exitCode).toBe(1);
-  });
+  it.each(["soon", 8_640_000_000_000_001, -8_640_000_000_000_001])(
+    "rejects invalid expiresAtMs %s while revoking the minted grant",
+    async (expiresAtMs) => {
+      vi.mocked(callGateway).mockResolvedValueOnce({
+        sessionKey: "agent:main:x",
+        token: "tok-123",
+        expiresAtMs,
+        mcpConfig: { mcpServers: { openclaw: {} } },
+        env: {},
+      });
+      vi.mocked(defaultRuntime.exit).mockImplementation((code) => {
+        throw new ExitError(code);
+      });
+      const configCount = vi.mocked(mkdtempSync).mock.calls.length;
+      await expect(runAttach("--print-config")).rejects.toEqual(new ExitError(1));
+      expect(logs).toEqual(["ERR:attach.grant returned an unexpected response from the gateway."]);
+      expect(vi.mocked(mkdtempSync).mock.calls).toHaveLength(configCount);
+      const revocations = gatewayCalls.filter((call) => call.method === "attach.revoke");
+      expect(revocations).toHaveLength(1);
+      expect(revocations[0]?.params).toEqual({ token: "tok-123" });
+    },
+  );
 
-  it("rejects an out-of-range finite expiresAtMs while revoking the minted grant", async () => {
-    vi.mocked(callGateway).mockResolvedValueOnce({
-      sessionKey: "agent:main:x",
-      token: "tok-123",
-      expiresAtMs: MAX_DATE_TIMESTAMP_MS + 1,
-      mcpConfig: { mcpServers: { openclaw: {} } },
-      env: {},
-    } as never);
+  it("rejects a missing grant without attempting revocation", async () => {
+    vi.mocked(callGateway).mockResolvedValueOnce(null);
     await runAttach("--print-config");
     expect(exitCode).toBe(1);
-    expect(logs.join("\n")).toContain("attach.grant returned an unexpected response");
-    const revocations = gatewayCalls.filter((call) => call.method === "attach.revoke");
-    expect(revocations).toHaveLength(1);
-    expect(revocations[0]?.params).toEqual({ token: "tok-123" });
+    expect(logs).toEqual(["ERR:attach.grant returned an unexpected response from the gateway."]);
+    expect(gatewayCalls.some((call) => call.method === "attach.revoke")).toBe(false);
   });
 });
