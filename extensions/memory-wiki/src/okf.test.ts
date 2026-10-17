@@ -668,4 +668,120 @@ Version ${version}
     expect(refreshed).toContain("Version 2");
     expect(refreshed).not.toContain("Version 1");
   });
+
+  it("preserves the complete outer Notes block when notes contain a copied marker example", async () => {
+    const rootDir = await createTempDir("memory-wiki-okf-copied-marker-");
+    const bundlePath = path.join(rootDir, "copied-marker-okf");
+    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
+    await fs.writeFile(
+      path.join(bundlePath, "tables", "customers.md"),
+      `---
+type: BigQuery Table
+title: Customers
+---
+
+Customer body.
+`,
+      "utf8",
+    );
+    const { config } = await createVault({
+      rootDir: path.join(rootDir, "vault"),
+    });
+    const first = await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
+    });
+    const pagePath = getOnlyPagePath(first.pagePaths);
+    const pageAbsolutePath = path.join(config.vault.path, pagePath);
+    const raw = await fs.readFile(pageAbsolutePath, "utf8");
+    const withCopiedExample = raw.replace(
+      "<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->",
+      [
+        "<!-- openclaw:human:start -->",
+        "Handwritten note before the pasted example.",
+        "Example:",
+        "```markdown",
+        "<!-- openclaw:human:start -->",
+        "<!-- openclaw:human:end -->",
+        "```",
+        "Handwritten note after the pasted example.",
+        "<!-- openclaw:human:end -->",
+      ].join("\n"),
+    );
+    await fs.writeFile(pageAbsolutePath, withCopiedExample, "utf8");
+
+    await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
+    });
+
+    const refreshed = await fs.readFile(pageAbsolutePath, "utf8");
+    expect(refreshed).toContain("Handwritten note before the pasted example.");
+    expect(refreshed).toContain("Handwritten note after the pasted example.");
+    expect(refreshed).toContain("<!-- openclaw:human:start -->");
+  });
+
+  it("does not promote a legacy fenced producer marker example into the Notes slot", async () => {
+    const rootDir = await createTempDir("memory-wiki-okf-legacy-fenced-");
+    const bundlePath = path.join(rootDir, "legacy-fenced-okf");
+    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
+    await fs.writeFile(
+      path.join(bundlePath, "tables", "customers.md"),
+      `---
+type: BigQuery Table
+title: Customers
+---
+
+Customer body.
+`,
+      "utf8",
+    );
+    const { config } = await createVault({
+      rootDir: path.join(rootDir, "vault"),
+    });
+    const first = await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
+    });
+    const pagePath = getOnlyPagePath(first.pagePaths);
+    const pageAbsolutePath = path.join(config.vault.path, pagePath);
+    // Simulate a page written by the previous importer whose producer body
+    // contains a fenced marker example but no local Notes slot.
+    await fs.writeFile(
+      pageAbsolutePath,
+      `---
+pageType: concept
+title: Customers
+---
+
+Customer body.
+
+\`\`\`markdown
+## Notes
+<!-- openclaw:human:start -->
+stale producer example
+<!-- openclaw:human:end -->
+\`\`\`
+`,
+      "utf8",
+    );
+
+    await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
+    });
+
+    const refreshed = await fs.readFile(pageAbsolutePath, "utf8");
+    // The local slot must start empty: the fenced producer example is not
+    // treated as human Notes.
+    const notesSlot = refreshed.match(
+      /## Notes\s*<!-- openclaw:human:start -->\s*<!-- openclaw:human:end -->/u,
+    );
+    expect(notesSlot).not.toBeNull();
+    expect(refreshed).not.toContain("stale producer example");
+  });
 });

@@ -8,6 +8,7 @@ import { applyMemoryWikiMutation } from "./apply.js";
 import { importChatGptConversations } from "./chatgpt-import.js";
 import { compileMemoryWikiVault } from "./compile.js";
 import { ingestMemoryWikiSource } from "./ingest.js";
+import { importMemoryWikiOkfBundle } from "./okf.js";
 import { writeImportedSourcePage } from "./source-page-shared.js";
 import { buildSourcePage } from "./source-page.test-helpers.js";
 import { createMemoryWikiTestHarness } from "./test-helpers.js";
@@ -414,6 +415,47 @@ describe("memory-wiki existing-page read retry", () => {
 
     expect(securityRuntimeMock.readTextFailureInjected).toBe(true);
     await expect(fs.readFile(pagePath, "utf8")).resolves.toBe(before);
+  });
+
+  it("leaves OKF concept pages unchanged after a persistent existing-page read failure", async () => {
+    const rootDir = await createTempDir("memory-wiki-okf-persistent-read-");
+    const bundlePath = path.join(rootDir, "persistent-read-okf");
+    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
+    await fs.writeFile(
+      path.join(bundlePath, "tables", "customers.md"),
+      `---
+type: BigQuery Table
+title: Customers
+---
+
+Customer body.
+`,
+      "utf8",
+    );
+    const { config } = await createVault({
+      rootDir: path.join(rootDir, "vault"),
+    });
+    const first = await importMemoryWikiOkfBundle({
+      config,
+      bundlePath,
+      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
+    });
+    expect(first.pagePaths).toHaveLength(1);
+    const pagePath = expectDefined(first.pagePaths[0], "imported OKF concept page");
+    const before = await fs.readFile(path.join(config.vault.path, pagePath), "utf8");
+
+    securityRuntimeMock.failReadTextAlwaysFor = pagePath;
+
+    await expect(
+      importMemoryWikiOkfBundle({
+        config,
+        bundlePath,
+        nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
+      }),
+    ).rejects.toThrow("persistent existing-page read failure");
+
+    expect(securityRuntimeMock.readTextFailureInjected).toBe(true);
+    await expect(fs.readFile(path.join(config.vault.path, pagePath), "utf8")).resolves.toBe(before);
   });
 
   it("preserves chatgpt conversation notes containing replacement-pattern dollar sequences", async () => {

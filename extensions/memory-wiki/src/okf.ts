@@ -21,7 +21,11 @@ import {
   WIKI_RELATED_START_MARKER,
 } from "./markdown.js";
 import { resolveMemoryWikiTimestamp } from "./time.js";
-import { readWikiPageStat, writeGuardedVaultPage } from "./vault-page-write.js";
+import {
+  readExistingWikiPageUtf8,
+  readWikiPageStat,
+  writeGuardedVaultPage,
+} from "./vault-page-write.js";
 import { initializeMemoryWikiVault } from "./vault.js";
 
 const OKF_RESERVED_FILENAMES = new Set(["index.md", "log.md"]);
@@ -289,12 +293,37 @@ function normalizeOkfRenderedPageForComparison(content: string): string {
 // fences, and legacy pages produced before the slot existed have no markers at
 // all; both must leave the rendered page untouched.
 function extractOkfHumanNotesBlock(page: string): string | null {
-  const start = page.lastIndexOf(OKF_HUMAN_START_MARKER);
+  const codeRanges: Array<{ start: number; end: number }> = [];
+  forEachMarkdownCodeRange(page, (start, end) => codeRanges.push({ start, end }));
+  const inCode = (index: number) =>
+    codeRanges.some((range) => index >= range.start && index < range.end);
+
+  // The importer appends the Notes slot last, so its closing marker is the
+  // final human marker in the page. Anchor on that end and the local slot
+  // heading that precedes it: a copied marker example inside the notes or a
+  // legacy producer marker pair (e.g. inside a fenced example) is not a local
+  // slot and must not widen the preserved range.
   const end = page.lastIndexOf(OKF_HUMAN_END_MARKER);
-  if (start === -1 || end < start) {
+  if (end === -1) {
     return null;
   }
-  return page.slice(start, end + OKF_HUMAN_END_MARKER.length);
+  const headingPattern = /(?:^|\r?\n)## Notes[\t ]*(?:\r?\n|$)/gu;
+  let slotStart = -1;
+  let match: RegExpExecArray | null;
+  while ((match = headingPattern.exec(page))) {
+    if (match.index >= end) {
+      break;
+    }
+    const candidate = page.indexOf(OKF_HUMAN_START_MARKER, match.index + match[0].length);
+    if (candidate === -1 || candidate >= end || inCode(candidate)) {
+      continue;
+    }
+    slotStart = candidate;
+  }
+  if (slotStart === -1) {
+    return null;
+  }
+  return page.slice(slotStart, end + OKF_HUMAN_END_MARKER.length);
 }
 
 function preserveOkfHumanNotes(rendered: string, existing: string): string {
@@ -317,9 +346,11 @@ async function writeOkfConceptPage(params: {
 }): Promise<{ changed: boolean; created: boolean }> {
   const vault = await fsRoot(params.vaultRoot);
   const pageStat = await readWikiPageStat(vault, params.pagePath);
-  const existing = pageStat ? await vault.readText(params.pagePath).catch(() => "") : "";
+  const existing = pageStat ? await readExistingWikiPageUtf8(vault, params.pagePath, () => "") : "";
   // Re-import regenerates concept pages; keep any human Notes block so
-  // re-imports cannot silently erase handwritten notes.
+  // re-imports cannot silently erase handwritten notes. Reading the existing
+  // page must propagate persistent errors so a transient read failure cannot
+  // replace the page with an empty Notes scaffold.
   const nextRendered = existing ? preserveOkfHumanNotes(params.content, existing) : params.content;
   if (
     existing === nextRendered ||
