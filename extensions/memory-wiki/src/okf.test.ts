@@ -617,7 +617,7 @@ Producer note.
     const bundlePath = path.join(rootDir, "literal-marker-okf");
     await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
     const conceptPath = path.join(bundlePath, "tables", "customers.md");
-    const writeConcept = (version: string) =>
+    const writeVersionedConcept = (version: string) =>
       fs.writeFile(
         conceptPath,
         `---
@@ -635,7 +635,7 @@ Version ${version}
 `,
         "utf8",
       );
-    await writeConcept("1");
+    await writeVersionedConcept("1");
     const { config } = await createVault({
       rootDir: path.join(rootDir, "vault"),
     });
@@ -656,7 +656,7 @@ Version ${version}
       "utf8",
     );
 
-    await writeConcept("2");
+    await writeVersionedConcept("2");
     await importMemoryWikiOkfBundle({
       config,
       bundlePath,
