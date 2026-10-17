@@ -15,7 +15,6 @@ import { forEachMarkdownCodeRange } from "./markdown-links.js";
 import {
   createWikiPageFilename,
   parseWikiMarkdown,
-  preserveHumanNotesBlock,
   renderWikiMarkdown,
   slugifyWikiSegment,
   WIKI_RELATED_END_MARKER,
@@ -284,6 +283,33 @@ function normalizeOkfRenderedPageForComparison(content: string): string {
   return `---\n${frontmatterBody}---\n${withoutRelated.slice(frontmatterMatch[0].length)}`.trimEnd();
 }
 
+// Producer Markdown is inserted directly before the local Notes slot, so the
+// human-marker search must be scoped to the slot appended at the end of the
+// page. Producer bodies may legitimately contain literal marker examples inside
+// fences, and legacy pages produced before the slot existed have no markers at
+// all; both must leave the rendered page untouched.
+function extractOkfHumanNotesBlock(page: string): string | null {
+  const start = page.lastIndexOf(OKF_HUMAN_START_MARKER);
+  const end = page.lastIndexOf(OKF_HUMAN_END_MARKER);
+  if (start === -1 || end < start) {
+    return null;
+  }
+  return page.slice(start, end + OKF_HUMAN_END_MARKER.length);
+}
+
+function preserveOkfHumanNotes(rendered: string, existing: string): string {
+  const humanBlock = extractOkfHumanNotesBlock(existing);
+  if (!humanBlock) {
+    return rendered;
+  }
+  const start = rendered.lastIndexOf(OKF_HUMAN_START_MARKER);
+  const end = rendered.lastIndexOf(OKF_HUMAN_END_MARKER);
+  if (start === -1 || end < start) {
+    return rendered;
+  }
+  return rendered.slice(0, start) + humanBlock + rendered.slice(end + OKF_HUMAN_END_MARKER.length);
+}
+
 async function writeOkfConceptPage(params: {
   vaultRoot: string;
   pagePath: string;
@@ -292,11 +318,9 @@ async function writeOkfConceptPage(params: {
   const vault = await fsRoot(params.vaultRoot);
   const pageStat = await readWikiPageStat(vault, params.pagePath);
   const existing = pageStat ? await vault.readText(params.pagePath).catch(() => "") : "";
-  // Re-import regenerates concept pages; keep any human Notes block (same rule
-  // as source-page sync so re-imports cannot silently erase handwritten notes).
-  const nextRendered = existing
-    ? preserveHumanNotesBlock(params.content, existing)
-    : params.content;
+  // Re-import regenerates concept pages; keep any human Notes block so
+  // re-imports cannot silently erase handwritten notes.
+  const nextRendered = existing ? preserveOkfHumanNotes(params.content, existing) : params.content;
   if (
     existing === nextRendered ||
     normalizeOkfRenderedPageForComparison(existing) ===
