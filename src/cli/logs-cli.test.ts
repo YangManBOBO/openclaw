@@ -151,6 +151,7 @@ it("reports a byte-budget re-anchor without claiming rotation in JSON output", a
 it.each([
   { mode: "plain UTC", args: ["--utc", "--plain"], time: "2025-01-01T12:00:00.000Z" },
   { mode: "pretty local", args: [], time: "07:00:00-05:00" },
+  { mode: "pretty explicit local", args: ["--local-time"], time: "07:00:00-05:00" },
   { mode: "pretty UTC", args: ["--utc"], time: "12:00:00+00:00" },
 ])("renders $mode timestamps and preserves missing or malformed values", async ({ args, time }) => {
   await withEnvAsync({ TZ: "America/New_York" }, async () => {
@@ -183,6 +184,15 @@ it.each([
       ]);
     });
   });
+});
+
+it("rejects combining --local-time with --utc", async () => {
+  await expect(runLogsCli(["logs", "--local-time", "--utc"])).rejects.toThrow(
+    "Pass only one of --local-time or --utc.",
+  );
+  await expect(runLogsCli(["logs", "--utc", "--local-time"])).rejects.toThrow(
+    "Pass only one of --local-time or --utc.",
+  );
 });
 
 it("retains calendar log identity in text and JSON", async () => {

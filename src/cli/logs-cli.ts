@@ -414,7 +414,10 @@ export function registerLogsCli(program: Command) {
       jsonMode ? emitJsonLine({ type: "notice", message }) : errorLine(message);
     const pretty = !jsonMode && process.stdout.isTTY && !opts.plain;
     const rich = isRich() && opts.color !== false && !opts.plain;
-    const localTime = !opts.utc;
+    if (opts.localTime && opts.utc) {
+      throw new Error("Pass only one of --local-time or --utc.");
+    }
+    const localTime = opts.localTime === true || !opts.utc;
     const emitConnectionNotice = (message: string, style: (value: string) => string) =>
       jsonMode
         ? emitJsonLine({ type: "notice", message }, true)
