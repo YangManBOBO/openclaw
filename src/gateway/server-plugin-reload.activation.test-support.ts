@@ -100,20 +100,11 @@ export async function verifyPreparedSidecarRecovery(
     expect(
       manager.getRuntimeSnapshot({ channelId, inspectAccounts: false }).channels[channelId],
     ).toMatchObject({ running: true, connected: true, lifecycle: "ready" });
-    if (mode === "live") {
-      expect(result).toMatchObject({ cause: preparationError });
-    } else {
-      expect(result).toMatchObject({
-        cause: {
-          errors: [
-            preparationError,
-            expect.objectContaining({
-              message: "Plugin channel early-running could not start: default",
-            }),
-          ],
-        },
-      });
-    }
+    // For the aborted-predecessor case, a manual stop that timed out leaves the
+    // recovery marker, so rollback's preserveManualStop start is skipped/manual-stop
+    // and no channel-start error is aggregated; the rollback keeps the account
+    // running without starting a replacement.
+    expect(result).toMatchObject({ cause: preparationError });
   } finally {
     finishTask.resolve();
     vi.useRealTimers();
