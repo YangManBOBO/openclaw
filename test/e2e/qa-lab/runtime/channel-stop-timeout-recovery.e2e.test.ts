@@ -218,6 +218,9 @@ it(
       trace.push(`status after explicit start: ${JSON.stringify(account)}`);
       expect(recovered).toBe(true);
     } finally {
+      console.log(
+        `stop-timeout recovery trace (shipped Gateway):\n${trace.map((line) => `  ${line}`).join("\n")}`,
+      );
       if (started) {
         await disconnectGatewayClient(started.client).catch(() => undefined);
         await started.server
@@ -226,8 +229,5 @@ it(
       }
       temp.env.restore();
     }
-    console.log(
-      `stop-timeout recovery trace (shipped Gateway):\n${trace.map((line) => `  ${line}`).join("\n")}`,
-    );
   },
 );

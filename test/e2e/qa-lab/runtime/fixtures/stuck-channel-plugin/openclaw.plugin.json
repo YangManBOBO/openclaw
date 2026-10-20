@@ -1,5 +1,6 @@
 {
   "id": "stuck-channel",
+  "activation": { "onStartup": true },
   "name": "Stuck Channel",
   "description": "Synthetic channel whose first startAccount ignores abort (used to prove stop-timeout recovery through a shipped Gateway).",
   "channels": ["stuck-channel"],
@@ -7,27 +8,5 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {}
-  },
-  "channelConfigs": {
-    "stuck-channel": {
-      "schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": { "type": "boolean" },
-          "accounts": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "enabled": { "type": "boolean" }
-              }
-            }
-          },
-          "defaultAccount": { "type": "string" }
-        }
-      }
-    }
   }
 }

@@ -1,19 +1,20 @@
 let startCount = 0;
 
-export default {
+const plugin = {
   id: "stuck-channel",
   meta: {
     id: "stuck-channel",
     label: "Stuck Channel",
+    selectionLabel: "Stuck Channel",
+    docsPath: "/channels/stuck-channel",
     blurb: "Stop-timeout recovery proof channel.",
   },
   capabilities: { chatTypes: ["direct"] },
   config: {
     listAccountIds: () => ["default"],
-    defaultAccountId: () => "default",
-    resolveAccount: () => ({ accountId: "default", enabled: true, configured: true }),
-    isConfigured: () => true,
+    resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "default" }),
     isEnabled: () => true,
+    isConfigured: () => true,
   },
   gateway: {
     // First start ignores abort and never settles, so a manual stop times out at
@@ -35,5 +36,12 @@ export default {
       });
     },
     stopAccount: async () => {},
+  },
+};
+
+export default {
+  id: "stuck-channel",
+  register(api) {
+    api.registerChannel({ plugin });
   },
 };
