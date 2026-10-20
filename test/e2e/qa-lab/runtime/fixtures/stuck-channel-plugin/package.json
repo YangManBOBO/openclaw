@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/stuck-channel-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stop-timeout recovery proof channel fixture",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.mjs"],
+    "channel": {
+      "id": "stuck-channel",
+      "label": "Stuck Channel",
+      "blurb": "Stop-timeout recovery proof channel."
+    }
+  }
+}
