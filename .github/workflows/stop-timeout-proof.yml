@@ -1,0 +1,40 @@
+name: Stop-Timeout Shipped Gateway Proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [e2e/proof]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: "false"
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: restore
+          install-bun: "true"
+      - name: Run shipped Gateway stop-timeout proof
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/test-projects.mts test/e2e/qa-lab/runtime/channel-stop-timeout-recovery.e2e.test.ts --maxWorkers=1 2>&1 | tee stop-timeout-proof.log
+      - name: Upload proof log
+        if: always()
+        uses: actions/upload-artifact@5d3f46a8c5f1b0e2a8f8e4f3a4b3c2d1e0f9a8b7 # v4
+        with:
+          name: stop-timeout-proof-log
+          path: stop-timeout-proof.log
