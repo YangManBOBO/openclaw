@@ -454,6 +454,52 @@ describe("importMemoryWikiOkfBundle", () => {
     },
   );
 
+  it.each(["plain", "producer marker example", "human marker example"])(
+    "rejects a missing local closing marker without rewriting Notes (%s)",
+    async (example) => {
+      const { bundlePath, config, run } = await createImport("missing-end-okf");
+      const conceptPath = path.join(bundlePath, "tables", "customers.md");
+      const literal = [
+        "~~~markdown",
+        "## Notes",
+        "<!-- openclaw:human:start -->",
+        "Copied marker example.",
+        "<!-- openclaw:human:end -->",
+        "~~~",
+      ].join("\n");
+      const producer =
+        "Customer body." + (example === "producer marker example" ? "\n" + literal : "");
+      await writeConcept(conceptPath, "Customers", producer);
+      const first = await run();
+      const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+      const raw = await fs.readFile(pagePath, "utf8");
+      const endMarker = "<!-- openclaw:human:end -->";
+      const humanBlock = [
+        "<!-- openclaw:human:start -->",
+        "Keep this handwritten note — café 🦞.  ",
+        ...(example === "human marker example" ? [literal] : []),
+        "Handwritten text after the example.",
+        endMarker,
+      ].join("\r\n");
+      const intact = raw.replace("<!-- openclaw:human:start -->\n" + endMarker, humanBlock);
+      const end = intact.lastIndexOf(endMarker);
+      const damaged = intact.slice(0, end) + intact.slice(end + endMarker.length);
+      await fs.writeFile(pagePath, damaged);
+
+      await expect(run()).rejects.toThrow(/restore.*openclaw:human:end/i);
+      await expect(fs.readFile(pagePath)).resolves.toEqual(Buffer.from(damaged));
+      await writeConcept(conceptPath, "Customers", producer + "\nUpdated producer content.");
+      await expect(run()).rejects.toThrow(/restore.*openclaw:human:end/i);
+      await expect(fs.readFile(pagePath)).resolves.toEqual(Buffer.from(damaged));
+
+      await fs.writeFile(pagePath, intact);
+      await run();
+      const recovered = await fs.readFile(pagePath, "utf8");
+      expect(recovered).toContain(humanBlock);
+      expect(recovered).toContain("Updated producer content.");
+    },
+  );
+
   it("preserves ambiguous unfenced Notes copies until they are fenced", async () => {
     const { bundlePath, config, run } = await createImport("copied-notes-okf");
     const conceptPath = path.join(bundlePath, "tables", "customers.md");

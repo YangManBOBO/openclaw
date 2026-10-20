@@ -331,19 +331,20 @@ function extractOkfHumanNotesBlock(page: string): string | null {
   // legacy producer marker pair (e.g. inside a fenced example) is not a local
   // slot and must not widen the preserved range.
   const end = page.lastIndexOf(OKF_HUMAN_END_MARKER);
-  if (end === -1) {
-    return null;
-  }
   const headingPattern = /(?:^|\r?\n)## Notes[\t ]*(?:\r?\n|$)/gu;
   let slotStart = -1;
   let match: RegExpExecArray | null;
   while ((match = headingPattern.exec(page))) {
-    if (match.index >= end) {
-      break;
-    }
     const candidate = page.indexOf(OKF_HUMAN_START_MARKER, match.index + match[0].length);
-    if (candidate === -1 || candidate >= end || inCode(candidate)) {
+    if (candidate === -1 || inCode(candidate)) {
       continue;
+    }
+    // A local opening marker is not a legacy slot-free page, even if its end is missing
+    // or the only remaining closing marker belongs to a fenced example.
+    if (end < candidate || inCode(end)) {
+      throw new Error(
+        `OKF human Notes are missing a closing marker outside code fences; restore ${OKF_HUMAN_END_MARKER} outside code fences before re-importing this concept; existing Notes were not changed.`,
+      );
     }
     if (slotStart !== -1 && slotStart !== candidate) {
       throw new Error(
@@ -353,6 +354,9 @@ function extractOkfHumanNotesBlock(page: string): string | null {
     slotStart = candidate;
   }
   if (slotStart === -1) {
+    if (end === -1) {
+      return null;
+    }
     // A legacy local slot can be inside an unclosed producer fence. Its trailing markers
     // are ambiguous, not evidence that the page has no human edits to preserve.
     const trailing = page.slice(end + OKF_HUMAN_END_MARKER.length).replace(/\r\n/g, "\n");
