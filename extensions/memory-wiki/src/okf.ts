@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -152,7 +153,15 @@ async function readOkfTextFile(params: {
   relativePath: string;
   warnings: ImportMemoryWikiOkfWarning[];
 }): Promise<string | null> {
-  return await params.bundleRoot.readText(params.relativePath).catch((err: unknown) => {
+  try {
+    const bytes = await params.bundleRoot.readBytes(params.relativePath);
+    if (!isUtf8(bytes)) {
+      throw new Error(
+        "OKF document must be valid UTF-8. Convert the source to UTF-8 and retry the import.",
+      );
+    }
+    return bytes.toString("utf8");
+  } catch (err) {
     params.warnings.push({
       code: "unreadable-entry",
       path: params.relativePath,
@@ -164,7 +173,7 @@ async function readOkfTextFile(params: {
             : "Unable to read OKF concept.",
     });
     return null;
-  });
+  }
 }
 
 function splitMarkdownLinkDestination(target: string): {
@@ -287,6 +296,24 @@ function normalizeOkfRenderedPageForComparison(content: string): string {
   return `---\n${frontmatterBody}---\n${withoutRelated.slice(frontmatterMatch[0].length)}`.trimEnd();
 }
 
+function renderOkfBodyWithHumanNotes(producerBody: string): string {
+  const body = producerBody.trimEnd();
+  const notes = `## Notes\n${OKF_HUMAN_START_MARKER}\n${OKF_HUMAN_END_MARKER}\n`;
+  const rendered = body + "\n\n" + notes;
+  const notesOffset = body.length + 2;
+  let closingFence = "";
+  // Unclosed producer fences are valid Markdown, but must not swallow the local editing area.
+  forEachMarkdownCodeRange(rendered, (start, end) => {
+    if (start <= notesOffset && notesOffset < end) {
+      closingFence = /^ {0,3}(`{3,}|~{3,})/u.exec(rendered.slice(start))?.[1] ?? "";
+      if (!closingFence) {
+        throw new Error("Close the producer Markdown fence before importing this OKF concept.");
+      }
+    }
+  });
+  return closingFence ? body + "\n" + closingFence + "\n\n" + notes : rendered;
+}
+
 // Producer Markdown is inserted directly before the local Notes slot, so the
 // human-marker search must be scoped to the slot appended at the end of the
 // page. Producer bodies may legitimately contain literal marker examples inside
@@ -318,9 +345,22 @@ function extractOkfHumanNotesBlock(page: string): string | null {
     if (candidate === -1 || candidate >= end || inCode(candidate)) {
       continue;
     }
+    if (slotStart !== -1 && slotStart !== candidate) {
+      throw new Error(
+        "Ambiguous OKF Notes: put copied Notes sections in code fences before re-importing; existing Notes were not changed.",
+      );
+    }
     slotStart = candidate;
   }
   if (slotStart === -1) {
+    // A legacy local slot can be inside an unclosed producer fence. Its trailing markers
+    // are ambiguous, not evidence that the page has no human edits to preserve.
+    const trailing = page.slice(end + OKF_HUMAN_END_MARKER.length).replace(/\r\n/g, "\n");
+    if (!trailing.replace(OKF_RELATED_SECTION_PATTERN, "").trim()) {
+      throw new Error(
+        "Close the producer Markdown fence before re-importing this OKF concept; existing Notes were not changed.",
+      );
+    }
     return null;
   }
   return page.slice(slotStart, end + OKF_HUMAN_END_MARKER.length);
@@ -424,8 +464,11 @@ export async function importMemoryWikiOkfBundle(params: {
 
   for (const relativePath of markdownFiles) {
     if (relativePath === "index.md") {
-      rootIndexContent =
-        (await readOkfTextFile({ bundleRoot, relativePath, warnings })) ?? undefined;
+      const content = await readOkfTextFile({ bundleRoot, relativePath, warnings });
+      if (content === null) {
+        throw new Error(`Cannot read OKF bundle index.md: ${warnings.at(-1)?.message}`);
+      }
+      rootIndexContent = content;
     }
     if (OKF_RESERVED_FILENAMES.has(path.posix.basename(relativePath))) {
       continue;
@@ -532,7 +575,7 @@ export async function importMemoryWikiOkfBundle(params: {
       pagePath: concept.pagePath,
       content: renderWikiMarkdown({
         frontmatter,
-        body: `${rewritten.body.trimEnd()}\n\n## Notes\n${OKF_HUMAN_START_MARKER}\n${OKF_HUMAN_END_MARKER}\n`,
+        body: renderOkfBodyWithHumanNotes(rewritten.body),
       }),
     });
     if (!writeResult.created && writeResult.changed) {

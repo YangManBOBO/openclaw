@@ -358,320 +358,248 @@ describe("importMemoryWikiOkfBundle", () => {
     });
   });
 
-  it("preserves human notes on OKF concept pages across re-import", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-notes-");
-    const bundlePath = path.join(rootDir, "notes-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
-
-Customer body.
-`,
-      "utf8",
-    );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    const raw = await fs.readFile(pageAbsolutePath, "utf8");
-    const withNotes = raw.includes("<!-- openclaw:human:start -->")
-      ? raw.replace(
+  it.each([false, true])(
+    "preserves exact human Notes across unchanged and changed OKF bundles (unterminated producer fence: %s)",
+    async (unterminated) => {
+      const { bundlePath, config, run } = await createImport("notes-okf");
+      const conceptPath = path.join(bundlePath, "tables", "customers.md");
+      const producerBody = (version: number) =>
+        [
+          "Customer body version " + version,
+          "",
+          "## Notes",
+          "Producer-owned notes.",
+          "",
+          "~~~markdown",
+          "## Notes",
           "<!-- openclaw:human:start -->",
-          "<!-- openclaw:human:start -->\nHANDWRITTEN NOTE MUST SURVIVE",
-        )
-      : `${raw.trimEnd()}\n\n## Notes\n<!-- openclaw:human:start -->\nHANDWRITTEN NOTE MUST SURVIVE\n<!-- openclaw:human:end -->\n`;
-    await fs.writeFile(pageAbsolutePath, withNotes, "utf8");
-
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
-
-    await expect(fs.readFile(pageAbsolutePath, "utf8")).resolves.toContain(
-      "HANDWRITTEN NOTE MUST SURVIVE",
-    );
-  });
-
-  it("upgrades a pre-Notes OKF concept page to the Notes format on re-import", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-upgrade-");
-    const bundlePath = path.join(rootDir, "upgrade-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
-
-Customer body.
-`,
-      "utf8",
-    );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    // Simulate a page persisted before the Notes slot existed: same importer
-    // frontmatter and body, no "## Notes" heading and no human markers.
-    const oldFormat = (await fs.readFile(pageAbsolutePath, "utf8")).replace(
-      "\n## Notes\n<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->\n",
-      "\n",
-    );
-    expect(oldFormat).not.toContain("openclaw:human");
-    await fs.writeFile(pageAbsolutePath, `${oldFormat}\n`, "utf8");
-
-    // Re-import must load the existing data and migrate it to the Notes format.
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
-    const migrated = await fs.readFile(pageAbsolutePath, "utf8");
-    expect(migrated).toContain("Customer body.");
-    expect(migrated).toContain("## Notes\n<!-- openclaw:human:start -->");
-    expect(parseWikiMarkdown(migrated).frontmatter.pageType).toBe("concept");
-  });
-
-  it("re-imports legacy OKF pages that carry an unmarked producer Notes section", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-legacy-notes-");
-    const bundlePath = path.join(rootDir, "legacy-notes-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
-
-Customer body.
-`,
-      "utf8",
-    );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    // Simulate a page produced by the previous importer: a plain producer
-    // "## Notes" section with no human markers.
-    await fs.writeFile(
-      pageAbsolutePath,
-      `---
-pageType: concept
-title: Customers
----
-
-Customer body.
-
-## Notes
-Producer note.
-`,
-      "utf8",
-    );
-
-    // Re-import must not treat the unmarked producer section as malformed human Notes.
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
-    await expect(fs.readFile(pageAbsolutePath, "utf8")).resolves.toContain(
-      "<!-- openclaw:human:start -->",
-    );
-  });
-
-  it("preserves only the local Notes slot when the producer body contains literal human markers", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-literal-marker-");
-    const bundlePath = path.join(rootDir, "literal-marker-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    const conceptPath = path.join(bundlePath, "tables", "customers.md");
-    const writeVersionedConcept = (version: string) =>
-      fs.writeFile(
-        conceptPath,
-        `---
-type: BigQuery Table
-title: Customers
----
-
-# Schema
-
-\`\`\`markdown
-<!-- openclaw:human:start -->
-\`\`\`
-
-Version ${version}
-`,
+          "Producer marker example " + version,
+          "<!-- openclaw:human:end -->",
+          "~~~",
+        ].join("\n") +
+        (unterminated ? "\n" + String.fromCharCode(96).repeat(3) + "sql\nSELECT 1" : "");
+      await writeConcept(conceptPath, "Customers", producerBody(1));
+      const first = await run();
+      const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+      const raw = await fs.readFile(pagePath, "utf8");
+      const emptyBlock = "<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->";
+      const humanBlock = [
+        "<!-- openclaw:human:start -->",
+        "Handwritten note before the pasted example.  ",
+        "",
+        "  Preserve indentation, café and 🦞.",
+        "~~~markdown",
+        "## Notes",
+        "<!-- openclaw:human:start -->",
+        "Copied marker example.",
+        "<!-- openclaw:human:end -->",
+        "~~~",
+        "Handwritten note after the pasted example.  ",
+        "<!-- openclaw:human:end -->",
+      ].join("\r\n");
+      // Pre-fix pages have no local slot; append the same human edit for base-red proof.
+      const slot = raw.lastIndexOf(emptyBlock);
+      await fs.writeFile(
+        pagePath,
+        slot < 0
+          ? raw + "\n## Notes\n" + humanBlock + "\n"
+          : raw.slice(0, slot) + humanBlock + raw.slice(slot + emptyBlock.length),
         "utf8",
       );
-    await writeVersionedConcept("1");
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    const raw = await fs.readFile(pageAbsolutePath, "utf8");
-    await fs.writeFile(
-      pageAbsolutePath,
-      raw.replace(
-        "## Notes\n<!-- openclaw:human:start -->",
-        "## Notes\n<!-- openclaw:human:start -->\nHANDWRITTEN NOTE MUST SURVIVE",
-      ),
-      "utf8",
-    );
 
-    await writeVersionedConcept("2");
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
+      await run(Date.UTC(2026, 5, 12, 11));
+      await expect(fs.readFile(pagePath, "utf8")).resolves.toContain(humanBlock);
 
-    const refreshed = await fs.readFile(pageAbsolutePath, "utf8");
-    expect(refreshed).toContain("HANDWRITTEN NOTE MUST SURVIVE");
-    expect(refreshed).toContain("Version 2");
-    expect(refreshed).not.toContain("Version 1");
-  });
+      await writeConcept(conceptPath, "Customers", producerBody(2));
+      const changed = await run(Date.UTC(2026, 5, 12, 12));
+      expect(changed.pagePaths).toEqual(first.pagePaths);
+      const refreshed = await fs.readFile(pagePath, "utf8");
+      expect(refreshed).toContain(humanBlock);
+      expect(refreshed).toContain(producerBody(2));
+      expect(refreshed).not.toContain("Customer body version 1");
+      expect(refreshed).not.toContain("Producer marker example 1");
+    },
+  );
 
-  it("preserves the complete outer Notes block when notes contain a copied marker example", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-copied-marker-");
-    const bundlePath = path.join(rootDir, "copied-marker-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
+  it.each(["\n", "\r\n"])(
+    "does not rewrite existing human Notes swallowed by an unterminated producer fence (%j)",
+    async (lineEnding) => {
+      const { bundlePath, config, run } = await createImport("ambiguous-notes-okf");
+      const conceptPath = path.join(bundlePath, "tables", "customers.md");
+      await writeConcept(conceptPath, "Customers", "~~~sql\nSELECT 1");
+      const first = await run();
+      const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+      const { frontmatter } = parseWikiMarkdown(await fs.readFile(pagePath, "utf8"));
+      const existing = renderWikiMarkdown({
+        frontmatter,
+        body: [
+          "~~~sql",
+          "SELECT 1",
+          "",
+          "## Notes",
+          "<!-- openclaw:human:start -->",
+          "Human note must survive.",
+          "<!-- openclaw:human:end -->",
+          "",
+          "## Related",
+          "<!-- openclaw:wiki:related:start -->",
+          "- No related pages yet.",
+          "<!-- openclaw:wiki:related:end -->",
+        ].join(lineEnding),
+      });
+      await fs.writeFile(pagePath, existing, "utf8");
 
-Customer body.
-`,
-      "utf8",
-    );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    const raw = await fs.readFile(pageAbsolutePath, "utf8");
-    const withCopiedExample = raw.replace(
+      await expect(run()).rejects.toThrow(/close.*producer.*fence/i);
+      await expect(fs.readFile(pagePath, "utf8")).resolves.toBe(existing);
+    },
+  );
+
+  it("preserves ambiguous unfenced Notes copies until they are fenced", async () => {
+    const { bundlePath, config, run } = await createImport("copied-notes-okf");
+    const conceptPath = path.join(bundlePath, "tables", "customers.md");
+    await writeConcept(conceptPath, "Customers", "Original producer content.");
+    const first = await run();
+    const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+    const raw = await fs.readFile(pagePath, "utf8");
+    const copied = [
+      "## Notes",
+      "<!-- openclaw:human:start -->",
+      "Copied note.",
+      "<!-- openclaw:human:end -->",
+    ].join("\n");
+    const humanBlock = [
+      "<!-- openclaw:human:start -->",
+      "Handwritten note before the copy.",
+      copied,
+      "Handwritten note after the copy.",
+      "<!-- openclaw:human:end -->",
+    ].join("\n");
+    const withNotes = raw.replace(
       "<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->",
-      [
-        "<!-- openclaw:human:start -->",
-        "Handwritten note before the pasted example.",
-        "Example:",
-        "```markdown",
-        "<!-- openclaw:human:start -->",
-        "<!-- openclaw:human:end -->",
-        "```",
-        "Handwritten note after the pasted example.",
-        "<!-- openclaw:human:end -->",
-      ].join("\n"),
+      humanBlock,
     );
-    await fs.writeFile(pageAbsolutePath, withCopiedExample, "utf8");
+    await fs.writeFile(pagePath, withNotes, "utf8");
 
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
+    await expect(run()).rejects.toThrow("copied Notes sections");
+    await expect(fs.readFile(pagePath, "utf8")).resolves.toBe(withNotes);
+    await writeConcept(conceptPath, "Customers", "Updated producer content.");
+    await expect(run()).rejects.toThrow("copied Notes sections");
+    await expect(fs.readFile(pagePath, "utf8")).resolves.toBe(withNotes);
 
-    const refreshed = await fs.readFile(pageAbsolutePath, "utf8");
-    expect(refreshed).toContain("Handwritten note before the pasted example.");
-    expect(refreshed).toContain("Handwritten note after the pasted example.");
-    expect(refreshed).toContain("<!-- openclaw:human:start -->");
+    const fencedBlock = humanBlock.replace(copied, "~~~markdown\n" + copied + "\n~~~");
+    await fs.writeFile(pagePath, withNotes.replace(humanBlock, fencedBlock), "utf8");
+    await run();
+    const refreshed = await fs.readFile(pagePath, "utf8");
+    expect(refreshed).toContain(fencedBlock);
+    expect(refreshed).toContain("Updated producer content.");
   });
 
-  it("does not promote a legacy fenced producer marker example into the Notes slot", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-legacy-fenced-");
-    const bundlePath = path.join(rootDir, "legacy-fenced-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
-    await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
+  it.each([
+    ["without Notes", "Customer body."],
+    ["with unmarked producer Notes", "Customer body.\n\n## Notes\nProducer-owned note."],
+    [
+      "with a fenced producer marker example",
+      [
+        "Customer body.",
+        "~~~markdown",
+        "## Notes",
+        "<!-- openclaw:human:start -->",
+        "Producer-owned marker example.",
+        "<!-- openclaw:human:end -->",
+        "~~~",
+      ].join("\n"),
+    ],
+  ])(
+    "upgrades legacy OKF pages %s without promoting producer content into human Notes",
+    async (_label, body) => {
+      const { bundlePath, config, run } = await createImport("legacy-okf");
+      const conceptPath = path.join(bundlePath, "tables", "customers.md");
+      await writeConcept(conceptPath, "Customers", body);
+      const first = await run();
+      const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+      const { frontmatter } = parseWikiMarkdown(await fs.readFile(pagePath, "utf8"));
+      // This is the previous importer's persisted format: producer body, no local slot.
+      await fs.writeFile(pagePath, renderWikiMarkdown({ frontmatter, body }), "utf8");
 
-Customer body.
-`,
-      "utf8",
-    );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
+      const emptyNotes = "## Notes\n<!-- openclaw:human:start -->\n<!-- openclaw:human:end -->";
+      await run(Date.UTC(2026, 5, 12, 11));
+      const migrated = await fs.readFile(pagePath, "utf8");
+      expect(migrated).toContain(body);
+      expect(migrated).toContain(emptyNotes);
+      expect(parseWikiMarkdown(migrated).frontmatter.pageType).toBe("concept");
+
+      const updatedBody = body + "\nUpdated producer content.";
+      await writeConcept(conceptPath, "Customers", updatedBody);
+      await run(Date.UTC(2026, 5, 12, 12));
+      const refreshed = await fs.readFile(pagePath, "utf8");
+      expect(refreshed).toContain(updatedBody);
+      expect(refreshed).toContain(emptyNotes);
+    },
+  );
+
+  it("preserves imported concepts when malformed UTF-8 is mixed with valid input", async () => {
+    const { bundlePath, config, run } = await createImport("encoding-okf");
+    const conceptPath = path.join(bundlePath, "tables", "customers.md");
+    await writeConcept(conceptPath, "Customers", "Original body.\n");
+    await writeConcept(path.join(bundlePath, "valid.md"), "Valid", "Café 😀 literal \uFFFD\n");
+    const first = await run();
+    const conceptPage = first.pagePaths.find((pagePath) => pagePath.includes("customers"));
+    if (!conceptPage) {
+      throw new Error("Expected the customers concept to be imported.");
+    }
+    const pagePath = path.join(config.vault.path, conceptPage);
+    const original = await fs.readFile(pagePath);
+    const malformed = Buffer.concat([
+      Buffer.from("---\ntype: Concept\ntitle: Customers\n---\nBroken "),
+      Buffer.from([0xc3, 0x28]),
+    ]);
+    await fs.writeFile(conceptPath, malformed);
+
+    const result = await run();
+
+    expect(result).toMatchObject({
+      importedCount: 1,
+      updatedCount: 0,
+      removedCount: 0,
+      skippedCount: 1,
     });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    const pagePath = getOnlyPagePath(first.pagePaths);
-    const pageAbsolutePath = path.join(config.vault.path, pagePath);
-    // Simulate a page written by the previous importer whose producer body
-    // contains a fenced marker example but no local Notes slot.
-    await fs.writeFile(
-      pageAbsolutePath,
-      `---
-pageType: concept
-title: Customers
----
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "unreadable-entry",
+        path: "tables/customers.md",
+        message: expect.stringContaining("UTF-8"),
+      }),
+    ]);
+    await expect(fs.readFile(pagePath)).resolves.toEqual(original);
+    await expect(fs.readFile(conceptPath)).resolves.toEqual(malformed);
+    const validPage = path.join(config.vault.path, getOnlyPagePath(result.pagePaths));
+    await expect(fs.readFile(validPage, "utf8")).resolves.toContain("Café 😀 literal \uFFFD");
+  });
 
-Customer body.
+  it("rejects an unreadable root index without changing existing concept identities", async () => {
+    const { bundlePath, config, run } = await createImport("invalid-index-okf");
+    const indexPath = path.join(bundlePath, "index.md");
+    const index = "---\nid: stable\n---\nBundle description.\n";
+    await fs.writeFile(indexPath, index);
+    const conceptPath = path.join(bundlePath, "tables", "customers.md");
+    await writeConcept(conceptPath, "Customers", "Original body.\n");
+    const first = await run();
+    const pagesBefore = await fs.readdir(path.join(config.vault.path, "concepts"));
+    const pagePath = path.join(config.vault.path, getOnlyPagePath(first.pagePaths));
+    const original = await fs.readFile(pagePath);
+    await fs.writeFile(indexPath, Buffer.concat([Buffer.from(index), Buffer.from([0xff])]));
+    await writeConcept(conceptPath, "Customers", "Updated body.\n");
 
-\`\`\`markdown
-## Notes
-<!-- openclaw:human:start -->
-stale producer example
-<!-- openclaw:human:end -->
-\`\`\`
-`,
-      "utf8",
+    await expect(run()).rejects.toThrow(/index\.md.*UTF-8/);
+    await expect(fs.readFile(pagePath)).resolves.toEqual(original);
+    await expect(fs.readdir(path.join(config.vault.path, "concepts"))).resolves.toEqual(
+      pagesBefore,
     );
 
-    await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-    });
-
-    const refreshed = await fs.readFile(pageAbsolutePath, "utf8");
-    // The local slot must start empty: the fenced producer example is not
-    // treated as human Notes.
-    const notesSlot = refreshed.match(
-      /## Notes\s*<!-- openclaw:human:start -->\s*<!-- openclaw:human:end -->/u,
-    );
-    expect(notesSlot).not.toBeNull();
-    expect(refreshed).not.toContain("stale producer example");
+    await fs.writeFile(indexPath, index);
+    const recovered = await run();
+    expect(recovered).toMatchObject({ importedCount: 1, updatedCount: 1, warnings: [] });
+    expect(recovered.pagePaths).toEqual(first.pagePaths);
+    await expect(fs.readFile(pagePath, "utf8")).resolves.toContain("Updated body.");
   });
 });

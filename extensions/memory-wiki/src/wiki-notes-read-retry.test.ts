@@ -533,7 +533,11 @@ Customer body.
     });
     expect(first.pagePaths).toHaveLength(1);
     const pagePath = expectDefined(first.pagePaths[0], "imported OKF concept page");
-    const before = await fs.readFile(path.join(config.vault.path, pagePath), "utf8");
+    const before = (await fs.readFile(path.join(config.vault.path, pagePath), "utf8")).replace(
+      "<!-- openclaw:human:start -->",
+      "<!-- openclaw:human:start -->\nHandwritten note must survive the read failure.",
+    );
+    await fs.writeFile(path.join(config.vault.path, pagePath), before, "utf8");
 
     securityRuntimeMock.failReadTextAlwaysFor = pagePath;
 
