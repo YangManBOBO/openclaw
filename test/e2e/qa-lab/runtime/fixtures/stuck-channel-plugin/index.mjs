@@ -1,4 +1,8 @@
 let startCount = 0;
+let releaseFirstStart = () => {};
+const firstStartHeld = new Promise((resolve) => {
+  releaseFirstStart = resolve;
+});
 
 const plugin = {
   id: "stuck-channel",
@@ -17,16 +21,18 @@ const plugin = {
     isConfigured: () => true,
   },
   gateway: {
-    // First start ignores abort and never settles, so a manual stop times out at
-    // 5000ms while the task slot stays occupied. A later explicit start reclaims
-    // the slot and starts this callback again; the second instance responds to
-    // abort so the Gateway can shut down cleanly at the end of the proof.
+    // First start ignores abort and never settles on its own, so a manual stop
+    // times out at 5000ms while the task slot stays occupied. The recovery
+    // explicit start reclaims the slot and invokes this callback again; that
+    // second invocation releases the first so the Gateway can shut down
+    // cleanly at the end of the proof.
     startAccount: async ({ abortSignal }) => {
       startCount += 1;
       if (startCount === 1) {
-        await new Promise(() => {});
+        await firstStartHeld;
         return;
       }
+      releaseFirstStart();
       await new Promise((resolve) => {
         if (abortSignal.aborted) {
           resolve();
