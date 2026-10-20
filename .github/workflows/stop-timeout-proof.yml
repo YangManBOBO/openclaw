@@ -34,7 +34,7 @@ jobs:
           node scripts/test-projects.mts test/e2e/qa-lab/runtime/channel-stop-timeout-recovery.e2e.test.ts --maxWorkers=1 2>&1 | tee stop-timeout-proof.log
       - name: Upload proof log
         if: always()
-        uses: actions/upload-artifact@5d3f46a8c5f1b0e2a8f8e4f3a4b3c2d1e0f9a8b7 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stop-timeout-proof-log
           path: stop-timeout-proof.log
