@@ -81,6 +81,29 @@ describe("backup outcome ownership", () => {
     expect(runtime.error).not.toHaveBeenCalled();
   });
 
+  it("rejects non-decimal --bytes forms instead of coercing them", async () => {
+    const runtime = createTestRuntime();
+    for (const bytes of ["0x10", "1e3", "0b101", "0o17", "0.5", "12abc", ""]) {
+      await expect(
+        backupRecordCommand(runtime, { status: "ok", target: "hex", bytes, json: true }),
+      ).rejects.toThrow("--bytes must be a nonnegative integer.");
+    }
+    expect(await readBackupRuns(process.env)).toEqual([]);
+    expect(runtime.error).not.toHaveBeenCalled();
+  });
+
+  it("accepts decimal integer --bytes values", async () => {
+    await fixture();
+    const runtime = createTestRuntime();
+    await backupRecordCommand(runtime, {
+      status: "ok",
+      target: "decimal",
+      bytes: "42",
+      json: true,
+    });
+    expect(await readBackupRuns(process.env)).toMatchObject([{ target: "decimal", bytes: 42 }]);
+  });
+
   it.each([false, true])(
     "routes to the live writer, publishes its next read, and never replays a lost reply (%s)",
     async (loseReply) => {
