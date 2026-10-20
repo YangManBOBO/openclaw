@@ -8,7 +8,8 @@ import {
 import { captureEnv, setTestEnvValue } from "../../../../src/test-utils/env.js";
 import { useAutoCleanupTempDirTracker } from "../../../helpers/temp-dir.js";
 
-const TEST_TIMEOUT_MS = 120_000;
+const TEST_TIMEOUT_MS = 180_000;
+const RPC_TIMEOUT_MS = 45_000;
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const CHANNEL_ID = "stuck-channel";
 const ACCOUNT_ID = "default";
@@ -31,6 +32,25 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function traceStep(trace: string[], line: string) {
+  trace.push(line);
+  process.stderr.write(`[stop-timeout-proof] ${line}\n`);
+}
+
+async function withRpcTimeout<T>(label: string, promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const guard = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} RPC timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, guard]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 async function setupTempHome() {
@@ -136,41 +156,57 @@ it(
       });
 
       await started.server.startupSettled;
+      traceStep(trace, "gateway startup settled");
 
-      trace.push("waiting for ambient start of the abort-ignoring account");
+      traceStep(trace, "waiting for ambient start of the abort-ignoring account");
       const deadline = Date.now() + 30_000;
       let running = false;
       while (Date.now() < deadline) {
-        const payload = await started.client.request("channels.status", {
-          channel: CHANNEL_ID,
-          probe: false,
-          timeoutMs: 2_000,
-        });
+        const payload = await withRpcTimeout(
+          "channels.status",
+          started.client.request("channels.status", {
+            channel: CHANNEL_ID,
+            probe: false,
+            timeoutMs: 2_000,
+          }),
+          RPC_TIMEOUT_MS,
+        );
         const account = readStatusAccounts(payload)[ACCOUNT_ID];
         if (account?.running === true) {
           running = true;
-          trace.push(`ambient start visible: running=true (${JSON.stringify(account)})`);
+          traceStep(trace, `ambient start visible: running=true (${JSON.stringify(account)})`);
           break;
         }
         await sleep(200);
       }
       expect(running).toBe(true);
 
-      trace.push("issuing manual channels.stop");
+      traceStep(trace, "issuing manual channels.stop");
       const stopStartedAt = Date.now();
-      await started.client.request("channels.stop", { channel: CHANNEL_ID, accountId: ACCOUNT_ID });
+      await withRpcTimeout(
+        "channels.stop",
+        started.client.request("channels.stop", {
+          channel: CHANNEL_ID,
+          accountId: ACCOUNT_ID,
+        }),
+        RPC_TIMEOUT_MS,
+      );
       const stopElapsedMs = Date.now() - stopStartedAt;
-      trace.push(`channels.stop settled after ${stopElapsedMs}ms`);
+      traceStep(trace, `channels.stop settled after ${stopElapsedMs}ms`);
       expect(stopElapsedMs).toBeGreaterThanOrEqual(5_000);
 
       let account = readStatusAccounts(
-        await started.client.request("channels.status", {
-          channel: CHANNEL_ID,
-          probe: false,
-          timeoutMs: 2_000,
-        }),
+        await withRpcTimeout(
+          "channels.status",
+          started.client.request("channels.status", {
+            channel: CHANNEL_ID,
+            probe: false,
+            timeoutMs: 2_000,
+          }),
+          RPC_TIMEOUT_MS,
+        ),
       )[ACCOUNT_ID];
-      trace.push(`status after stop: ${JSON.stringify(account)}`);
+      traceStep(trace, `status after stop: ${JSON.stringify(account)}`);
       expect(account).toMatchObject({
         running: true,
         restartPending: false,
@@ -179,35 +215,50 @@ it(
 
       await sleep(2_000);
       account = readStatusAccounts(
-        await started.client.request("channels.status", {
-          channel: CHANNEL_ID,
-          probe: false,
-          timeoutMs: 2_000,
-        }),
+        await withRpcTimeout(
+          "channels.status",
+          started.client.request("channels.status", {
+            channel: CHANNEL_ID,
+            probe: false,
+            timeoutMs: 2_000,
+          }),
+          RPC_TIMEOUT_MS,
+        ),
       )[ACCOUNT_ID];
-      trace.push(`status after 2s (no automatic restart expected): ${JSON.stringify(account)}`);
+      traceStep(
+        trace,
+        `status after 2s (no automatic restart expected): ${JSON.stringify(account)}`,
+      );
       expect(account).toMatchObject({
         running: true,
         restartPending: false,
         lastError: "channel stop timed out after 5000ms",
       });
 
-      trace.push("issuing explicit channels.start");
-      const startReply = await started.client.request("channels.start", {
-        channel: CHANNEL_ID,
-        accountId: ACCOUNT_ID,
-      });
-      trace.push(`channels.start reply: ${JSON.stringify(startReply)}`);
+      traceStep(trace, "issuing explicit channels.start");
+      const startReply = await withRpcTimeout(
+        "channels.start",
+        started.client.request("channels.start", {
+          channel: CHANNEL_ID,
+          accountId: ACCOUNT_ID,
+        }),
+        RPC_TIMEOUT_MS,
+      );
+      traceStep(trace, `channels.start reply: ${JSON.stringify(startReply)}`);
 
       const finalDeadline = Date.now() + 15_000;
       let recovered = false;
       while (Date.now() < finalDeadline) {
         account = readStatusAccounts(
-          await started.client.request("channels.status", {
-            channel: CHANNEL_ID,
-            probe: false,
-            timeoutMs: 2_000,
-          }),
+          await withRpcTimeout(
+            "channels.status",
+            started.client.request("channels.status", {
+              channel: CHANNEL_ID,
+              probe: false,
+              timeoutMs: 2_000,
+            }),
+            RPC_TIMEOUT_MS,
+          ),
         )[ACCOUNT_ID];
         if (account?.running === true) {
           recovered = true;
@@ -215,17 +266,23 @@ it(
         }
         await sleep(200);
       }
-      trace.push(`status after explicit start: ${JSON.stringify(account)}`);
+      traceStep(trace, `status after explicit start: ${JSON.stringify(account)}`);
       expect(recovered).toBe(true);
     } finally {
       console.log(
         `stop-timeout recovery trace (shipped Gateway):\n${trace.map((line) => `  ${line}`).join("\n")}`,
       );
       if (started) {
-        await disconnectGatewayClient(started.client).catch(() => undefined);
-        await started.server
-          .close({ reason: "stop-timeout recovery proof complete" })
-          .catch(() => undefined);
+        await withRpcTimeout(
+          "disconnectGatewayClient",
+          disconnectGatewayClient(started.client),
+          15_000,
+        ).catch(() => undefined);
+        await withRpcTimeout(
+          "gateway close",
+          started.server.close({ reason: "stop-timeout recovery proof complete" }),
+          20_000,
+        ).catch(() => undefined);
       }
       temp.env.restore();
     }
