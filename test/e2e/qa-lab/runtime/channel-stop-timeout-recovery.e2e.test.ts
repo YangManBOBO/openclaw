@@ -119,7 +119,13 @@ it(
               },
             },
           },
-          plugins: { load: { paths: [pluginDir] } },
+          plugins: {
+            enabled: true,
+            allow: [CHANNEL_ID],
+            load: { paths: [pluginDir] },
+            entries: { [CHANNEL_ID]: { enabled: true } },
+            slots: { memory: "none" },
+          },
           channels: {
             [CHANNEL_ID]: { enabled: true, accounts: { [ACCOUNT_ID]: { enabled: true } } },
           },

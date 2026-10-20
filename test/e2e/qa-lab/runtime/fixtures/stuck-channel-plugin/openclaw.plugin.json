@@ -14,7 +14,18 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" }
+          "enabled": { "type": "boolean" },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" }
+              }
+            }
+          },
+          "defaultAccount": { "type": "string" }
         }
       }
     }
