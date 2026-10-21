@@ -16,25 +16,6 @@ async function listLeakedDirs(prefix = LEAK_PREFIX): Promise<string[]> {
   }
 }
 
-async function readSurvivingSentinelFiles(dirNames: string[]): Promise<string[]> {
-  const matches: string[] = [];
-  for (const name of dirNames) {
-    const dirPath = path.join(os.tmpdir(), name);
-    try {
-      const files = await fs.readdir(dirPath);
-      for (const file of files) {
-        const content = await fs.readFile(path.join(dirPath, file), "utf8");
-        if (content.includes(SENTINEL)) {
-          matches.push(path.join(name, file));
-        }
-      }
-    } catch {
-      // A directory that disappeared mid-sweep did not leak.
-    }
-  }
-  return matches;
-}
-
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const name of await listLeakedDirs()) {
@@ -84,6 +65,5 @@ describe("writeTemporaryBundleMcpJson cleanup on write failure", () => {
 
     const leaked = await listLeakedDirs();
     expect(leaked).toEqual([]);
-    expect(await readSurvivingSentinelFiles(leaked)).toEqual([]);
   });
 });
