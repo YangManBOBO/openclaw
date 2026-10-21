@@ -319,7 +319,7 @@ function findNotesHumanBlock(
   producerMarkdown = false,
 ): { start: number; end: number } | null {
   const bodyOffset = producerMarkdown ? (page.match(FRONTMATTER_PATTERN)?.[0].length ?? 0) : 0;
-  const searchable = producerMarkdown ? maskMarkdownCode(page.slice(bodyOffset)) : page;
+  const searchable = producerMarkdown ? maskMarkdownCode(page.slice(bodyOffset), true) : page;
   const searchFrom = producerMarkdown ? 0 : afterSourceContentFence(page);
   const start = searchable.indexOf(HUMAN_START_MARKER, searchFrom);
   const endMarker = searchable.lastIndexOf(HUMAN_END_MARKER);

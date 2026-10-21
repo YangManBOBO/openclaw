@@ -61,6 +61,21 @@ describe("human Notes blocks", () => {
       "human Notes are missing",
     );
   });
+
+  it.each(["\n", "\r\n"])("preserves legacy Notes under an open producer fence (%j)", (newline) => {
+    const humanBlock = [startMarker, "Keep café and trailing spaces.  ", endMarker].join(newline);
+    const existing = `~~~sql${newline}SELECT 1${newline}## Notes${newline}${humanBlock}${newline}`;
+
+    expect(preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toBe(
+      rendered.replace(`${startMarker}\n${endMarker}`, () => humanBlock),
+    );
+  });
+
+  it("does not preserve a legacy producer's closed Notes example", () => {
+    const existing = `~~~markdown\n## Notes\n${startMarker}\nProducer example.\n${endMarker}\n~~~`;
+
+    expect(preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toBe(rendered);
+  });
 });
 
 describe("toWikiPageSummary", () => {
