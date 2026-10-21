@@ -45,10 +45,10 @@ describe("writeTemporaryBundleMcpJson cleanup on write failure", () => {
   it("removes the temp directory when the non-atomic write fails mid-write", async () => {
     const realWriteFile = fs.writeFile.bind(fs);
     vi.spyOn(fs, "writeFile").mockImplementation(async (target, data, options) => {
-      const filePath = typeof target === "string" ? target : target.toString();
-      if (filePath.includes(LEAK_PREFIX)) {
-        const content = String(data);
-        await realWriteFile(filePath, content.slice(0, -2), "utf-8");
+      if (typeof target === "string" && target.includes(LEAK_PREFIX)) {
+        if (typeof data === "string") {
+          await realWriteFile(target, data.slice(0, -2), "utf-8");
+        }
         throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
       }
       return realWriteFile(target, data, options);
