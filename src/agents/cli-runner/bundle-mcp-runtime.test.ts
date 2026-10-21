@@ -1,0 +1,89 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeTemporaryBundleMcpJson } from "./bundle-mcp-runtime.js";
+
+const LEAK_PREFIX = "openclaw-cli-mcp-leak-test-";
+const SENTINEL = "sentinel-header-credential-xyz";
+
+async function listLeakedDirs(prefix = LEAK_PREFIX): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(os.tmpdir());
+    return entries.filter((entry) => entry.startsWith(prefix));
+  } catch {
+    return [];
+  }
+}
+
+async function readSurvivingSentinelFiles(dirNames: string[]): Promise<string[]> {
+  const matches: string[] = [];
+  for (const name of dirNames) {
+    const dirPath = path.join(os.tmpdir(), name);
+    try {
+      const files = await fs.readdir(dirPath);
+      for (const file of files) {
+        const content = await fs.readFile(path.join(dirPath, file), "utf8");
+        if (content.includes(SENTINEL)) {
+          matches.push(path.join(name, file));
+        }
+      }
+    } catch {
+      // A directory that disappeared mid-sweep did not leak.
+    }
+  }
+  return matches;
+}
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const name of await listLeakedDirs()) {
+    await fs.rm(path.join(os.tmpdir(), name), { recursive: true, force: true });
+  }
+});
+
+describe("writeTemporaryBundleMcpJson cleanup on write failure", () => {
+  it("removes the temp directory when the non-atomic write fails before flushing", async () => {
+    vi.spyOn(fs, "writeFile").mockRejectedValueOnce(
+      Object.assign(new Error("disk full"), { code: "ENOSPC" }),
+    );
+
+    await expect(
+      writeTemporaryBundleMcpJson(
+        LEAK_PREFIX,
+        { mcpServers: { openclaw: { headers: { Authorization: `Bearer ${SENTINEL}` } } } },
+        "mcp.json",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "ENOSPC" });
+
+    const leaked = await listLeakedDirs();
+    expect(leaked).toEqual([]);
+  });
+
+  it("removes the temp directory when the non-atomic write fails mid-write", async () => {
+    const realWriteFile = fs.writeFile.bind(fs);
+    vi.spyOn(fs, "writeFile").mockImplementation(async (target, data, options) => {
+      const filePath = typeof target === "string" ? target : target.toString();
+      if (filePath.includes(LEAK_PREFIX)) {
+        const content = String(data);
+        await realWriteFile(filePath, content.slice(0, -2), "utf-8");
+        throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      }
+      return realWriteFile(target, data, options);
+    });
+
+    await expect(
+      writeTemporaryBundleMcpJson(
+        LEAK_PREFIX,
+        { mcpServers: { openclaw: { headers: { Authorization: `Bearer ${SENTINEL}` } } } },
+        "mcp.json",
+        false,
+      ),
+    ).rejects.toMatchObject({ code: "ENOSPC" });
+
+    const leaked = await listLeakedDirs();
+    expect(leaked).toEqual([]);
+    expect(await readSurvivingSentinelFiles(leaked)).toEqual([]);
+  });
+});
