@@ -56,6 +56,7 @@ import { createSidebarSnapshot } from "./sidebar-snapshot.ts";
 import { GatewayStatus } from "./solid/gateway-status.tsx";
 import { Icon } from "./solid/icon.tsx";
 import { PanelRefreshStatus } from "./solid/panel-refresh-status.tsx";
+import { SidebarCommunityInvite } from "./solid/sidebar-community-invite.tsx";
 
 export class AppSidebarOwner extends AppSidebarSessionNavigationElement implements SessionListHost {
   private readonly emptyNarrationLines = new Map<string, string>();
@@ -450,7 +451,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
       const rail = renderSidebarRail(this);
       const Pages = () => renderSidebarPages(this);
       const toolbar = renderSessionListToolbar(this);
-      const online = renderAppSidebarOnline(this);
+      const Online = () => renderAppSidebarOnline(this);
       const menus = this.sidebarMenus.render(this);
       const statusVisible = () =>
         this.gatewayStatus?.kind &&
@@ -499,7 +500,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
                         </>
                       }
                     >
-                      {online}
+                      <Online />
                     </Show>
                   }
                 >
@@ -529,6 +530,17 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
                   </openclaw-tooltip>
                 </Show>
               </div>
+            </Show>
+            <Show
+              when={
+                this.context.theme.branding.communityLinks &&
+                this.context.config.current.communityInvite
+              }
+            >
+              <SidebarCommunityInvite
+                mode={this.context.theme.resolvedMode}
+                onDismiss={() => this.navigationViewElements.get(this.navigationView)?.focus()}
+              />
             </Show>
           </div>
           {menus}
