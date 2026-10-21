@@ -44,7 +44,7 @@ export function forEachMarkdownCodeRange(
   visit(fromMarkdown(markdown));
 }
 
-function maskMarkdownCode(markdown: string): string {
+export function maskMarkdownCode(markdown: string): string {
   const masked = markdown.split("");
   forEachMarkdownCodeRange(markdown, (start, end) => {
     for (let index = start; index < end; index++) {

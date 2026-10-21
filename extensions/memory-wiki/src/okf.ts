@@ -15,6 +15,9 @@ import { appendMemoryWikiLog } from "./log.js";
 import { forEachMarkdownCodeRange } from "./markdown-links.js";
 import {
   createWikiPageFilename,
+  HUMAN_START_MARKER,
+  HUMAN_END_MARKER,
+  preserveHumanNotesBlock,
   parseWikiMarkdown,
   renderWikiMarkdown,
   slugifyWikiSegment,
@@ -30,8 +33,6 @@ import {
 import { initializeMemoryWikiVault } from "./vault.js";
 
 const OKF_RESERVED_FILENAMES = new Set(["index.md", "log.md"]);
-const OKF_HUMAN_START_MARKER = "<!-- openclaw:human:start -->";
-const OKF_HUMAN_END_MARKER = "<!-- openclaw:human:end -->";
 const OKF_MARKDOWN_LINK_PATTERN = /(!?)\[([^\]]*)\]\(([^)]+)\)/g;
 const OKF_RELATED_SECTION_PATTERN = new RegExp(
   `\\n+## Related\\n${WIKI_RELATED_START_MARKER}[\\s\\S]*?${WIKI_RELATED_END_MARKER}\\n?`,
@@ -298,7 +299,7 @@ function normalizeOkfRenderedPageForComparison(content: string): string {
 
 function renderOkfBodyWithHumanNotes(producerBody: string): string {
   const body = producerBody.trimEnd();
-  const notes = `## Notes\n${OKF_HUMAN_START_MARKER}\n${OKF_HUMAN_END_MARKER}\n`;
+  const notes = `## Notes\n${HUMAN_START_MARKER}\n${HUMAN_END_MARKER}\n`;
   const rendered = body + "\n\n" + notes;
   const notesOffset = body.length + 2;
   let closingFence = "";
@@ -314,75 +315,6 @@ function renderOkfBodyWithHumanNotes(producerBody: string): string {
   return closingFence ? body + "\n" + closingFence + "\n\n" + notes : rendered;
 }
 
-// Producer Markdown is inserted directly before the local Notes slot, so the
-// human-marker search must be scoped to the slot appended at the end of the
-// page. Producer bodies may legitimately contain literal marker examples inside
-// fences, and legacy pages produced before the slot existed have no markers at
-// all; both must leave the rendered page untouched.
-function extractOkfHumanNotesBlock(page: string): string | null {
-  const codeRanges: Array<{ start: number; end: number }> = [];
-  forEachMarkdownCodeRange(page, (start, end) => codeRanges.push({ start, end }));
-  const inCode = (index: number) =>
-    codeRanges.some((range) => index >= range.start && index < range.end);
-
-  // The importer appends the Notes slot last, so its closing marker is the
-  // final human marker in the page. Anchor on that end and the local slot
-  // heading that precedes it: a copied marker example inside the notes or a
-  // legacy producer marker pair (e.g. inside a fenced example) is not a local
-  // slot and must not widen the preserved range.
-  const end = page.lastIndexOf(OKF_HUMAN_END_MARKER);
-  const headingPattern = /(?:^|\r?\n)## Notes[\t ]*(?:\r?\n|$)/gu;
-  let slotStart = -1;
-  let match: RegExpExecArray | null;
-  while ((match = headingPattern.exec(page))) {
-    const candidate = page.indexOf(OKF_HUMAN_START_MARKER, match.index + match[0].length);
-    if (candidate === -1 || inCode(candidate)) {
-      continue;
-    }
-    // A local opening marker is not a legacy slot-free page, even if its end is missing
-    // or the only remaining closing marker belongs to a fenced example.
-    if (end < candidate || inCode(end)) {
-      throw new Error(
-        `OKF human Notes are missing a closing marker outside code fences; restore ${OKF_HUMAN_END_MARKER} outside code fences before re-importing this concept; existing Notes were not changed.`,
-      );
-    }
-    if (slotStart !== -1 && slotStart !== candidate) {
-      throw new Error(
-        "Ambiguous OKF Notes: put copied Notes sections in code fences before re-importing; existing Notes were not changed.",
-      );
-    }
-    slotStart = candidate;
-  }
-  if (slotStart === -1) {
-    if (end === -1) {
-      return null;
-    }
-    // A legacy local slot can be inside an unclosed producer fence. Its trailing markers
-    // are ambiguous, not evidence that the page has no human edits to preserve.
-    const trailing = page.slice(end + OKF_HUMAN_END_MARKER.length).replace(/\r\n/g, "\n");
-    if (!trailing.replace(OKF_RELATED_SECTION_PATTERN, "").trim()) {
-      throw new Error(
-        "Close the producer Markdown fence before re-importing this OKF concept; existing Notes were not changed.",
-      );
-    }
-    return null;
-  }
-  return page.slice(slotStart, end + OKF_HUMAN_END_MARKER.length);
-}
-
-function preserveOkfHumanNotes(rendered: string, existing: string): string {
-  const humanBlock = extractOkfHumanNotesBlock(existing);
-  if (!humanBlock) {
-    return rendered;
-  }
-  const start = rendered.lastIndexOf(OKF_HUMAN_START_MARKER);
-  const end = rendered.lastIndexOf(OKF_HUMAN_END_MARKER);
-  if (start === -1 || end < start) {
-    return rendered;
-  }
-  return rendered.slice(0, start) + humanBlock + rendered.slice(end + OKF_HUMAN_END_MARKER.length);
-}
-
 async function writeOkfConceptPage(params: {
   vaultRoot: string;
   pagePath: string;
@@ -391,11 +323,9 @@ async function writeOkfConceptPage(params: {
   const vault = await fsRoot(params.vaultRoot);
   const pageStat = await readWikiPageStat(vault, params.pagePath);
   const existing = pageStat ? await readExistingWikiPageUtf8(vault, params.pagePath, () => "") : "";
-  // Re-import regenerates concept pages; keep any human Notes block so
-  // re-imports cannot silently erase handwritten notes. Reading the existing
-  // page must propagate persistent errors so a transient read failure cannot
-  // replace the page with an empty Notes scaffold.
-  const nextRendered = existing ? preserveOkfHumanNotes(params.content, existing) : params.content;
+  const nextRendered = preserveHumanNotesBlock(params.content, existing, {
+    producerMarkdown: true,
+  });
   if (
     existing === nextRendered ||
     normalizeOkfRenderedPageForComparison(existing) ===

@@ -53,6 +53,14 @@ describe("human Notes blocks", () => {
     expect(extractHumanNotesBlock(existing)).toBe(`${startMarker}\n${notes}\n${endMarker}`);
     expect(preserveHumanNotesBlock(rendered, existing)).toBe(existing);
   });
+
+  it.each([startMarker, endMarker])("rejects an unpaired producer-page marker %s", (marker) => {
+    const existing = `# Concept\n\n## Notes\n${marker}\nHandwritten note.\n`;
+
+    expect(() => preserveHumanNotesBlock(rendered, existing, { producerMarkdown: true })).toThrow(
+      "human Notes are missing",
+    );
+  });
 });
 
 describe("toWikiPageSummary", () => {

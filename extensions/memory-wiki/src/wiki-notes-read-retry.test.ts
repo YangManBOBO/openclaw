@@ -383,48 +383,26 @@ describe("memory-wiki existing-page read retry", () => {
   });
 
   it("leaves OKF concept pages unchanged after a persistent existing-page read failure", async () => {
-    const rootDir = await createTempDir("memory-wiki-okf-persistent-read-");
-    const bundlePath = path.join(rootDir, "persistent-read-okf");
-    await fs.mkdir(path.join(bundlePath, "tables"), { recursive: true });
+    const { rootDir, config } = await createVault({ prefix: "memory-wiki-okf-read-failure-" });
+    const bundlePath = path.join(rootDir, "bundle");
+    await fs.mkdir(bundlePath);
     await fs.writeFile(
-      path.join(bundlePath, "tables", "customers.md"),
-      `---
-type: BigQuery Table
-title: Customers
----
-
-Customer body.
-`,
-      "utf8",
+      path.join(bundlePath, "customers.md"),
+      "---\ntype: Concept\ntitle: Customers\n---\nCustomer body.\n",
     );
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-    const first = await importMemoryWikiOkfBundle({
-      config,
-      bundlePath,
-      nowMs: Date.UTC(2026, 5, 12, 10, 0, 0),
-    });
-    expect(first.pagePaths).toHaveLength(1);
+    const first = await importMemoryWikiOkfBundle({ config, bundlePath });
     const pagePath = expectDefined(first.pagePaths[0], "imported OKF concept page");
-    const before = (await fs.readFile(path.join(config.vault.path, pagePath), "utf8")).replace(
-      "<!-- openclaw:human:start -->",
-      "<!-- openclaw:human:start -->\nHandwritten note must survive the read failure.",
-    );
-    await fs.writeFile(path.join(config.vault.path, pagePath), before, "utf8");
-
+    const absolutePath = path.join(config.vault.path, pagePath);
+    await addNotes(absolutePath, "Handwritten note must survive the read failure.");
+    const before = await fs.readFile(absolutePath, "utf8");
     securityRuntimeMock.failReadTextAlwaysFor = pagePath;
 
-    await expect(
-      importMemoryWikiOkfBundle({
-        config,
-        bundlePath,
-        nowMs: Date.UTC(2026, 5, 12, 11, 0, 0),
-      }),
-    ).rejects.toThrow("persistent existing-page read failure");
+    await expect(importMemoryWikiOkfBundle({ config, bundlePath })).rejects.toThrow(
+      "persistent existing-page read failure",
+    );
 
     expect(securityRuntimeMock.readTextFailureInjected).toBe(true);
-    await expect(fs.readFile(path.join(config.vault.path, pagePath), "utf8")).resolves.toBe(before);
+    await expect(fs.readFile(absolutePath, "utf8")).resolves.toBe(before);
   });
 
   it("preserves chatgpt conversation notes containing dollar sequences and marker examples", async () => {
