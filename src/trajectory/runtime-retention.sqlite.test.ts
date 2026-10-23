@@ -62,8 +62,16 @@ function currentEvent(
   return createTrajectoryEvent({ type, ts: new Date(Date.now()).toISOString(), ...options });
 }
 
-function append(sessionId: string, events: TrajectoryEvent[], maxGlobalRuntimeBytes?: number) {
-  appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath, maxGlobalRuntimeBytes }, events);
+function append(
+  sessionId: string,
+  events: TrajectoryEvent[],
+  maxGlobalRuntimeBytes?: number,
+  maxAgeMs?: number,
+) {
+  appendSqliteTrajectoryRuntimeEvents(
+    { sessionId, storePath, maxGlobalRuntimeBytes, maxAgeMs },
+    events,
+  );
 }
 
 function startCurrent(payloadSize?: number) {
@@ -301,6 +309,44 @@ it.each(["budget", "age"] as const)(
     });
   },
 );
+
+it("deletes runs older than a configured retention age below the 14-day default", async () => {
+  const current = startCurrent();
+  await addSession("history");
+  const configuredAge = 3 * 24 * 60 * 60 * 1_000;
+  const expiredAt = now - 7 * 24 * 60 * 60 * 1_000;
+  append("history", [
+    createTrajectoryEvent({
+      sessionId: "history",
+      runId: "expired",
+      type: "expired",
+      ts: new Date(expiredAt).toISOString(),
+    }),
+  ]);
+  vi.advanceTimersByTime(60 * 60 * 1_000);
+  const { trigger } = nextWindow(current);
+  append("session-1", [trigger], undefined, configuredAge);
+  await expectTypes({ history: [], "session-1": ["current", "trigger"] });
+});
+
+it("retains runs younger than a configured retention age", async () => {
+  const current = startCurrent();
+  await addSession("history");
+  const configuredAge = 7 * 24 * 60 * 60 * 1_000;
+  const recentAt = now - 2 * 24 * 60 * 60 * 1_000;
+  append("history", [
+    createTrajectoryEvent({
+      sessionId: "history",
+      runId: "recent",
+      type: "recent",
+      ts: new Date(recentAt).toISOString(),
+    }),
+  ]);
+  vi.advanceTimersByTime(60 * 60 * 1_000);
+  const { trigger } = nextWindow(current);
+  append("session-1", [trigger], undefined, configuredAge);
+  await expectTypes({ history: ["recent"], "session-1": ["current", "trigger"] });
+});
 
 it("keeps the committed append when retention fails and retries retention on the next append", async () => {
   startCurrent();
