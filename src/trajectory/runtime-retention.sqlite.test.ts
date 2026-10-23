@@ -348,6 +348,29 @@ it("retains runs younger than a configured retention age beyond the 14-day defau
   await expectTypes({ history: ["recent"], "session-1": ["current", "trigger"] });
 });
 
+it("loads existing default-policy data and applies configured retention on top", async () => {
+  const current = startCurrent();
+  await addSession("history");
+  const preUpgradeAt = now - 10 * 24 * 60 * 60 * 1_000;
+  append("history", [
+    createTrajectoryEvent({
+      sessionId: "history",
+      runId: "pre-upgrade",
+      type: "pre-upgrade",
+      ts: new Date(preUpgradeAt).toISOString(),
+    }),
+  ]);
+  const before = loadSqliteTrajectoryRuntimeEventRowsSync({
+    sessionId: "history",
+    storePath,
+  });
+  expect(before.map(({ event }) => event.runId)).toEqual(["pre-upgrade"]);
+  vi.advanceTimersByTime(60 * 60 * 1_000);
+  const { trigger } = nextWindow(current);
+  append("session-1", [trigger], undefined, 7 * 24 * 60 * 60 * 1_000);
+  await expectTypes({ history: [], "session-1": ["current", "trigger"] });
+});
+
 it("keeps the committed append when retention fails and retries retention on the next append", async () => {
   startCurrent();
   await addSession("history");
