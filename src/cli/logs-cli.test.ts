@@ -187,12 +187,14 @@ it.each([
 });
 
 it("rejects combining --local-time with --utc", async () => {
+  callGatewayFromCli.mockResolvedValue(logPage([]));
   await expect(runLogsCli(["logs", "--local-time", "--utc"])).rejects.toThrow(
     "Pass only one of --local-time or --utc.",
   );
   await expect(runLogsCli(["logs", "--utc", "--local-time"])).rejects.toThrow(
     "Pass only one of --local-time or --utc.",
   );
+  expect(callGatewayFromCli).not.toHaveBeenCalled();
 });
 
 it("retains calendar log identity in text and JSON", async () => {
