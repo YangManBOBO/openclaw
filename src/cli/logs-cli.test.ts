@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { formatCliFailureLines } from "./failure-output.js";
 import {
   buildGatewayConnectionDetails,
   callGatewayFromCli,
@@ -188,12 +189,21 @@ it.each([
 
 it("rejects combining --local-time with --utc", async () => {
   callGatewayFromCli.mockResolvedValue(logPage([]));
-  await expect(runLogsCli(["logs", "--local-time", "--utc"])).rejects.toThrow(
-    "Pass only one of --local-time or --utc.",
-  );
-  await expect(runLogsCli(["logs", "--utc", "--local-time"])).rejects.toThrow(
-    "Pass only one of --local-time or --utc.",
-  );
+  for (const flags of [
+    ["--local-time", "--utc"],
+    ["--utc", "--local-time"],
+  ]) {
+    const failure = await runLogsCli(["logs", ...flags]).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(
+      formatCliFailureLines({
+        title: "The CLI command failed.",
+        error: failure,
+        argv: ["node", "openclaw", "logs", ...flags],
+        env: {},
+      }),
+    ).toContain("Pass only one of --local-time or --utc.");
+  }
   expect(callGatewayFromCli).not.toHaveBeenCalled();
 });
 

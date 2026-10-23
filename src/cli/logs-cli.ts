@@ -38,6 +38,7 @@ import { formatTimestamp } from "../logging/timestamps.js";
 import { defaultRuntime } from "../runtime.js";
 import { getAsyncWorkSignal } from "../shared/async-work-scope.js";
 import { formatCliCommand } from "./command-format.js";
+import { throwExpectedCliError } from "./failure-output.js";
 import { resolveGatewayLocalPortOverride } from "./gateway-port-option.js";
 import { addGatewayClientOptions, callGatewayFromCli } from "./gateway-rpc.js";
 import type { GatewayRpcOpts } from "./gateway-rpc.types.js";
@@ -361,7 +362,7 @@ export function registerLogsCli(program: Command) {
     const pretty = !jsonMode && process.stdout.isTTY && !opts.plain;
     const rich = isRich() && opts.color !== false && !opts.plain;
     if (opts.localTime && opts.utc) {
-      throw new Error("Pass only one of --local-time or --utc.");
+      throwExpectedCliError("Pass only one of --local-time or --utc.");
     }
     const localTime = !opts.utc;
     const formatLogLine = (raw: string): string => {
