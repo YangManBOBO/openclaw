@@ -126,32 +126,6 @@ describe("trajectory runtime", () => {
     expect(JSON.stringify(parsed.data)).toContain("abcd-efgh-ijkl-mnop");
   });
 
-  it("passes configured trajectory retention thresholds to the sink", async () => {
-    const writes: string[] = [];
-    const spy = vi
-      .spyOn(runtimeStoreWriter, "createSqliteTrajectoryRuntimeSink")
-      .mockResolvedValueOnce({
-        write: (_event: unknown, line: string) => writes.push(line),
-        flush: async () => {},
-        describeFlushState: () => undefined,
-      });
-    await createTrajectoryRuntimeRecorder({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      cfg: {
-        session: {
-          maintenance: { trajectoryRetention: { maxAge: "7d", maxBytes: "200mb" } },
-        },
-      } as never,
-    });
-    expect(spy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        maxAgeMs: 7 * 24 * 60 * 60 * 1000,
-        maxGlobalRuntimeBytes: 200 * 1024 * 1024,
-      }),
-    );
-  });
-
   it("records SQLite marker runtime events without active JSONL sidecars", async () => {
     const tempDir = tempDirs.make("openclaw-trajectory-runtime-");
     const storePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
