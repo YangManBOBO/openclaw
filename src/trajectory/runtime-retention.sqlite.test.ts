@@ -329,11 +329,11 @@ it("deletes runs older than a configured retention age below the 14-day default"
   await expectTypes({ history: [], "session-1": ["current", "trigger"] });
 });
 
-it("retains runs younger than a configured retention age", async () => {
+it("retains runs younger than a configured retention age beyond the 14-day default", async () => {
   const current = startCurrent();
   await addSession("history");
-  const configuredAge = 7 * 24 * 60 * 60 * 1_000;
-  const recentAt = now - 2 * 24 * 60 * 60 * 1_000;
+  const configuredAge = 21 * 24 * 60 * 60 * 1_000;
+  const recentAt = now - 16 * 24 * 60 * 60 * 1_000;
   append("history", [
     createTrajectoryEvent({
       sessionId: "history",
