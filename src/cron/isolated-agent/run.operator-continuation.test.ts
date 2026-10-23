@@ -1,7 +1,5 @@
-import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { SessionGitHubPublicationPublished } from "../../../packages/gateway-protocol/src/schema/session-github-publication.js";
 import { createOpenClawCodingToolsAsync } from "../../agents/agent-tools.js";
 import { withPreparedEmbeddedGatewayTools } from "../../agents/embedded-agent-runner/run/attempt-gateway-tools.js";
 import { applyEmbeddedAttemptToolsAllow } from "../../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
@@ -29,7 +27,6 @@ import * as publicationTransport from "../../gateway/github-publication-git-tran
 import { createGitHubPublicationCoordinator } from "../../gateway/github-publication.js";
 import { captureGatewayOperatorRunAuthority } from "../../gateway/operator-run-authority.js";
 import { createOperatorRecoveryFixture } from "../../gateway/operator-run-recovery.test-support.js";
-import { createScheduledGatewayRunner } from "../../gateway/scheduled-run-gateway-context.js";
 import { createAgentEventTestHarness } from "../../gateway/server-chat.agent-events.test-harness.js";
 import {
   admission,
@@ -67,24 +64,39 @@ import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-trans
 import { createDeferredCore } from "../../shared/deferred.js";
 import { setCanonicalUserProfileRole } from "../../state/user-profile-writes.js";
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
-import {
-  createGatewaySchedulerClock,
-  createTestGatewayScheduler,
-} from "../../test-utils/gateway-scheduler-clock.js";
-import { createCronServiceWithStateForTest, createNoopLogger } from "../service.test-harness.js";
+import { createGatewaySchedulerClock } from "../../test-utils/gateway-scheduler-clock.js";
+import type { CronEvent } from "../service.js";
 import { onTimer } from "../service/timer.test-support.js";
-import { resolveCronSessionTargetSessionKey } from "../session-target.js";
+import { readSessionMessagesAsyncMock } from "./run-automation.test-support.js";
 import { prepareAuthorityConfig, resetAuthorityRunHarness } from "./run.authority.test-support.js";
+import {
+  createOperatorContinuationService,
+  publication,
+  publicationCommandResult,
+} from "./run.operator-continuation.test-support.js";
 import {
   loadRunCronIsolatedAgentTurn,
   loadSessionEntryMock,
   patchSessionEntryMock,
-  readSessionMessagesAsyncMock,
   resolveCronSessionMock,
   runEmbeddedAgentMock,
 } from "./run.test-harness.js";
 
+const sessionRunner = vi.hoisted(() => ({
+  runEmbedded: vi.fn<typeof import("../../agents/embedded-agent-runner/run.js").runEmbeddedAgent>(),
+}));
+// mock-isolation: Only model execution is synthetic; scheduled admission and publication stay real.
+vi.mock("../../agents/embedded-agent-runner/run.js", () => ({
+  runEmbeddedAgent: sessionRunner.runEmbedded,
+}));
+
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
+await Promise.all([
+  import("../../auto-reply/dispatch.js"),
+  import("../../auto-reply/reply/get-reply-from-config.runtime.js").then((runtime) =>
+    runtime.prewarmConfigDrivenReplyRuntime(),
+  ),
+]);
 const session = await vi.importActual<typeof import("./session.js")>("./session.js");
 const accessor = await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
   "../../config/sessions/session-accessor.js",
@@ -107,6 +119,9 @@ beforeEach(() => {
   resolveCronSessionMock.mockImplementation(session.prepareCronSession);
   loadSessionEntryMock.mockImplementation(session.loadCronSessionEntryLatest);
   patchSessionEntryMock.mockImplementation(accessor.patchSessionEntryCore);
+  sessionRunner.runEmbedded
+    .mockReset()
+    .mockImplementation((params) => runEmbeddedAgentMock(params));
 });
 afterEach(() => {
   runEmbeddedAgentMock.mockReset();
@@ -116,6 +131,9 @@ afterEach(() => {
 // Exercise custody transfer through durable reload, scheduled admission and the real action owner.
 it.each([
   "operator",
+  "self removal",
+  "self removal then role revoked during merge",
+  "self removal then session replaced during merge",
   "paused force run",
   "restart",
   "restart with prior operator source",
@@ -127,8 +145,10 @@ it.each([
   "role revoked",
   "role revoked during merge",
   "session replaced",
+  "active recovery",
 ] as const)("scheduled continuation preserves the %s boundary", async (scenario) => {
   const restarting = scenario.startsWith("restart");
+  const selfRemoving = scenario.startsWith("self removal");
   const config = await prepareAuthorityConfig({
     tools: { allow: [AUTOMATIONS_TOOL_NAME, "github_publish"] },
   });
@@ -146,6 +166,12 @@ it.each([
     sessionId: SESSION_ID,
     scopes: scenario === "guest" ? ["operator.sessions.write"] : ["operator.admin"],
   });
+  if (scenario !== "active recovery") {
+    // Ordinary admission retires a completed predecessor; an active claim keeps custody.
+    recovery.entry.status = "done";
+    recovery.entry.abortedLastRun = false;
+    await accessor.replaceSessionEntry(recovery.target, recovery.entry);
+  }
   const captureAuthority = async () =>
     expectDefined(
       await captureGatewayOperatorRunAuthority({
@@ -235,7 +261,9 @@ it.each([
                     payload: {
                       kind: "agentTurn",
                       message: "Inspect and land the reviewed PR",
-                      toolsAllow: ["github_publish"],
+                      toolsAllow: selfRemoving
+                        ? ["github_publish", AUTOMATIONS_TOOL_NAME]
+                        : ["github_publish"],
                     },
                     delivery: { mode: "none" },
                     deleteAfterRun: false,
@@ -319,15 +347,6 @@ it.each([
   }
 
   // Publication creation/storage and actual GitHub credentials are outside this regression.
-  const publication: SessionGitHubPublicationPublished = {
-    status: "published",
-    requestId: "27878d29-9f2e-462d-a68a-4e9b4ba27685",
-    repository: "fixture/repository",
-    branch: "reviewed-change",
-    headCommit: "a".repeat(40),
-    url: "https://github.com/fixture/repository/pull/7",
-    publisher: { source: "agent-override", accountId: 42, login: "roboclaw-bot" },
-  };
   const coordinator = createGitHubPublicationCoordinator({
     placements: createWorkerSessionPlacementStore(),
     getCommittedRuntimeConfig: () => config,
@@ -349,6 +368,9 @@ it.each([
     .spyOn(publicationTransport, "runPublicationCommand")
     .mockImplementation(async (argv, options) => {
       options?.beforeRun?.();
+      if (selfRemoving) {
+        expect(context.cron.getJob(job.id)).toBeUndefined();
+      }
       if (argv.includes("PUT") && argv.includes("repos/fixture/repository/pulls/7/merge")) {
         writes.push(JSON.parse(String(options?.input)));
         merged = true;
@@ -356,34 +378,23 @@ it.each([
         expect(argv).toContain("GET");
         expect(argv).toContain("repos/fixture/repository/pulls/7");
         reads++;
-        if (scenario === "role revoked during merge" && reads === 2) {
-          // Revoke during merge preflight, after inspect but before the final write.
-          await setCanonicalUserProfileRole(profile.id, "blocked");
+        if (reads === 2) {
+          // Commit authority loss during awaited preflight, before the final write.
+          if (
+            scenario === "role revoked during merge" ||
+            scenario === "self removal then role revoked during merge"
+          ) {
+            await setCanonicalUserProfileRole(profile.id, "blocked");
+          } else if (scenario === "self removal then session replaced during merge") {
+            await accessor.replaceSessionEntry(recovery.target, {
+              ...expectDefined(accessor.loadSessionEntry(recovery.target), "active session"),
+              sessionId: "replacement-session",
+              lifecycleRevision: "replacement",
+            });
+          }
         }
       }
-      return {
-        code: 0,
-        termination: "exit" as const,
-        signal: null,
-        killed: false,
-        stderr: Buffer.alloc(0),
-        stdout: Buffer.from(
-          JSON.stringify({
-            node_id: "fixture-pr",
-            html_url: publication.url,
-            title: "Reviewed change",
-            body: "Reviewed",
-            state: merged ? "closed" : "open",
-            draft: false,
-            merged,
-            head: { ref: publication.branch, sha: publication.headCommit },
-            base: { repo: { full_name: publication.repository } },
-            mergeable: true,
-            mergeable_state: "clean",
-            merge_commit_sha: merged ? "b".repeat(40) : null,
-          }),
-        ),
-      };
+      return publicationCommandResult(merged);
     });
   const restartEntered = createDeferredCore();
   const restartContinue = createDeferredCore();
@@ -399,13 +410,15 @@ it.each([
       "gateway",
       params.runId,
     );
+    const lifecycleGeneration = getAgentEventLifecycleGeneration();
+    await params.onExecutionStarted?.({ lifecycleGeneration });
+    params.onExecutionPhase?.({ phase: "model_call_started" });
+    await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
     if (restarting && entered === 1) {
       expect(params.toolsAllow).toEqual(["github_publish"]);
       const recorder = expectDefined(params.userTurnTranscriptRecorder, "cron transcript owner");
       expect(await recorder.persistApproved()).toBeDefined();
       interruptedRunId = params.runId;
-      const lifecycleGeneration = getAgentEventLifecycleGeneration();
-      await params.onExecutionStarted?.({ lifecycleGeneration });
       await persistGatewaySessionLifecycleEvent({
         agentId: "main",
         sessionKey: SESSION,
@@ -492,10 +505,21 @@ it.each([
             abortSignal: params.abortSignal,
             runtimeToolAllowlist: params.toolsAllow,
             scheduledToolPolicy: params.scheduledToolPolicy,
+            trigger: params.trigger,
+            jobId: params.jobId,
           }),
           params.toolsAllow,
           { toolMeta: getPluginToolMeta },
         );
+        if (selfRemoving) {
+          const automations = expectDefined(
+            tools.find((tool) => tool.name === AUTOMATIONS_TOOL_NAME),
+            "scheduled self-cleanup tool",
+          );
+          await automations.execute("self-cleanup", { action: "remove", jobId: job.id });
+          expect(params.abortSignal?.aborted).toBe(false);
+          expect(context.cron.getJob(job.id)).toBeUndefined();
+        }
         const publish = tools.find((tool) => tool.name === "github_publish");
         offered = publish?.parameters;
         if (publish && JSON.stringify(offered).includes('"inspect"')) {
@@ -511,6 +535,12 @@ it.each([
             );
           } catch (error) {
             rejected = String(error);
+            if (
+              scenario === "role revoked during merge" ||
+              scenario === "self removal then role revoked during merge"
+            ) {
+              expect(params.abortSignal?.aborted).toBe(true);
+            }
           }
         }
         return { payloads: [{ text: "Continuation complete" }], meta: { agentMeta: {} } };
@@ -518,30 +548,19 @@ it.each([
     );
   });
   const finished = createDeferredCore();
-  const { cron: execution, state: schedulerState } = createCronServiceWithStateForTest({
+  let finishedEvent: CronEvent | undefined;
+  const { cron: execution, state: schedulerState } = createOperatorContinuationService({
+    config,
+    stateDir,
+    clock: clock.clock,
+    resolveGatewayContext,
+    runIsolated: runCronIsolatedAgentTurn,
     onEvent: (event) => {
       if (event.action === "finished" && event.jobId === job.id) {
+        finishedEvent = event;
         finished.resolve();
       }
     },
-    scheduler: createTestGatewayScheduler(clock.clock),
-    nowMs: clock.clock.now,
-    storePath: path.join(stateDir, "cron", "jobs.json"),
-    cronEnabled: true,
-    defaultAgentId: "main",
-    log: createNoopLogger(),
-    enqueueSystemEvent: vi.fn(),
-    requestHeartbeat: vi.fn(),
-    runSchedulerOwned: createScheduledGatewayRunner(resolveGatewayContext),
-    runIsolatedAgentJob: (request) =>
-      runCronIsolatedAgentTurn({
-        ...request,
-        cfg: config,
-        deps: {},
-        agentId: "main",
-        sessionKey:
-          resolveCronSessionTargetSessionKey(request.job.sessionTarget) ?? "cron:" + request.job.id,
-      }),
   });
   context.cron = execution;
   try {
@@ -581,13 +600,15 @@ it.each([
           expect(interrupted).toMatchObject({
             status: "interrupted",
             mainRestartRecovery: { cycleId: expect.any(String) },
-            restartRecoveryDeliverySourceRunId:
-              scenario === "restart" ? interruptedRunId : recovery.target.sourceRunId,
+            restartRecoveryDeliverySourceRunId: interruptedRunId,
           });
           if (scenario !== "restart") {
+            expect(interrupted.restartRecoveryTerminalRunIds).toContain(
+              recovery.target.sourceRunId,
+            );
             expect(
               readRestartRecoveryRequesterSource({ ...recovery.target, entry: interrupted }),
-            ).toMatchObject({ sessionKey: SESSION, operatorProfileId: profile.id });
+            ).toBeUndefined();
           }
           expect(interrupted.restartRecoveryRuns).toContainEqual({
             runId: interruptedRunId,
@@ -602,6 +623,33 @@ it.each([
     }
     await finished.promise;
     await execution.waitForIdle();
+    if (selfRemoving) {
+      expect(execution.getJob(job.id)).toBeUndefined();
+      expect(entered).toBe(1);
+      if (scenario !== "self removal") {
+        expect(finishedEvent).toMatchObject({ status: "error" });
+        expect(reads).toBe(2);
+        expect(results).toHaveLength(1);
+        expect(rejected).toMatch(/abort|authority|source|session/i);
+        expect(writes).toEqual([]);
+        expect(merged).toBe(false);
+        return;
+      }
+      expect(finishedEvent, finishedEvent?.error).toMatchObject({
+        status: "ok",
+        completionStatus: "succeeded",
+        summary: "Continuation complete",
+      });
+      expect(rejected).toBeUndefined();
+      expect(merged).toBe(true);
+      expect(writes).toEqual([{ sha: "a".repeat(40), merge_method: "merge" }]);
+      const completed = expectDefined(
+        accessor.loadSessionEntry(recovery.target),
+        "completed session",
+      );
+      expect(completed.status).not.toBe("killed");
+      return;
+    }
     const state = expectDefined(execution.getJob(job.id), "finished scheduled job").state;
     if (restarting) {
       await shutdownReleased;
@@ -659,19 +707,34 @@ it.each([
       expect(entered).toBe(2);
       return;
     }
-    if (scenario === "role revoked" || scenario === "session replaced") {
+    if (
+      scenario === "role revoked" ||
+      scenario === "session replaced" ||
+      scenario === "active recovery"
+    ) {
       expect(entered).toBe(0);
       expect(state.lastRunStatus, state.lastError).toBe("error");
       expect(state.lastError).toMatch(
-        scenario === "role revoked"
-          ? /operator identity changed/i
-          : /authority|source|conversation|session|role/i,
+        scenario === "active recovery"
+          ? /abandoned before execution/
+          : scenario === "role revoked"
+            ? /operator identity changed/i
+            : /authority|source|conversation|session|role/i,
       );
+      if (scenario === "active recovery") {
+        expect(accessor.loadSessionEntry(recovery.target)).toMatchObject({
+          restartRecoveryDeliveryRunId: recovery.target.recoveryRunId,
+          restartRecoveryDeliverySourceRunId: recovery.target.sourceRunId,
+          restartRecoveryOperatorSource: recovery.entry.restartRecoveryOperatorSource,
+        });
+      }
     } else {
-      expect(state.lastRunStatus, state.lastError).toBe("ok");
+      expect(state.lastRunStatus, state.lastError).toBe(
+        scenario === "role revoked during merge" ? "error" : "ok",
+      );
       expect(entered).toBe(1);
       if (scenario === "operator" || scenario === "paused force run") {
-        expect(JSON.stringify(offered)).toContain("inspect");
+        expect(JSON.stringify(offered)).toContain('"inspect"');
         expect(JSON.stringify(offered)).toContain("merge");
         expect(rejected).toBeUndefined();
         expect(results).toMatchObject([
@@ -689,14 +752,15 @@ it.each([
           });
         }
       } else if (scenario === "role revoked during merge") {
+        expect(state.lastError).toBe("Session event execution aborted");
         expect(reads).toBe(2);
         expect(results).toHaveLength(1);
-        expect(rejected).toMatch(/operator authority changed/i);
+        expect(rejected).toBe("AbortError: Aborted");
         expect(writes).toEqual([]);
       } else if (scenario === "current tool deny") {
         expect(offered).toBeUndefined();
       } else {
-        expect(JSON.stringify(offered)).not.toContain("inspect");
+        expect(JSON.stringify(offered)).not.toContain('"inspect"');
         expect(JSON.stringify(offered)).not.toContain("merge");
         expect(results).toEqual([]);
       }
