@@ -27,7 +27,6 @@ describe("channel stop-timeout recovery", () => {
 
   it("recovers a manual stop that timed out against an abort-ignoring task", async () => {
     const startAccount = vi.fn(async ({ abortSignal }: ChannelGatewayContextV2<TestAccount>) => {
-      abortSignal.addEventListener("abort", () => {}, { once: true });
       if (startAccount.mock.calls.length === 1) {
         await new Promise<void>(() => {});
         return;
@@ -55,7 +54,9 @@ describe("channel stop-timeout recovery", () => {
       expect(startAccount).toHaveBeenCalledTimes(2);
       expect(account(manager)).toMatchObject({ running: true, restartPending: false });
     } finally {
-      await manager.stopChannel("discord").catch(() => {});
+      const cleanup = manager.stopChannel("discord").catch(() => {});
+      await vi.advanceTimersByTimeAsync(5_000);
+      await cleanup;
     }
   });
 });
