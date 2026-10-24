@@ -433,6 +433,7 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
     gatewayNamespace: nodeWorkerGatewayNamespace,
   });
   const workerEnvironmentService = createWorkerEnvironmentService({
+    resolveGatewayContext: params.resolveGatewayContext,
     scheduler: params.scheduler,
     projectNamespace: nodeWorkerGatewayNamespace,
     prepareComputer: computers.prepare,

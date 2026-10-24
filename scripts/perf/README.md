@@ -7,6 +7,20 @@ snapshot and run the streaming analyzer in aggregate-only mode with bounded host
 resources. It covers dominators, collections, duplicate strings, and session-key
 scaling without exporting snapshot payloads.
 
+## Released session authority
+
+`node --expose-gc --import ./scripts/tsx.mjs scripts/perf/session-authority-retention.ts
+--reads 1000 --expect-released` measures the session publication owner's payload
+lifetime while released sharing, predicate, and generation handles stay reachable.
+Each read deserializes identical synthetic row bytes. WeakRefs count surviving
+rows after collection; an active handle must still retain its row. Reports include
+read counts, serialized payload bytes, survivors, and retained heap delta including
+the handles themselves. Use `--owner /absolute/path/to/baseline.ts` for a saved
+owner module beside its original source so relative imports remain canonical.
+Run at least five alternating samples at 100 and 1,000 reads on the approved
+benchmark host. This is forced-GC owner retention proof, not a latency, allocation,
+promotion, or production GC benchmark.
+
 ## Private-array copies
 
 `node --expose-gc scripts/perf/private-array-copies-measure.mjs <baseline-root> <candidate-root>`
@@ -2087,6 +2101,20 @@ timestamps and unprofiled paired runs for acceptance comparisons. Set the idle
 duration beyond the lifecycle's eviction window. Fixtures and all output stay
 inside the supplied synthetic state directory.
 
+To reproduce tool-context retention, set `OPENCLAW_BENCH_RETAIN_TOOL_CONTEXT=1`
+for this source-only scenario. The benchmark loader retains one
+`AsyncLocalStorage.snapshot()` per concrete tool invocation, modeling a socket or
+timer that outlives the call. `BENCH_RETAINED_TOOL_CONTEXTS` lines in the Gateway
+log report the cumulative capture count. No Agent or SessionManager is captured
+directly. Keep this instrumentation identical on both sides and require matching
+turn and context counts. Settled managers should collect while the contexts
+remain reachable, and reopened sessions must preserve their history digest.
+For a same-checkout baseline, set `OPENCLAW_BENCH_TOOL_EXECUTION_SOURCE` to a saved
+`packages/agent-core/src/agent-loop-tool-execution.ts`; the loader substitutes
+only that owner's source and keeps its canonical import identity. Record both
+source hashes. These forced-GC counts and snapshots prove owner retention, not
+untraced latency, promotion, or GC performance.
+
 For a steady memory soak with real tool execution and attached viewers, use:
 
 ```sh
@@ -3230,6 +3258,27 @@ This probe measures preparation and validation, including Mistral serialization;
 it does not measure a whole chat turn. Pair it with
 `transcript-broadcast-measure.ts --scenario chat.send --allocations` when assessing
 the effect on Gateway turn allocations.
+
+## Published schemas across sessions
+
+Measure factory-owned schema reuse through real tool finalization and settlement:
+
+```sh
+node --expose-gc --import ./scripts/tsx.mjs scripts/perf/finalized-tool-schemas-measure.ts \
+  --factory message --sessions 63 --samples 5 \
+  --output /path/to/report.json --golden-output /path/to/provider-json.json
+```
+
+Use `message` for the default full message schema or `message-configured` for the
+send-only schema with an empty configuration. Each sample warms one session and
+creates up to 63 more, fitting the finalizer's 64-session snapshot bound. The
+probe counts distinct source objects, exact schema contents, retained published
+schemas, and publication/prewarming calls. It measures untraced CPU/time,
+allocation including collected objects, and survivors in separate passes.
+Compare at least five samples per revision on the approved benchmark host and
+compare provider JSON files byte for byte. Forced-GC retained bytes are contextual
+memory evidence, not natural GC cost or promotion measurements. The probe does
+not execute tools, send messages, or measure a whole Gateway turn.
 
 ## Allocated bytes per RPC or turn
 

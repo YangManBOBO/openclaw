@@ -331,8 +331,12 @@ export class ChatPaneRuntime extends ChatPaneLayoutRender {
         this.sessionCreation.recovering ||
         this.collaboration.addOperation !== undefined,
       placementStartup: placementStartup ?? placementComposer.startup,
+      guestWelcome: this.context.guestWelcome,
       onRetrySessionPlacementStartup: placementStartup?.retryable
         ? this.retrySessionPlacementStartup
+        : undefined,
+      onDiscardSessionPlacementStartup: placementStartup?.initialTurn
+        ? this.discardSessionPlacementStartup
         : undefined,
       canAbort: sessionParticipationBlocked ? false : hasAbortableSessionRun(state),
       runActive,
