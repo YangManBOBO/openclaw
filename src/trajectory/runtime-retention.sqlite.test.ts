@@ -13,7 +13,7 @@ import {
   readSqliteDatabaseScopedWriteToken,
   sqliteSessionIdWriteScope,
 } from "../infra/sqlite-database-admission.js";
-import { AGENT_INDEX_RETIREMENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
+import { CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { retainAgentDatabase } from "../state/openclaw-agent-db-lifecycle.js";
 import { withAgentDatabaseMaintenanceLease } from "../state/openclaw-agent-db-maintenance-lease.js";
 import { getOpenClawAgentMigrationSchema } from "../state/openclaw-agent-db-schema-helpers.js";
@@ -365,13 +365,16 @@ it("applies configured retention to legacy rows upgraded from the pre-payload tr
     const configuredAge = 3 * 24 * 60 * 60 * 1_000;
     const legacyAt = now - 7 * 24 * 60 * 60 * 1_000;
     {
-      // Seed the agent database exactly as stable releases through v2026.10.6 left
-      // it: the trajectory table predates the payload columns migration (v30), so
-      // it has no event_utf8_bytes / event_payload / event_codec columns.
+      // Seed the agent database exactly as the latest stable release v2026.10.7
+      // published it: OPENCLAW_AGENT_SCHEMA_VERSION was 25, and the trajectory
+      // table predates the payload columns migration (v30), so it has no
+      // event_utf8_bytes / event_payload / event_codec columns.
       const seed = new DatabaseSync(dbPath);
       try {
-        seed.exec(getOpenClawAgentMigrationSchema(AGENT_INDEX_RETIREMENT_SCHEMA_VERSION));
-        seedVersion(seed, AGENT_INDEX_RETIREMENT_SCHEMA_VERSION);
+        seed.exec(
+          getOpenClawAgentMigrationSchema(CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION),
+        );
+        seedVersion(seed, CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION);
         seed.exec(`
           PRAGMA foreign_keys = ON;
           INSERT INTO session_nodes (session_key, current_session_id, entry_json, updated_at)
