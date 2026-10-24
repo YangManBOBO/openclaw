@@ -13,7 +13,11 @@ import {
   readSqliteDatabaseScopedWriteToken,
   sqliteSessionIdWriteScope,
 } from "../infra/sqlite-database-admission.js";
+import { AGENT_INDEX_RETIREMENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { retainAgentDatabase } from "../state/openclaw-agent-db-lifecycle.js";
+import { withAgentDatabaseMaintenanceLease } from "../state/openclaw-agent-db-maintenance-lease.js";
+import { getOpenClawAgentMigrationSchema } from "../state/openclaw-agent-db-schema-helpers.js";
+import { ensureOpenClawAgentDatabaseSchema } from "../state/openclaw-agent-db-schema.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
 import {
   openOpenClawAgentDatabase,
@@ -21,7 +25,9 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { createAgentWorkerTestLoaders } from "../state/openclaw-agent-execution-operations.test-support.js";
 import type { AgentWorkerOperationContext } from "../state/openclaw-agent-operation-context.js";
+import { seedVersion } from "../state/schema-migration.test-support.js";
 import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { useSessionStoreTempDirs } from "../test-utils/session-state-cleanup.js";
 import { readTrajectoryPayload } from "./runtime-payload.js";
 import {
@@ -348,6 +354,74 @@ it("retains runs younger than a configured retention age beyond the 14-day defau
   const { trigger } = nextWindow(current);
   append("session-1", [trigger], undefined, configuredAge);
   await expectTypes({ history: ["recent"], "session-1": ["current", "trigger"] });
+});
+
+it("applies configured retention to legacy rows upgraded from the pre-payload trajectory schema", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    // A dedicated .sqlite store path keeps the seed isolated from the store the
+    // beforeEach fixture created at the default agent path.
+    const dbPath = state.statePath("upgrade-legacy.sqlite");
+    storePath = dbPath;
+    const configuredAge = 3 * 24 * 60 * 60 * 1_000;
+    const legacyAt = now - 7 * 24 * 60 * 60 * 1_000;
+    {
+      // Seed the agent database exactly as stable releases through v2026.10.6 left
+      // it: the trajectory table predates the payload columns migration (v30), so
+      // it has no event_utf8_bytes / event_payload / event_codec columns.
+      const seed = new DatabaseSync(dbPath);
+      try {
+        seed.exec(getOpenClawAgentMigrationSchema(AGENT_INDEX_RETIREMENT_SCHEMA_VERSION));
+        seedVersion(seed, AGENT_INDEX_RETIREMENT_SCHEMA_VERSION);
+        seed.exec(`
+          PRAGMA foreign_keys = ON;
+          INSERT INTO session_nodes (session_key, current_session_id, entry_json, updated_at)
+            VALUES ('agent:main:main', 'session-1', '{"sessionId":"session-1","updatedAt":10}', 10),
+                   ('agent:main:history', 'history', '{"sessionId":"history","updatedAt":1}', 1);
+          INSERT INTO session_windows (session_id, session_key, created_at, updated_at)
+            VALUES ('session-1', 'agent:main:main', 1, 1),
+                   ('history', 'agent:main:history', 1, 1);
+        `);
+        seed
+          .prepare(`INSERT INTO trajectory_runtime_events
+            (session_id, seq, run_id, event_json, created_at) VALUES (?, ?, ?, ?, ?)`)
+          .run(
+            "history",
+            0,
+            "legacy-run",
+            JSON.stringify({ type: "legacy", runId: "legacy-run" }),
+            legacyAt,
+          );
+      } finally {
+        seed.close();
+      }
+    }
+    // The real agent database migration path upgrades the legacy table in place
+    // (v30 adds the payload columns) and preserves the stored row.
+    await withAgentDatabaseMaintenanceLease({ env: state.env }, async () => {
+      const db = new DatabaseSync(dbPath);
+      try {
+        ensureOpenClawAgentDatabaseSchema(db, {
+          agentId: "main",
+          path: dbPath,
+          env: state.env,
+        });
+      } finally {
+        db.close();
+      }
+    });
+    const loaded = loadSqliteTrajectoryRuntimeEventRowsSync({ sessionId: "history", storePath });
+    expect(loaded.map(({ event }) => event.runId)).toEqual(["legacy-run"]);
+    // A configured short age then evicts the upgraded legacy run on the next
+    // append-triggered sweep while protecting the triggering session.
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const current = currentEvent("current");
+    append("session-1", [current]);
+    vi.advanceTimersByTime(60 * 60 * 1_000);
+    const trigger = currentEvent("trigger");
+    append("session-1", [trigger], undefined, configuredAge);
+    await expectTypes({ history: [], "session-1": ["current", "trigger"] });
+  });
 });
 
 it("keeps the committed append when retention fails and retries retention on the next append", async () => {
