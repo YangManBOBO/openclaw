@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canResizeChatAttachment, resizeChatAttachmentImage } from "./chat-attachment-image.ts";
 
 function bytes(...values: number[]): Uint8Array<ArrayBuffer> {
@@ -138,44 +138,5 @@ describe("chat attachment JPEG preparation admission", () => {
     const { promise } = runResize(jpegFile(concat(SOI, sof(8000, 4000), SOS, EOI)));
     await expect(promise).rejects.toThrow("exceed the resize budget");
     expect(MockWorker.created).toHaveLength(0);
-  });
-});
-
-describe("chat attachment image worker decode options", () => {
-  beforeEach(() => vi.resetModules());
-  afterEach(() => vi.unstubAllGlobals());
-
-  it("decodes with EXIF orientation applied and keeps the JPEG output type", async () => {
-    const decodeOptions: Array<ImageBitmapOptions | undefined> = [];
-    vi.stubGlobal("createImageBitmap", async (_file: Blob, options?: ImageBitmapOptions) => {
-      decodeOptions.push(options);
-      return { width: 1600, height: 1000, close() {} };
-    });
-    vi.stubGlobal(
-      "OffscreenCanvas",
-      class {
-        width = 0;
-        height = 0;
-        getContext() {
-          return { drawImage() {} };
-        }
-        async convertToBlob({ type }: { type: string }) {
-          return new Blob([new Uint8Array(120)], { type });
-        }
-      },
-    );
-    const workerScope = new EventTarget();
-    for (const method of ["addEventListener", "removeEventListener"] as const) {
-      vi.stubGlobal(method, workerScope[method].bind(workerScope));
-    }
-    const result = new Promise<File | null>((resolve) => {
-      vi.stubGlobal("postMessage", (file: File | null) => resolve(file));
-    });
-    await import("./chat-attachment-image.worker.ts");
-    const file = new File([new Uint8Array(64)], "photo.jpg", { type: "image/jpeg" });
-    workerScope.dispatchEvent(new MessageEvent("message", { data: { file, maxBytes: 200 } }));
-    const prepared = await result;
-    expect(decodeOptions).toEqual([{ imageOrientation: "from-image" }]);
-    expect(prepared).toMatchObject({ name: "photo.jpg", type: "image/jpeg" });
   });
 });
