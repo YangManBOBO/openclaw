@@ -2,11 +2,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { canResizeChatAttachment, resizeChatAttachmentImage } from "./chat-attachment-image.ts";
 
-function bytes(...values: number[]): Uint8Array {
+function bytes(...values: number[]): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(values);
 }
 
-function segment(marker: number, payload: Uint8Array): Uint8Array {
+function segment(marker: number, payload: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
   const length = payload.length + 2;
   const out = new Uint8Array(2 + length);
   out[0] = 0xff;
@@ -17,7 +17,7 @@ function segment(marker: number, payload: Uint8Array): Uint8Array {
   return out;
 }
 
-function sof(width: number, height: number, marker = 0xc0): Uint8Array {
+function sof(width: number, height: number, marker = 0xc0): Uint8Array<ArrayBuffer> {
   // precision(1) + height(2) + width(2) + components(1) + 3 component specs.
   const payload = new Uint8Array(15);
   payload[0] = 8;
@@ -29,7 +29,7 @@ function sof(width: number, height: number, marker = 0xc0): Uint8Array {
   return segment(marker, payload);
 }
 
-function concat(...parts: Uint8Array[]): Uint8Array {
+function concat(...parts: Uint8Array<ArrayBuffer>[]): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
   let offset = 0;
   for (const part of parts) {
@@ -44,7 +44,7 @@ const SOS = bytes(0xff, 0xda);
 const EOI = bytes(0xff, 0xd9);
 const EXIF_APP1 = segment(0xe1, bytes(0x45, 0x78, 0x69, 0x66, 0x00, 0x00));
 
-function jpegFile(data: Uint8Array, name = "photo.jpg"): File {
+function jpegFile(data: Uint8Array<ArrayBuffer>, name = "photo.jpg"): File {
   return new File([data], name, { type: "image/jpeg" });
 }
 
