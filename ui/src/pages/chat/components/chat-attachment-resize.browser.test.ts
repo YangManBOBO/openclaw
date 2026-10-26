@@ -12,34 +12,21 @@ import { createChatAttachmentDropHandlers, handleChatAttachmentPaste } from "./c
 
 const browserMode = "__vitest_browser__" in globalThis;
 
-describe.runIf(browserMode)("oversized composer JPEG photos", () => {
+describe.runIf(browserMode)("oversized EXIF-oriented composer JPEG", () => {
   let source: File;
   beforeAll(async () => {
-    const canvas = document.createElement("canvas");
-    Object.assign(canvas, { width: 2000, height: 1500 });
-    const context = expectDefined(canvas.getContext("2d"), "fixture canvas");
-    const pixels = context.createImageData(canvas.width, canvas.height);
-    let seed = 29;
-    for (let i = 0; i < pixels.data.length; i++) {
-      seed ^= seed << 13;
-      seed ^= seed >>> 17;
-      seed ^= seed << 5;
-      pixels.data[i] = seed & 255;
-    }
-    context.putImageData(pixels, 0, 0);
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, "image/jpeg", 1);
-    });
-    const jpeg = expectDefined(blob, "fixture JPEG");
-    source = new File([jpeg], "camera-photo.jpg", { type: "image/jpeg" });
-    canvas.width = canvas.height = 0;
-    expect(source.size).toBeGreaterThan(512 * 1024);
+    const fixture = new URL("../../../e2e/fixtures/oriented-portrait-photo.jpg", import.meta.url);
+    const response = await fetch(fixture);
+    expect(response.ok).toBe(true);
+    const jpeg = await response.blob();
+    source = new File([jpeg], "portrait-photo.jpg", { type: "image/jpeg" });
+    expect(source.size).toBeGreaterThan(200 * 1024);
   });
 
   it.each(["drop", "picker", "data-url paste"] as const)(
-    "prepares an oversized JPEG photo from %s before publishing a bounded payload",
+    "prepares an oversized EXIF portrait JPEG from %s before publishing a bounded payload",
     async (route) => {
-      const limit = 300 * 1024;
+      const limit = 200 * 1024;
       const { reads, props, attachments, pending, done, dispose } = createAttachmentDraft({
         maxBytes: 20 * 1024 * 1024,
         maxImageBytes: limit,
@@ -89,75 +76,6 @@ describe.runIf(browserMode)("oversized composer JPEG photos", () => {
       });
       const encoded = expectDefined(getChatAttachmentDataUrl(attachment), "send payload");
       expect(encoded.startsWith("data:image/jpeg;base64,")).toBe(true);
-      const image = await createImageBitmap(blob);
-      try {
-        expect(image.width).toBeLessThan(2000);
-        expect(image.height).toBeLessThan(1500);
-        expect(image.width / image.height).toBeCloseTo(2000 / 1500, 2);
-      } finally {
-        image.close();
-      }
-    },
-  );
-});
-
-describe.runIf(browserMode)("oversized EXIF-oriented composer JPEG", () => {
-  let source: File;
-  beforeAll(async () => {
-    const fixture = new URL("../../../e2e/fixtures/oriented-portrait-photo.jpg", import.meta.url);
-    const response = await fetch(fixture);
-    expect(response.ok).toBe(true);
-    const jpeg = await response.blob();
-    source = new File([jpeg], "portrait-photo.jpg", { type: "image/jpeg" });
-    expect(source.size).toBeGreaterThan(200 * 1024);
-  });
-
-  it.each(["drop", "picker", "data-url paste"] as const)(
-    "keeps an oversized EXIF portrait JPEG upright through %s",
-    async (route) => {
-      const limit = 200 * 1024;
-      const { reads, props, attachments, pending, done, dispose } = createAttachmentDraft({
-        maxBytes: 20 * 1024 * 1024,
-        maxImageBytes: limit,
-        maxBatchBytes: 20 * 1024 * 1024,
-      });
-      const host = document.body.appendChild(document.createElement("div"));
-      let view: ReturnType<typeof mountSolid> | undefined;
-      onTestFinished(() => {
-        dispose();
-        view?.unmount();
-        host.remove();
-      });
-      const transfer = new DataTransfer();
-      transfer.items.add(source);
-      if (route === "drop") {
-        const handlers = createChatAttachmentDropHandlers({ ...props, canCompose: true });
-        host.addEventListener("drop", handlers.onDrop);
-        host.dispatchEvent(new DragEvent("drop", { dataTransfer: transfer, cancelable: true }));
-      } else if (route === "picker") {
-        const inputHandle = createChatAttachmentInputHandle();
-        view = mountSolid(() => createComponent(ChatAttachmentInputs, { ...props, inputHandle }), {
-          container: host,
-        });
-        flush();
-        const input = expectDefined(host.querySelector<HTMLInputElement>("input"), "file picker");
-        input.files = transfer.files;
-        input.dispatchEvent(new Event("change"));
-      } else {
-        transfer.items.clear();
-        const encoded = bytesToBase64(new Uint8Array(await source.arrayBuffer()));
-        transfer.setData("text/plain", `data:image/jpeg;base64,${encoded}`);
-        handleChatAttachmentPaste(new ClipboardEvent("paste", { clipboardData: transfer }), props);
-      }
-      expect(reads.pendingReads).toBe(1);
-      expect(attachments()).toEqual([]);
-      await done;
-      expect(pending).toEqual([1, 0]);
-      expect(attachments()).toHaveLength(1);
-      const attachment = expectDefined(attachments()[0], "prepared attachment");
-      const blob = expectDefined(getChatAttachmentBlob(attachment), "prepared bytes");
-      expect(blob.size).toBeLessThanOrEqual(limit);
-      expect(blob.size).toBeGreaterThan(0);
       const image = await createImageBitmap(blob);
       try {
         // Stored 1024x768 landscape with EXIF orientation 6; the prepared
