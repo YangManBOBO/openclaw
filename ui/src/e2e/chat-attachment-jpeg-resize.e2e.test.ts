@@ -1,5 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, it } from "vitest";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
@@ -54,7 +54,9 @@ suite.define(() => {
         const params = request.params as {
           attachments: Array<{ content: string; mimeType: string; fileName: string }>;
         };
-        const photo = params.attachments.find((attachment) => attachment.fileName === "portrait-photo.jpg");
+        const photo = params.attachments.find(
+          (attachment) => attachment.fileName === "portrait-photo.jpg",
+        );
         expect(photo).toBeTruthy();
         expect(photo!.mimeType).toBe("image/jpeg");
         const bytes = Buffer.from(photo!.content, "base64");
