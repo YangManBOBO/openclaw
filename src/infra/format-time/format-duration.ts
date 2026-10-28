@@ -33,14 +33,16 @@ export function formatDurationSeconds(
     : 0;
   const unit = options.unit ?? "s";
   // Round once at the requested precision so float division noise cannot flip the
-  // final digit (e.g. 1005ms -> "1.01s", not "1.00s"). Fractional milliseconds are
-  // preserved by first scaling to a microsecond integer and rounding once; the
-  // legacy toFixed path also rounded the fractional input at the display precision
-  // (formatDurationPrecise(1004.6) -> "1s"). BigInt keeps the fixed-point arithmetic
-  // exact across the supported precision range: String(BigInt) is always full
-  // decimal, never scientific notation.
-  const micros = Math.round(Math.max(0, ms) * 1000);
-  const scaled = (BigInt(micros) * 10n ** BigInt(decimals) + 500_000n) / 1_000_000n;
+  // final digit (e.g. 1005ms -> "1.01s", not "1.00s"). Represent the input via its
+  // shortest decimal string so fractional milliseconds survive to the final rounding
+  // step (formatDurationPrecise(1004.9996) -> "1s"), and keep the fixed-point
+  // arithmetic in BigInt so String() is always full decimal, never scientific
+  // notation, across the supported precision range.
+  const msStr = String(Math.max(0, ms));
+  const [intPart, fracPart = ""] = msStr.split(".");
+  const fracFactor = 10n ** BigInt(fracPart.length);
+  const msBig = BigInt(intPart) * fracFactor + BigInt(fracPart || "0");
+  const scaled = (msBig * 10n ** BigInt(decimals) + fracFactor * 500n) / (fracFactor * 1000n);
   const divisor = 10n ** BigInt(decimals);
   const whole = scaled / divisor;
   const fraction = scaled % divisor;
