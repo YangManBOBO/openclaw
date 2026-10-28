@@ -16,6 +16,31 @@ export type FormatDurationCompactOptions = {
   spaced?: boolean;
 };
 
+/**
+ * Expand a number's shortest decimal string so BigInt construction always receives
+ * plain decimal digits: values below 1e-6 or at or above 1e21 stringify in exponent
+ * notation (e.g. "1e-7", "1e+21"), which BigInt() rejects.
+ */
+function expandDecimalString(value: number): string {
+  const raw = String(value);
+  const exponentIndex = raw.search(/[eE]/);
+  if (exponentIndex === -1) {
+    return raw;
+  }
+  const coefficient = raw.slice(0, exponentIndex);
+  const exponent = Number.parseInt(raw.slice(exponentIndex + 1), 10);
+  const [intPart = "0", fracPart = ""] = coefficient.split(".");
+  const digits = intPart + fracPart;
+  const pointPos = intPart.length + exponent;
+  if (pointPos <= 0) {
+    return `0.${"0".repeat(-pointPos)}${digits}`;
+  }
+  if (pointPos >= digits.length) {
+    return `${digits}${"0".repeat(pointPos - digits.length)}`;
+  }
+  return `${digits.slice(0, pointPos)}.${digits.slice(pointPos)}`;
+}
+
 export function formatDurationSeconds(
   ms: number,
   options: FormatDurationSecondsOptions = {},
@@ -38,7 +63,7 @@ export function formatDurationSeconds(
   // step (formatDurationPrecise(1004.9996) -> "1s"), and keep the fixed-point
   // arithmetic in BigInt so String() is always full decimal, never scientific
   // notation, across the supported precision range.
-  const msStr = String(Math.max(0, ms));
+  const msStr = expandDecimalString(Math.max(0, ms));
   const [intPart, fracPart = ""] = msStr.split(".");
   const fracFactor = 10n ** BigInt(fracPart.length);
   const msBig = BigInt(intPart) * fracFactor + BigInt(fracPart || "0");
