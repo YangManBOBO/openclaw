@@ -579,9 +579,9 @@ describe("operator role policy", () => {
 
       // A verified profile creator whose profile was removed must keep failing closed:
       // resuming its job under the default role could drop the profile's required sandbox.
-      expect(() =>
-        sandbox({ type: "human", source: "profile", id: "U-REMOVED-PROFILE" }),
-      ).toThrow(UserProfileNotFoundError);
+      expect(() => sandbox({ type: "human", source: "profile", id: "U-REMOVED-PROFILE" })).toThrow(
+        UserProfileNotFoundError,
+      );
     }));
 
   it("authorizes only configured agents and rejects unidentified operators", () =>
