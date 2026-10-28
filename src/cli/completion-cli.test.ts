@@ -401,4 +401,26 @@ ${cases
   ])("completes PowerShell line %s", async (commandLine, expected) => {
     expect(await powershell.complete(documentedProgram(), commandLine)).toEqual([expected]);
   });
+
+  function quotedCommandProgram(): Command {
+    const program = new Command().name("openclaw").option("-v, --verbose");
+    const quoted = program.command("it's").description("Apostrophe command");
+    quoted.command("run").description("Run it");
+    quoted.option("--json", "JSON output");
+    program.command("gateway").command("status");
+    return program;
+  }
+
+  it("escapes PowerShell completion path labels containing single quotes", () => {
+    const script = getCompletionScript("powershell", quotedCommandProgram());
+    expect(script).toContain("'it''s' {");
+    expect(script).toContain("if ($commandPath -eq 'it''s') {");
+    expect(script).not.toContain("'it's'");
+  });
+
+  itWithPowerShell("completes PowerShell subcommands of an apostrophe command", async () => {
+    const program = quotedCommandProgram();
+    expect(await powershell.complete(program, "openclaw it's r")).toEqual(["run"]);
+    expect(await powershell.complete(program, "openclaw it's --j")).toEqual(["--json"]);
+  });
 });

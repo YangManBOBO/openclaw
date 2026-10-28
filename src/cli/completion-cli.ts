@@ -284,7 +284,7 @@ function generatePowerShellCompletion(tree: ShellCompletionCommandTree): string 
   const commandPathCases = contexts
     .flatMap((context) =>
       context.pathVariants.map(
-        (pathSegments) => `            '${pathSegments.join(" ")}' {
+        (pathSegments) => `            '${pathSegments.join(" ").replaceAll("'", "''")}' {
                 $commandPath = $candidatePath
                 $valueOptions = ${formatPowerShellArray(context.valueOptions)}
             }`,
@@ -307,7 +307,7 @@ ${commandPathCases}
         .filter(Boolean)
         .map(
           (fullPath) => `
-            if ($commandPath -eq '${fullPath}') {
+            if ($commandPath -eq '${fullPath.replaceAll("'", "''")}') {
                 $completions = ${allCompletions}
                 $completions | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
