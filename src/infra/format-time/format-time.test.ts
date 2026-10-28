@@ -78,6 +78,8 @@ it.each([
   [1500, { decimals: 1.5 }, "1.5s"],
   [1005, { decimals: 2.4 }, "1.01s"],
   [1500, { decimals: Number.NaN }, "2s"],
+  [1500, { decimals: 22 }, "1.5s"],
+  [1005, { decimals: 22 }, "1.005s"],
   [Infinity, undefined, "unknown"],
 ] as const)("formats seconds duration for %j", (input, options, expected) => {
   expect(formatDurationSeconds(input, options)).toBe(expected);

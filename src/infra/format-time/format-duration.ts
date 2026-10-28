@@ -25,17 +25,23 @@ export function formatDurationSeconds(
   }
   // Preserve the legacy toFixed precision coercion: fractional and non-finite
   // decimals truncate to an integer count (NaN -> 0) to keep the plugin-sdk
-  // exported contract, and keep the exponent/divisor integer so rendering stays clean.
+  // exported contract, and clamp to toFixed's supported 0..100 range so the
+  // rendering stays clean for any accepted input.
   const requested = options.decimals ?? 1;
-  const decimals = Number.isFinite(requested) ? Math.max(0, Math.trunc(requested)) : 0;
+  const decimals = Number.isFinite(requested)
+    ? Math.min(100, Math.max(0, Math.trunc(requested)))
+    : 0;
   const unit = options.unit ?? "s";
   // Round once at the requested precision from the integer millisecond count so float
   // division noise cannot flip the final digit (e.g. 1005ms -> "1.01s", not "1.00s").
-  const scaled = Math.round((Math.max(0, ms) * 10 ** decimals) / 1000);
-  const whole = Math.floor(scaled / 10 ** decimals);
-  const fraction = scaled % 10 ** decimals;
+  // BigInt keeps the fixed-point arithmetic exact across the supported precision
+  // range: String(BigInt) is always full decimal, never scientific notation.
+  const scaled = (BigInt(Math.round(Math.max(0, ms))) * 10n ** BigInt(decimals) + 500n) / 1000n;
+  const divisor = 10n ** BigInt(decimals);
+  const whole = scaled / divisor;
+  const fraction = scaled % divisor;
   const trimmed =
-    fraction === 0
+    fraction === 0n
       ? `${whole}`
       : `${whole}.${String(fraction).padStart(decimals, "0").replace(/0+$/, "")}`;
   return unit === "seconds" ? `${trimmed} seconds` : `${trimmed}s`;
