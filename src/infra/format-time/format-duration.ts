@@ -23,11 +23,17 @@ export function formatDurationSeconds(
   if (!Number.isFinite(ms)) {
     return "unknown";
   }
-  const decimals = options.decimals ?? 1;
+  const decimals = Math.max(0, options.decimals ?? 1);
   const unit = options.unit ?? "s";
-  const seconds = Math.max(0, ms) / 1000;
-  const fixed = seconds.toFixed(Math.max(0, decimals));
-  const trimmed = fixed.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+  // Round once at the requested precision from the integer millisecond count so float
+  // division noise cannot flip the final digit (e.g. 1005ms -> "1.01s", not "1.00s").
+  const scaled = Math.round((Math.max(0, ms) * 10 ** decimals) / 1000);
+  const whole = Math.floor(scaled / 10 ** decimals);
+  const fraction = scaled % 10 ** decimals;
+  const trimmed =
+    fraction === 0
+      ? `${whole}`
+      : `${whole}.${String(fraction).padStart(decimals, "0").replace(/0+$/, "")}`;
   return unit === "seconds" ? `${trimmed} seconds` : `${trimmed}s`;
 }
 

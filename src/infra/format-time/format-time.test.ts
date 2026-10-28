@@ -64,6 +64,8 @@ it.each([
 it.each([
   [999, "999ms"],
   [999.6, "1s"],
+  [1005, "1.01s"],
+  [2005, "2.01s"],
   [Infinity, "unknown"],
 ] as const)("formats precise duration for %j", (input, expected) => {
   expect(formatDurationPrecise(input)).toBe(expected);
@@ -71,6 +73,8 @@ it.each([
 it.each([
   [1500, { decimals: 1 }, "1.5s"],
   [2000, { unit: "seconds" }, "2 seconds"],
+  [1005, { decimals: 2 }, "1.01s"],
+  [5, { decimals: 2 }, "0.01s"],
   [Infinity, undefined, "unknown"],
 ] as const)("formats seconds duration for %j", (input, options, expected) => {
   expect(formatDurationSeconds(input, options)).toBe(expected);
