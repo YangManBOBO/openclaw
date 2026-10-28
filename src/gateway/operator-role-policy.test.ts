@@ -9,7 +9,12 @@ import { runWithModelFallback } from "../agents/model-fallback-runner.js";
 import { resolveReplyOperatorAuthorityKey } from "../auto-reply/reply/reply-tool-authority.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { ensureProfileForEmail, linkEmail, setUserProfileRole } from "../state/user-profiles.js";
+import {
+  ensureProfileForEmail,
+  linkEmail,
+  setUserProfileRole,
+  UserProfileNotFoundError,
+} from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   authorizeGatewaySessionCreation,
@@ -605,6 +610,18 @@ describe("operator role policy", () => {
           actor: { type: "human", source: "channel", id: "U-CHANNEL-SENDER" },
         }),
       ).toBeUndefined();
+    });
+
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const cfg = roleConfig();
+
+      // A verified profile creator whose profile was removed must keep failing closed:
+      // resuming its job under the default role could drop the profile's required sandbox.
+      expect(() =>
+        resolveCreatorSandbox(cfg, {
+          actor: { type: "human", source: "profile", id: "U-REMOVED-PROFILE" },
+        }),
+      ).toThrow(UserProfileNotFoundError);
     });
   });
 

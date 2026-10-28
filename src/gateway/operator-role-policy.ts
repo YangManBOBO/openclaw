@@ -152,12 +152,17 @@ export function resolveCreatorSandbox(
       ? "required"
       : undefined;
   } catch (error) {
-    // Channel senders and other human creators carry their channel-native id, not a user
-    // profile id, so the role policy cannot resolve an assignment for them. Treat the
-    // unresolvable creator like a missing assignment so the configured default role (or
-    // the denied role) still decides sandboxing; this must not fail the scheduled run,
-    // and it must not bypass a default-role sandbox requirement.
-    if (error instanceof UserProfileNotFoundError) {
+    // Channel senders and other non-profile human creators carry their channel-native id,
+    // not a user-profile id, so the role policy cannot resolve an assignment for them.
+    // Treat only those sources like a missing assignment so the configured default role
+    // (or the denied role) still decides sandboxing; this must not fail the scheduled
+    // run, and it must not bypass a default-role sandbox requirement. A verified profile
+    // creator whose profile no longer exists keeps failing closed: its job must not
+    // resume under a default role that may drop the profile's required sandbox.
+    if (
+      error instanceof UserProfileNotFoundError &&
+      (actor.source === "channel" || actor.source === "unknown")
+    ) {
       return resolveOperatorRolePolicyForAssignment(actor.id, null, cfg)?.sandbox === "required"
         ? "required"
         : undefined;
