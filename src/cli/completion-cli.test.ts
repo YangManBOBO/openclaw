@@ -420,7 +420,9 @@ ${cases
 
   itWithPowerShell("completes PowerShell subcommands of an apostrophe command", async () => {
     const program = quotedCommandProgram();
-    expect(await powershell.complete(program, "openclaw it's r")).toEqual(["run"]);
-    expect(await powershell.complete(program, "openclaw it's --j")).toEqual(["--json"]);
+    // PowerShell treats a bare apostrophe as a string delimiter, so a command
+    // whose name contains one is typed with the single-quoted spelling.
+    expect(await powershell.complete(program, "openclaw 'it''s' r")).toEqual(["run"]);
+    expect(await powershell.complete(program, "openclaw 'it''s' --j")).toEqual(["--json"]);
   });
 });
