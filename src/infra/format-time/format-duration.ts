@@ -23,7 +23,11 @@ export function formatDurationSeconds(
   if (!Number.isFinite(ms)) {
     return "unknown";
   }
-  const decimals = Math.max(0, options.decimals ?? 1);
+  // Preserve the legacy toFixed precision coercion: fractional and non-finite
+  // decimals truncate to an integer count (NaN -> 0) to keep the plugin-sdk
+  // exported contract, and keep the exponent/divisor integer so rendering stays clean.
+  const requested = options.decimals ?? 1;
+  const decimals = Number.isFinite(requested) ? Math.max(0, Math.trunc(requested)) : 0;
   const unit = options.unit ?? "s";
   // Round once at the requested precision from the integer millisecond count so float
   // division noise cannot flip the final digit (e.g. 1005ms -> "1.01s", not "1.00s").
