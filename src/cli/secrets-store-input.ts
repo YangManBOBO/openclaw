@@ -27,6 +27,8 @@ async function readBoundedStdin(maxBytes: number): Promise<string> {
 }
 
 function readFailureErrorCode(error: unknown): string | undefined {
+  // SAFETY: invariant — fs error objects expose a string `code`; the narrowed
+  // object read keeps the assertion from widening into `unknown` access.
   const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
   return typeof code === "string" && code ? code : undefined;
 }
