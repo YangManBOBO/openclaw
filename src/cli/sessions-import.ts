@@ -109,6 +109,9 @@ export async function sessionsImportCommand(
   const recordFailure = (error: string, source: Partial<SessionCatalogLocator> = {}) =>
     record({ ...source, ok: false, status: "failed", error });
   const seen = new Set<string>();
+  // The --limit budget counts sessions actually imported, so a failed row does
+  // not consume a slot that a later healthy row could use.
+  let importedCount = 0;
   const importOne = async (locator: SessionsCatalogImportParams) => {
     const identity = JSON.stringify([
       locator.catalogId,
@@ -121,6 +124,7 @@ export async function sessionsImportCommand(
     }
     seen.add(identity);
     if (opts.dryRun) {
+      importedCount += 1;
       record({ ...locator, ok: true, status: "would_import" });
       return;
     }
@@ -132,6 +136,7 @@ export async function sessionsImportCommand(
         requiredScope: "operator.write",
         timeoutMs: timeoutMs ?? 300_000,
       });
+      importedCount += 1;
       record({
         ...locator,
         ...result,
@@ -150,7 +155,7 @@ export async function sessionsImportCommand(
       requiredScope: "operator.read",
       timeoutMs: timeoutMs ?? 300_000,
     });
-  const limitReached = () => limit !== undefined && seen.size >= limit;
+  const limitReached = () => limit !== undefined && importedCount >= limit;
   const listParams = {
     ...(agentId ? { agentId } : {}),
     limitPerHost: Math.min(limit ?? 100, 100),

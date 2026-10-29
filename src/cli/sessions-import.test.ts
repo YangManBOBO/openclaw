@@ -191,6 +191,35 @@ describe("sessions import CLI", () => {
     expect(mocks.runtime.exit).not.toHaveBeenCalled();
   });
 
+  it("does not let failed rows consume the --limit import budget", async () => {
+    mocks.callGateway
+      .mockResolvedValueOnce({
+        catalogs: [catalog("claude", [host(["first", "second", "third"])])],
+      })
+      .mockRejectedValueOnce(new Error("Source is unavailable"))
+      .mockResolvedValueOnce(imported)
+      .mockResolvedValueOnce({ ...imported, created: false, importedItems: 0 });
+
+    await run("sessions import --all --catalog claude --host gateway:local --limit 2 --json");
+
+    // The failed "first" row must not consume the two-session import budget:
+    // the healthy "second" and "third" rows are still attempted.
+    expect(mocks.callGateway.mock.calls.map(([params]) => params.method)).toEqual([
+      "sessions.catalog.list",
+      "sessions.catalog.import",
+      "sessions.catalog.import",
+      "sessions.catalog.import",
+    ]);
+    const output = JSON.parse(String(mocks.runtime.log.mock.calls[0]?.[0]));
+    expect(output.results.map((row: { threadId: string }) => row.threadId)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(output.summary).toMatchObject({ imported: 1, unchanged: 1, failed: 1 });
+    expect(mocks.runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
   it("imports an explicit locator and warns about bounded history in human output", async () => {
     mocks.callGateway.mockResolvedValueOnce({ ...imported, complete: false, totalItems: 50_001 });
     await run(
