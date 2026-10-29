@@ -26,6 +26,18 @@ async function readBoundedStdin(maxBytes: number): Promise<string> {
   return decodeUtf8Input(bytes, "Stdin input");
 }
 
+function readFailureErrorCode(error: unknown): string | undefined {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && code ? code : undefined;
+}
+
+function describeInputFileOpenFailure(pathname: string, error: unknown): string {
+  const code = readFailureErrorCode(error);
+  // Keep missing paths (ENOENT/ENOTDIR) and denied access (EACCES) distinguishable
+  // while pointing the operator at the corrective action.
+  return `Input file could not be read${code ? ` (${code})` : ""}: ${pathname}. Check that the path exists and is readable.`;
+}
+
 async function readBoundedFile(pathname: string, maxBytes: number): Promise<string> {
   // Open FIFOs without waiting for a writer so the descriptor check can reject them.
   const flags =
@@ -34,7 +46,7 @@ async function readBoundedFile(pathname: string, maxBytes: number): Promise<stri
   try {
     file = await fs.open(pathname, flags);
   } catch (error) {
-    throw new SecretStoreInputFileError(`Input file could not be read: ${pathname}`, {
+    throw new SecretStoreInputFileError(describeInputFileOpenFailure(pathname, error), {
       cause: error,
     });
   }

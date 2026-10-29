@@ -174,6 +174,7 @@ describe("secrets store CLI", () => {
     const missing = path.join(tempDirs.make("store-cli-"), "missing.txt");
     await expect(run(...args, missing)).rejects.toThrow("__exit__:2");
     expect(mocks.runtimeErrors.join("\n")).toContain("Input file could not be read");
+    expect(mocks.runtimeErrors.join("\n")).toContain("Check that the path exists and is readable");
     expect(mocks.write).not.toHaveBeenCalled();
     expect(mocks.writeBatch).not.toHaveBeenCalled();
   });
