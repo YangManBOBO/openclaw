@@ -64,7 +64,7 @@ export function formatDurationSeconds(
   // arithmetic in BigInt so String() is always full decimal, never scientific
   // notation, across the supported precision range.
   const msStr = expandDecimalString(Math.max(0, ms));
-  const [intPart, fracPart = ""] = msStr.split(".");
+  const [intPart = "0", fracPart = ""] = msStr.split(".");
   const fracFactor = 10n ** BigInt(fracPart.length);
   const msBig = BigInt(intPart) * fracFactor + BigInt(fracPart || "0");
   const scaled = (msBig * 10n ** BigInt(decimals) + fracFactor * 500n) / (fracFactor * 1000n);
