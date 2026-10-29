@@ -8,6 +8,7 @@ import {
   SECRET_STORE_VALUE_MAX_BYTES,
   SecretStoreValidationError,
 } from "../secrets/store/secret-store.js";
+import { SecretStoreInputFileError } from "./secrets-store-input-error.js";
 
 const SECRET_STORE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
 
@@ -29,11 +30,18 @@ async function readBoundedFile(pathname: string, maxBytes: number): Promise<stri
   // Open FIFOs without waiting for a writer so the descriptor check can reject them.
   const flags =
     process.platform === "win32" ? "r" : fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
-  const file = await fs.open(pathname, flags);
+  let file: fs.FileHandle;
+  try {
+    file = await fs.open(pathname, flags);
+  } catch (error) {
+    throw new SecretStoreInputFileError(`Input file could not be read: ${pathname}`, {
+      cause: error,
+    });
+  }
   try {
     const stat = await file.stat();
     if (!stat.isFile()) {
-      throw new Error(`Input path is not a regular file: ${pathname}`);
+      throw new SecretStoreInputFileError(`Input path is not a regular file: ${pathname}`);
     }
     if (stat.size > maxBytes) {
       throw new SecretStoreValidationError(
