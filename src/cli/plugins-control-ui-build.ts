@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { replaceFileAtomic } from "@openclaw/fs-safe/atomic";
@@ -9,7 +8,9 @@ import {
   CONTROL_UI_PLUGIN_MAX_ASSETS,
   CONTROL_UI_PLUGIN_MAX_BUILD_BYTES,
   isPluginControlUiAssetPath,
+  pluginControlUiGenerationHash,
 } from "../plugins/control-ui-assets.js";
+import { normalizeManifestControlUi } from "../plugins/manifest-control-ui.js";
 import type { PluginManifestControlUi } from "../plugins/manifest-types.js";
 import { PLUGIN_MANIFEST_FILENAME } from "../plugins/manifest.js";
 import { buildPluginLoaderAliasMap } from "../plugins/sdk-alias.js";
@@ -41,6 +42,22 @@ export async function buildPluginControlUi(params: {
   check?: boolean;
 }): Promise<PluginManifestControlUi> {
   const rootDir = await fs.realpath(params.rootDir);
+  const manifestText = await fs
+    .readFile(path.join(rootDir, PLUGIN_MANIFEST_FILENAME), "utf8")
+    .catch((error: unknown) => {
+      if (isRecord(error) && error.code === "ENOENT") {
+        return "{}";
+      }
+      throw error;
+    });
+  const authored: unknown = JSON.parse(manifestText);
+  const presentation = normalizeManifestControlUi(
+    isRecord(authored) ? authored.controlUi : undefined,
+    isRecord(authored) ? authored.channels : undefined,
+  );
+  if (!presentation.ok) {
+    throw new Error(presentation.error);
+  }
   const entry = await fs.realpath(path.resolve(rootDir, params.source));
   const relative = path.relative(rootDir, entry);
   if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
@@ -78,42 +95,44 @@ export async function buildPluginControlUi(params: {
   validateControlUiFiles(rawFiles);
   const files = nameControlUiChunks(rawFiles);
   validateControlUiFiles(files);
-  const hash = createHash("sha256");
-  for (const file of files) {
-    hash.update(`${file.name}\0${file.contents.length}\0`).update(file.contents);
-  }
-  const output = `dist/control-ui/${hash.digest("hex")}`;
+  const output = `dist/control-ui/${pluginControlUiGenerationHash(files)}`;
   const outputDir = path.join(rootDir, output);
   const declaration = {
+    ...(presentation.value?.activation ? { activation: presentation.value.activation } : {}),
+    ...(presentation.value?.settingsViews
+      ? { settingsViews: presentation.value.settingsViews }
+      : {}),
     entry: `${output}/index.js`,
     ...(files.some((file) => file.name === "index.css") ? { styles: [`${output}/index.css`] } : {}),
   };
-  return await publishControlUiBuild(outputDir, declaration, files, params.check);
-}
+  if (params.check) {
+    for (const file of files) {
+      const existing = await fs.readFile(path.join(outputDir, file.name)).catch(() => null);
+      if (!existing?.equals(Buffer.from(file.contents))) {
+        throw new Error("Control UI build is missing or stale. Run openclaw plugins build.");
+      }
+    }
+    return declaration;
+  }
 
-function validateControlUiFiles(files: Array<{ name: string; contents: Uint8Array }>): void {
-  if (files.length > CONTROL_UI_PLUGIN_MAX_ASSETS) {
-    throw new Error(`Control UI builds allow at most ${CONTROL_UI_PLUGIN_MAX_ASSETS} assets.`);
+  // Publish an immutable directory before its manifest pointer. A failed build
+  // cannot change the previous activation or expose a mixed JS/CSS generation.
+  const generations = path.dirname(outputDir);
+  await fs.mkdir(generations, { recursive: true });
+  // The builder owns this parent too; a restrictive umask would otherwise leave
+  // it owner-only and block traversal before the generation is ever reached.
+  await fs.chmod(generations, 0o755);
+  const staging = await fs.mkdtemp(path.join(generations, ".build-"));
+  try {
+    for (const file of files) {
+      await fs.writeFile(path.join(staging, file.name), file.contents);
+    }
+    await normalizeGenerationPermissions(staging, files);
+    await publishImmutableGeneration({ files, outputDir, staging });
+  } finally {
+    await fs.rm(staging, { recursive: true, force: true });
   }
-  if (
-    files.some((file) => file.contents.length > CONTROL_UI_PLUGIN_MAX_ASSET_BYTES) ||
-    files.reduce((total, file) => total + file.contents.length, 0) >
-      CONTROL_UI_PLUGIN_MAX_BUILD_BYTES
-  ) {
-    throw new Error(
-      "Control UI builds allow at most 4 MiB per asset and 8 MiB per plugin. Reduce the browser bundle before installing.",
-    );
-  }
-  if (
-    !files.some((file) => file.name === "index.js") ||
-    files.some(
-      (file) => file.name !== path.basename(file.name) || !isPluginControlUiAssetPath(file.name),
-    )
-  ) {
-    throw new Error(
-      "Control UI build must produce a JavaScript entrypoint and only flat JavaScript/CSS assets.",
-    );
-  }
+  return declaration;
 }
 
 // A freshly-written directory can be transiently locked on Windows while an
@@ -177,40 +196,29 @@ async function publishImmutableGeneration(params: {
   );
 }
 
-async function publishControlUiBuild(
-  outputDir: string,
-  declaration: PluginManifestControlUi,
-  files: Array<{ name: string; contents: Uint8Array }>,
-  check?: boolean,
-): Promise<PluginManifestControlUi> {
-  if (check) {
-    for (const file of files) {
-      const existing = await fs.readFile(path.join(outputDir, file.name)).catch(() => null);
-      if (!existing?.equals(Buffer.from(file.contents))) {
-        throw new Error("Control UI build is missing or stale. Run openclaw plugins build.");
-      }
-    }
-    return declaration;
+function validateControlUiFiles(files: Array<{ name: string; contents: Uint8Array }>): void {
+  if (files.length > CONTROL_UI_PLUGIN_MAX_ASSETS) {
+    throw new Error(`Control UI builds allow at most ${CONTROL_UI_PLUGIN_MAX_ASSETS} assets.`);
   }
-
-  // Publish an immutable directory before its manifest pointer. A failed build
-  // cannot change the previous activation or expose a mixed JS/CSS generation.
-  const generations = path.dirname(outputDir);
-  await fs.mkdir(generations, { recursive: true });
-  // The builder owns this parent too; a restrictive umask would otherwise leave
-  // it owner-only and block traversal before the generation is ever reached.
-  await fs.chmod(generations, 0o755);
-  const staging = await fs.mkdtemp(path.join(generations, ".build-"));
-  try {
-    for (const file of files) {
-      await fs.writeFile(path.join(staging, file.name), file.contents);
-    }
-    await normalizeGenerationPermissions(staging, files);
-    await publishImmutableGeneration({ files, outputDir, staging });
-  } finally {
-    await fs.rm(staging, { recursive: true, force: true });
+  if (
+    files.some((file) => file.contents.length > CONTROL_UI_PLUGIN_MAX_ASSET_BYTES) ||
+    files.reduce((total, file) => total + file.contents.length, 0) >
+      CONTROL_UI_PLUGIN_MAX_BUILD_BYTES
+  ) {
+    throw new Error(
+      "Control UI builds allow at most 4 MiB per asset and 8 MiB per plugin. Reduce the browser bundle before installing.",
+    );
   }
-  return declaration;
+  if (
+    !files.some((file) => file.name === "index.js") ||
+    files.some(
+      (file) => file.name !== path.basename(file.name) || !isPluginControlUiAssetPath(file.name),
+    )
+  ) {
+    throw new Error(
+      "Control UI build must produce a JavaScript entrypoint and only flat JavaScript/CSS assets.",
+    );
+  }
 }
 
 // mkdtemp is owner-only and file creation follows umask. Normalize generated

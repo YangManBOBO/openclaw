@@ -36,12 +36,6 @@
 .palette-session-settings__title,
 .palette-session-settings__machine {
   padding-inline: 10px;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  line-height: 1.2;
-  text-transform: uppercase;
 }
 
 .palette-session-settings__title {
@@ -117,13 +111,6 @@
   gap: 1px;
 }
 
-.palette-session-settings__label,
-.palette-session-settings__secondary {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .palette-session-settings__secondary,
 .palette-session-settings__unavailable {
   color: var(--muted);
@@ -136,8 +123,7 @@
 }
 
 .palette-session-settings__agent .new-session-page__select,
-.palette-session-settings__agent openclaw-agent-select,
-.palette-session-settings__agent wa-dropdown {
+.palette-session-settings__agent openclaw-agent-select {
   display: block;
   width: 100%;
   max-width: none;

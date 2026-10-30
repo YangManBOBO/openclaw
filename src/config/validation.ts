@@ -15,7 +15,6 @@ import {
   validatePreparedConfigWithPlugins,
   type ValidateConfigWithPluginsParams,
 } from "./validation-plugin-rules.js";
-import type { PreparedPluginSchemaValidations } from "./validation-prepared.js";
 import type {
   PreparedConfigValidationPluginMetadata,
   ValidateConfigWithPluginsResult,
@@ -82,9 +81,6 @@ async function validateConfigObjectWithPluginsAsyncInternal(
     const strictConfig = prepareStrictValidation
       ? cloneConfigWithResolutionFacts(parsedConfig)
       : undefined;
-    const schemaValidations: PreparedPluginSchemaValidations | undefined = strictConfig
-      ? new Map()
-      : undefined;
     const preparedParams = {
       ...validationParams,
       pluginMetadataSnapshot: metadata,
@@ -97,7 +93,6 @@ async function validateConfigObjectWithPluginsAsyncInternal(
       preparedParams,
       true,
       metadata?.installedPluginRecordIds,
-      schemaValidations,
     );
     if (!result.ok || !strictConfig) {
       return result;
@@ -108,7 +103,6 @@ async function validateConfigObjectWithPluginsAsyncInternal(
       pluginValidation: "full",
       semanticValidation: "strict",
       installedPluginRecordIds: metadata?.installedPluginRecordIds,
-      schemaValidations,
     });
     return { ...result, strictIssues: strict.ok ? [] : strict.issues };
   };
@@ -175,13 +169,11 @@ function finishConfigObjectWithPlugins(
   params: ValidateConfigWithPluginsParams | undefined,
   applyDefaults: boolean,
   installedPluginRecordIds?: ReadonlySet<string>,
-  schemaValidations?: PreparedPluginSchemaValidations,
 ): ValidateConfigWithPluginsResult {
   return validatePreparedConfigWithPlugins(migrated, parsedConfig, {
     ...params,
     applyDefaults,
     installedPluginRecordIds,
-    schemaValidations,
     pluginValidation: params?.pluginValidation ?? "full",
     semanticValidation: params?.semanticValidation ?? "runtime",
   });
@@ -204,11 +196,9 @@ export function materializeLegacyAgentOwnershipForActiveChannelsResult(
     ...(manifestRecords ? { manifestRecords } : {}),
   });
   return materializeLegacyDefaultAgentRoles(config, legacyDefaultAgentId, {
+    ...options,
     ambientChannelIds,
     env,
-    homedir: options?.homedir,
-    materializeSessionStore: options?.materializeSessionStore,
-    materializeWorkspace: options?.materializeWorkspace,
   });
 }
 
@@ -223,10 +213,8 @@ export async function materializeLegacyAgentOwnershipForActiveChannelsResultAsyn
     ...(manifestRecords ? { manifestRecords } : {}),
   });
   return materializeLegacyDefaultAgentRoles(config, legacyDefaultAgentId, {
+    ...options,
     ambientChannelIds,
     env,
-    homedir: options?.homedir,
-    materializeSessionStore: options?.materializeSessionStore,
-    materializeWorkspace: options?.materializeWorkspace,
   });
 }

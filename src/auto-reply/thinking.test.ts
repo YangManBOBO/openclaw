@@ -62,6 +62,38 @@ describe("prepared catalog identity", () => {
 });
 
 describe("provider profiles", () => {
+  it("retains medium defaults for Qwen chat-template models that declare efforts", () => {
+    mocks.profile.mockReturnValue(undefined);
+    const declaredCompat = {
+      thinkingFormat: "qwen-chat-template",
+      supportedReasoningEfforts: ["low", "medium", "xhigh"],
+    };
+    const catalog = [
+      { provider: "local-qwen", id: "qwen-template", reasoning: true, compat: declaredCompat },
+      {
+        provider: "local-qwen",
+        id: "qwen-template-no-high",
+        reasoning: true,
+        compat: declaredCompat,
+        thinkingLevelMap: { high: null },
+      },
+      {
+        provider: "local-qwen",
+        id: "qwen-template-undeclared",
+        reasoning: true,
+        compat: { thinkingFormat: "qwen-chat-template" },
+      },
+      { provider: "local-qwen", id: "generic", reasoning: true },
+    ];
+    const resolveDefault = (model: string) =>
+      resolveThinkingDefaultForModel({ provider: "local-qwen", model, catalog });
+
+    expect(resolveDefault("qwen-template")).toBe("medium");
+    expect(resolveDefault("qwen-template-no-high")).toBe("medium");
+    expect(resolveDefault("qwen-template-undeclared")).toBe("medium");
+    expect(resolveDefault("generic")).toBe("medium");
+  });
+
   it("uses base levels without a provider", () => {
     expect(listThinkingLevels()).toEqual(baseLevels);
   });
@@ -188,6 +220,40 @@ describe("provider profiles", () => {
       "ultra",
     ]);
     expect(resolveThinkingDefaultForModel(params)).toBe("high");
+  });
+
+  it("lets a row with a default thinking level own the profile over the provider hook", () => {
+    mocks.profile.mockReturnValue({ levels: [{ id: "low" }], defaultLevel: "low" });
+    const params = thinkingModel({
+      reasoning: false,
+      thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, xhigh: "max" },
+      compat: {
+        defaultThinkingLevel: "high",
+        adaptiveThinking: true,
+        thinkingRequired: true,
+        thinkingLevelLabels: { low: "light" },
+      },
+    });
+    expect(resolveThinkingProfile({ ...params, agentRuntime: "openclaw" })).toEqual({
+      levels: [
+        { id: "low", label: "light", rank: expect.any(Number) },
+        { id: "adaptive", label: "adaptive", rank: expect.any(Number) },
+        { id: "high", label: "high", rank: expect.any(Number) },
+        { id: "xhigh", label: "xhigh", rank: expect.any(Number) },
+        { id: "ultra", label: "ultra", rank: expect.any(Number) },
+      ],
+      defaultLevel: "high",
+    });
+    expect(mocks.profile).not.toHaveBeenCalled();
+  });
+
+  it("keeps a row without a default thinking level on the provider hook", () => {
+    mocks.profile.mockReturnValue({ levels: [{ id: "low", label: "on" }], defaultLevel: "low" });
+    const params = thinkingModel({ reasoning: true, compat: { adaptiveThinking: true } });
+    expect(listThinkingLevels(params.provider, params.model, params.catalog, "codex")).toEqual([
+      "low",
+      "ultra",
+    ]);
   });
 
   it("preserves catalog-advertised advanced levels on other runtimes", () => {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { gitReadOnlyEnvironment } from "../../infra/git-exec.js";
 import { runGitWorkerOperation } from "../../infra/git-worker.js";
 import { hasNodeErrorCode } from "../../infra/path-guards.js";
 import { STAGED_INPUT_GIT_PATHSPEC } from "../../media/staged-inputs.js";
@@ -106,8 +107,9 @@ export async function runWorkspaceInventoryCommandToFile(params: {
     input = params.inputPath ? await fs.open(params.inputPath, "r") : undefined;
     params.signal.throwIfAborted();
     const boundedOutput = params.maxOutputBytes !== undefined;
+    const env = params.baseEnv ?? workerSshCommandOptions({ timeoutMs: params.timeoutMs }).baseEnv;
     const child = spawn(command, args, {
-      env: params.baseEnv ?? workerSshCommandOptions({ timeoutMs: params.timeoutMs }).baseEnv,
+      env: command === "git" ? gitReadOnlyEnvironment(args, env) : env,
       stdio: [input?.fd ?? "ignore", boundedOutput ? "pipe" : output.fd, "pipe"],
       ...(process.platform !== "win32" ? { detached: true } : {}),
       windowsHide: true,
@@ -159,8 +161,7 @@ export async function runWorkspaceInventoryCommandToFile(params: {
           }
           childStderr.destroy();
           finish({ code: child.exitCode });
-        }, COMMAND_KILL_GRACE_MS + 1_000);
-        terminationTimer.unref?.();
+        }, COMMAND_KILL_GRACE_MS + 1_000).unref();
       };
       if (boundedOutput) {
         const childStdout = child.stdout;
@@ -206,8 +207,7 @@ export async function runWorkspaceInventoryCommandToFile(params: {
       timer = setTimeout(() => {
         timedOut = !terminationStarted && child.exitCode === null && child.signalCode === null;
         terminate();
-      }, params.timeoutMs);
-      timer.unref?.();
+      }, params.timeoutMs).unref();
       if (params.signal.aborted) {
         abort();
       }
