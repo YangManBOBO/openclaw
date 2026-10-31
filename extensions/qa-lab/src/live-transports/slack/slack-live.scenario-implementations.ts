@@ -73,15 +73,14 @@ export const slackQaThreadParticipationWorkspaceScenario: SlackQaScenarioImpleme
           throw new Error("Slack QA SUT identity has no team id for the workspace record");
         }
         const participationKey = `${context.sutAccountId}:${sutTeamId}:${context.channelId}:${context.sentTs}`;
-        const restart = context.gateway.restartAfterStateMutation;
-        if (!restart) {
+        if (typeof context.gateway.restartAfterStateMutation !== "function") {
           throw new Error("Slack QA gateway child cannot restart after a state mutation");
         }
         // Send records participation under delivery.teamId; a relay/non-enterprise
         // follow-up arrives without an event scope. Seed the same store row the
         // workspace-scoped send writes, then restart so the monitor re-reads
         // persistence instead of its in-memory cache.
-        await restart.call(context.gateway, async ({ stateDir }) => {
+        await context.gateway.restartAfterStateMutation(async ({ stateDir }) => {
           const { createPluginStateSyncKeyedStore } =
             await import("openclaw/plugin-sdk/plugin-state-store-runtime");
           const store = createPluginStateSyncKeyedStore("slack", {
