@@ -220,7 +220,7 @@ export function createCliProgress(options: ProgressOptions): ProgressReporter {
   };
 
   const tick = (delta = 1) => {
-    if (!total) {
+    if (!total || Number.isNaN(delta)) {
       return;
     }
     completed = Math.min(total, completed + delta);

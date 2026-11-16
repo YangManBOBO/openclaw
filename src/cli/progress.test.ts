@@ -125,6 +125,17 @@ describe("cli progress", () => {
     expect(writes.join("")).not.toContain("NaN");
   });
 
+  it("rejects a NaN tick without corrupting the completed count", () => {
+    const { writes, stream } = captureOutput();
+    const reporter = progress({ label: "Scanning", total: 2, stream, fallback: "line" });
+    reporter.tick(Number.NaN);
+    reporter.tick(1);
+    reporter.done();
+
+    expect(writes.join("")).toContain("Scanning 50%");
+    expect(writes.join("")).not.toContain("NaN");
+  });
+
   it("does not render literal NaN% for a totals update with a NaN completed count", async () => {
     const { writes, stream } = captureOutput(false);
     await withProgressTotals(
